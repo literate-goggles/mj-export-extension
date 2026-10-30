@@ -12,3 +12,20 @@ jobs:
           node-version: '22'
       - run: npm run check
       - run: npm test
+  viewer:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The container image installs this Pillow (viewer/Dockerfile); the viewer also runs without it.
+        pillow: ['12.3.0', 'none']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Pillow ${{ matrix.pillow }}
+        if: matrix.pillow != 'none'
+        run: python3 -m pip install 'Pillow==${{ matrix.pillow }}'
+      - name: Viewer unit tests (synthetic data; the browser test is opt-in)
+        working-directory: viewer
+        run: python3 -m unittest -v

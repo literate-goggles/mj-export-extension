@@ -98,8 +98,11 @@ ui/                      Popup and offscreen document
 scripts/                 Dependency-free build/check and offline export verifier
 tests/                   Synthetic unit and controller regression tests; no network
 docs/                    Endpoint observations, architecture, and sanitized test evidence
+viewer/                  Local read-only viewer for finished exports (Python; not part of the extension)
 .github/workflows/       Offline CI checks
 ```
+
+To browse a finished export, use the local viewer in [`viewer/`](viewer/README.md): `cd viewer && python3 -m mjviewer /path/to/mj_export_folder_or.zip`, then open `http://localhost:8765/`. It needs only Python 3.9+, reads the export without modifying it, and makes no network requests. It is not part of the extension and is not included in the distribution ZIP.
 
 With Node 20+ already installed, no package installation is required:
 
