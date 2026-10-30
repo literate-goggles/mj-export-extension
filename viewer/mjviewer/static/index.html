@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="mjv-token" content="{{MJV_TOKEN}}">
+<meta name="mjv-mode" content="{{MJV_MODE}}">
+<meta name="referrer" content="no-referrer">
+<title>MJ Export Viewer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232456c9'/%3E%3Crect x='7' y='7' width='8' height='8' rx='1.5' fill='%23fff'/%3E%3Crect x='17' y='7' width='8' height='8' rx='1.5' fill='%23fff' fill-opacity='.6'/%3E%3Crect x='7' y='17' width='8' height='8' rx='1.5' fill='%23fff' fill-opacity='.6'/%3E%3Crect x='17' y='17' width='8' height='8' rx='1.5' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/theme.js"></script>
+<script type="module" src="/static/app.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="topbar">
+  <div class="topbar__inner">
+    <a class="brand" href="#/" aria-label="MJ Export Viewer: all exports">
+      <svg class="brand__mark" viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" focusable="false">
+        <rect class="brand__tile" x="2" y="2" width="9" height="9" rx="2"></rect>
+        <rect class="brand__tile brand__tile--soft" x="13" y="2" width="9" height="9" rx="2"></rect>
+        <rect class="brand__tile brand__tile--soft" x="2" y="13" width="9" height="9" rx="2"></rect>
+        <rect class="brand__tile" x="13" y="13" width="9" height="9" rx="2"></rect>
+      </svg>
+      <span class="brand__name">MJ Export Viewer</span>
+    </a>
+    <div class="crumb" id="export-crumb" hidden></div>
+    <nav class="tabs" id="export-tabs" aria-label="Export sections" hidden></nav>
+    <div class="topbar__actions">
+      <div class="account" id="account" hidden></div>
+      <button class="icon-btn" id="theme-toggle" type="button" aria-label="Theme">
+        <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+<div id="notices" class="notices"></div>
+<main id="main" class="main" tabindex="-1">
+  <div id="view" class="view">
+    <div class="page"><p class="loading" role="status"><span class="spinner" aria-hidden="true"></span><span>Loading viewer…</span></p></div>
+  </div>
+</main>
+<div id="announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+<noscript><p class="noscript">MJ Export Viewer needs JavaScript to show exports.</p></noscript>
+</body>
+</html>

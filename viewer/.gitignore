@@ -1,0 +1,5 @@
+# Exports are personal data: never commit one here, not even as a test fixture.
+mj_export_*
+*.zip
+# Local cache, if --cache-dir points into this folder.
+.cache/
