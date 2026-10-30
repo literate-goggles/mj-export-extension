@@ -27,19 +27,19 @@ After source changes, reload the extension card and then reload the Midjourney p
 ## Use
 
 - **Scan** counts records in the selected scope. Its estimate assumes 1 MiB per image and is clearly labeled approximate; scanning downloads no images.
-- Scope is **Max N jobs** (default 20), **Since date**, or **All jobs**. Since-date mode scans metadata across the feed rather than assuming its order.
-- **Include images** defaults off. Start with a small metadata-only test, then enable images and resume the same scope.
-- **Small test** restricts boards and profiles to one each. Disable it to include all own boards and visible profiles. This limit is independent of the job limit.
+- Scope is **All jobs** (default), **Since date**, or **Max N jobs** (20 when selected). Since-date mode scans metadata across the feed rather than assuming its order.
+- **Include images** defaults on. Turn it off for metadata only.
+- **Small test** defaults off. When enabled, it restricts boards and profiles to one each. Disable it to include all own boards and visible profiles. This limit is independent of the job limit.
 - **Export / resume** continues the saved export. **Pause** stops further work after in-flight requests/downloads finish. **Resume** never starts automatically.
 - **New export** starts a separate folder and resets extension progress for the new run; it does not delete earlier downloaded files.
 - **Open export folder** reveals the metadata file in its folder. Chrome's own download-directory settings control the base destination. If Chrome asks where to save every download, those prompts still apply.
 
-Only one run may be active across tabs. Run settings and errors appear in the popup and on-page panel. The popup restores saved settings; its **Resume** button uses the saved run's settings. **Export** uses the current controls and rejects a changed scope rather than overwriting the saved run.
+Only one run may be active across tabs. Run settings and errors appear in the popup and on-page panel. An unfinished run restores its saved settings; a fresh install or completed run shows the new defaults; its **Resume** button uses the saved run's settings. **Export** uses the current controls and rejects a changed scope rather than overwriting the saved run.
 
 ### Exact sequence after permission to run
 
 1. Reload the extension card in `chrome://extensions`, then reload your signed-in Organize page. The repository root is still the Load unpacked folder.
-2. Choose the scope. To request all returned own jobs/boards/profiles: select **All jobs**, turn **Small test** off, and turn **Include images** on.
+2. The defaults are **All jobs**, **Include images** on, and **Small test** off. An unfinished run retains its previous settings for safe resumption.
 3. **Scan is optional.** It counts the chosen scope and estimates bytes, but does not create a cached export or guarantee completeness. Export reads the feed again.
 4. Because the earlier small test has saved progress, use **New export** when changing to All jobs or another scope. This starts immediately in a separate folder. For the same saved scope, use **Export / resume** on the page or **Resume** in the popup.
 5. Keep the tab open. Use **Pause**, then **Resume** as needed. When complete, choose **Open export folder** and inspect `export_meta.json` for failures and parent gaps.
@@ -113,3 +113,11 @@ python3 scripts/verify-export.py /absolute/path/to/mj_export_folder
 After edits to `lib/`, rebuild before reloading Chrome. The generated core is committed so a fresh clone can be loaded directly; CI rejects stale output. Version numbers in `manifest.json` and `package.json` must match.
 
 Personal exports (`test-exports/`), the original account-specific `TEST_REPORT.md`, and `test-verification.json` are deliberately ignored by Git and retained locally. Do not force-add them or commit browser HAR files. The shareable acceptance summary is [docs/TESTING.md](docs/TESTING.md).
+
+## Share with designers
+
+Use the generated `dist/mj-export-extension-0.3.1.zip`, not a ZIP of the entire working folder: the working folder may contain private ignored exports and Git history.
+
+The distribution contains the ready-to-load manifest and bundled scripts, plus source, tests and documentation. Designers do not need Node, Python, npm, or a build step. They should unzip it, keep the extracted `mj-export-extension` directory in a permanent location, open `chrome://extensions`, enable Developer mode, click **Load unpacked**, and select that extracted directory containing `manifest.json`. Chrome does not load this ZIP directly.
+
+The development folder `~/Projects/mj-export-extension` is also directly loadable. Rebuild only after changing library source. To regenerate a clean distribution as a developer, run `npm run package` (Node and Python required for packaging, not installation). No export starts on installation. The account-risk and coverage limits above apply to every designer too.
