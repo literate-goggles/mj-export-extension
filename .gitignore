@@ -1,0 +1,14 @@
+# Personal exports and account-specific evidence stay local.
+/test-exports/
+/test-verification.json
+/TEST_REPORT.md
+/mj_export_*/
+*.har
+.env
+.env.*
+!.env.example
+node_modules/
+.npm/
+.DS_Store
+__pycache__/
+*.pyc

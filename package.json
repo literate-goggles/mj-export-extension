@@ -1,0 +1,14 @@
+{
+  "name": "mj-export-extension",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.js",
+    "check": "node scripts/build.mjs --check && node scripts/check.mjs"
+  }
+}
