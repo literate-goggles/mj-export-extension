@@ -1,0 +1,6 @@
+# Only mjviewer/ goes into the image: never an export, a ZIP, a cache or the tests.
+*
+!Dockerfile
+!mjviewer
+**/__pycache__
+**/*.pyc
