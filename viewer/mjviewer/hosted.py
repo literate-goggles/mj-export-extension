@@ -44,8 +44,8 @@ from dataclasses import dataclass
 from typing import List, Mapping, Optional, Tuple
 
 from . import API_VERSION, __version__
-from .catalog import (LOOPBACK, USER_AGENT, BlobStore, Catalog, CatalogError, Published, ZipCache, describe,
-                      email_address, opener_for)
+from .catalog import (LOOPBACK, USER_AGENT, BlobStore, Catalog, CatalogError, CatalogUnavailable, Published,
+                      ZipCache, describe, email_address, opener_for)
 from .server import (DEFAULT_STATIC, PIL_IMAGE, Handler, ViewerApp, ViewerServer, default_cache_dir, dump_json)
 from .sources import Limits
 
@@ -646,6 +646,11 @@ class HostedHandler(Handler):
             return self._error(404, 'not_found', 'not found')
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
+        except CatalogUnavailable as exc:  # the list and every export route, while catalog.json cannot be read
+            if self._sent_headers:
+                self.close_connection = True
+            else:
+                self._error(503, exc.code, exc.message)
         except Exception:
             # Scrubbed, in case an unexpected error ever carries the storage query string.
             self.app.log(self.app.store.scrub(traceback.format_exc(limit=5)).rstrip())

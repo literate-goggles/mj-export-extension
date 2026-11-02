@@ -276,6 +276,34 @@ class CatalogRefreshTests(BlobTestCase):
         self.assertEqual(cat.health(), {'exports': 1, 'ok': False, 'age_s': 61.0})
         self.assertIn('could not be read (OverflowError)', cat.status()['error'])
 
+    def test_a_catalog_not_read_for_too_long_is_outdated(self):
+        """After max(5 minutes, 5 x MJV_CATALOG_TTL_S) without a good answer (a 200 that parses, or a 304), counted
+        from the start until the first one."""
+        self.blob.write_catalog([])
+        for ttl, limit in ((0, 300), (60, 300), (600, 3000)):
+            with self.subTest(ttl=ttl):
+                clock = [5000.0]
+                cat = Catalog(BlobStore(self.blob.url), ttl_s=ttl, clock=lambda: clock[0])
+                self.assertEqual(cat.unread_limit_s, limit)
+                for answer in (200, 304):
+                    self.blob.faults['catalog.json'] = '500'
+                    clock[0] += limit - 1
+                    cat.entries()
+                    self.assertFalse(cat.outdated())
+                    clock[0] += 1
+                    cat.entries()
+                    self.assertTrue(cat.outdated())
+                    self.blob.faults.clear()
+                    clock[0] += ttl
+                    cat.entries()
+                    self.assertFalse(cat.outdated())
+                    self.assertEqual(self.blob.requests[-1]['status'], answer)
+                self.blob.put('catalog.json', b'{"version": 1}')  # read, but not a catalog: no good read either
+                clock[0] += limit
+                cat.entries()
+                self.assertTrue(cat.outdated())
+                self.blob.write_catalog([])
+
     def test_a_catalog_over_the_size_cap_is_refused(self):
         self.blob.put('catalog.json', b' ' * (catalog_module.MAX_CATALOG_BYTES + 1))
         cat = Catalog(BlobStore(self.blob.url), ttl_s=60)
@@ -1376,6 +1404,47 @@ class DeleteFlowTests(FlowTestCase):
         leave_files()
         second.app.maintain()  # and every minute, also while nobody uses the viewer
         self.assertEqual((self.zips(), self.thumbs()), ([], []))
+
+    def test_an_instance_that_cannot_read_the_catalog_stops_serving_exports(self):
+        """Another instance follows a deletion when it next reads catalog.json successfully. While its reads fail it
+        keeps its last good copy, which still lists the export, for max(5 minutes, 5 x MJV_CATALOG_TTL_S) at most;
+        then it closes the exports open there and answers 503 for the list and every export route, until a read
+        succeeds."""
+        mine = self.publish(fx.gallery_export(12), name='mine.zip')
+        self.blob.write_catalog([mine])
+        first, first_session = self.start(MJV_CATALOG_TTL_S='60')
+        second, session = self.start(MJV_CATALOG_TTL_S='60')  # the same cache folder
+        clock = [time.monotonic()]
+        second.app.catalog._clock = lambda: clock[0]
+        for hosted, user in ((first, first_session), (second, session)):
+            self.view(hosted, user, mine)
+        jobs = json.loads(second.get('/api/exports/%s/jobs?limit=1' % mine['id'], session)[2])['items']
+        overview = '/api/exports/%s/overview' % mine['id']
+        routes = ('/api/exports', overview, jobs[0]['images'][0]['url'], jobs[0]['images'][0]['thumb_url'],
+                  '/api/catalog/%s' % mine['id'])
+        self.assertEqual(self.delete(first, first_session, mine)[0], 200)
+        self.blob.faults['catalog.json'] = '500'  # from now on the second instance cannot read catalog.json
+        for _ in range(4):
+            clock[0] += 60
+            second.app.maintain()
+            self.assertEqual(second.get(overview, session)[0], 200)
+        clock[0] += 60
+        second.app.maintain()  # 5 minutes: closed, also while nobody uses it
+        self.assertIsNone(second.app.registry.get(mine['id']))
+        unavailable = {'code': 'catalog_unavailable',
+                       'message': "The viewer can't reach its list of exports right now. Try again in a few minutes."}
+        answers = [second.get(path, session) for path in routes] + [self.open(second, session, mine['id'])]
+        self.assertEqual([(status, json.loads(body)['error']) for status, _, body in answers],
+                         [(503, unavailable)] * (len(routes) + 1))
+        self.assertEqual([second.get(path, session)[0] for path in ('/api/health', '/')], [200, 200])
+        self.assertEqual(second.log.getvalue().count('catalog: no successful read for 5 minutes; no export is served '
+                                                     'until one succeeds; closed %s' % mine['id']), 1)
+        # Once a read succeeds it serves again, and follows the deletion it missed.
+        self.blob.faults.clear()
+        clock[0] += 60
+        self.assertEqual(json.loads(second.get('/api/exports', session)[2])['catalog']['items'], [])
+        self.assertEqual(second.get(overview, session)[0], 404)
+        self.assertEqual(second.log.getvalue().count('catalog: read successfully again'), 1)
 
     def test_a_download_under_way_stops_and_leaves_nothing(self):
         mine = self.publish(fx.gallery_export(60))

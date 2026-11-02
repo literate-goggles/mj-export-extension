@@ -26,7 +26,10 @@ not know survive, with If-Match on the ETag just read: the entry leaves the
 exports list and a tombstone joins the top-level deleted list. Then the ZIP is
 deleted from storage. Every instance closes a deleted export and deletes its
 cached ZIP and thumbnails as soon as its catalog shows the tombstone, used
-recently or not.
+recently or not. An instance that cannot read catalog.json keeps its last good
+copy, which may still list a deleted export, for a while only: after
+max(UNREAD_LIMIT_S, UNREAD_TTLS x MJV_CATALOG_TTL_S) without a good read it
+closes its exports and serves none until a read succeeds.
 """
 from __future__ import annotations
 
@@ -79,6 +82,8 @@ CLOSE_WAIT_S = 5.0       # on shutdown, how long preparations get to remove thei
 WRITE_ATTEMPTS = 5       # conditional writes of catalog.json before giving up (another writer kept getting there first)
 BLOB_RETRY_S = 60.0      # a deleted export's ZIP still in storage is deleted again at most this often...
 TOMBSTONE_RETRY_S = 30 * 86400.0  # ...and only while its tombstone is this recent
+UNREAD_LIMIT_S = 300.0   # no good read of catalog.json for this long, or for UNREAD_TTLS times MJV_CATALOG_TTL_S
+UNREAD_TTLS = 5          # when that is longer: no export is served until a read succeeds
 BUSY = ('queued', 'waiting', 'downloading', 'verifying', 'opening')
 LOOPBACK = ('localhost', '127.0.0.1')
 USER_AGENT = 'mjviewer/%s' % __version__
@@ -87,6 +92,7 @@ SUMMARY_TEXT = ('extension_version', 'status')
 EMAIL_RE = re.compile(r"[a-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
                       r"[a-z][a-z0-9-]{0,61}[a-z0-9]")
 NOT_LISTED = 'this export is not published any more; it may have been deleted already'
+CATALOG_UNAVAILABLE = "The viewer can't reach its list of exports right now. Try again in a few minutes."
 STORAGE_CODE_RE = re.compile(r'[A-Za-z]{1,64}')  # storage's own name for an error (x-ms-error-code)
 _CONTROL = re.compile('[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]')
 
@@ -100,6 +106,13 @@ class CatalogError(Exception):
         self.code = code
         self.message = message
         self.status = status
+
+
+class CatalogUnavailable(CatalogError):
+    """catalog.json has not been read successfully for too long (Catalog.outdated): no export is served."""
+
+    def __init__(self):
+        super().__init__('catalog_unavailable', CATALOG_UNAVAILABLE)
 
 
 # ------------------------------------------------------------------- HTTP
@@ -518,6 +531,7 @@ class Catalog:
         self._etag: Optional[str] = None
         self._fetched: Optional[float] = None  # clock time of the last good answer (200 or 304)
         self._checked: Optional[float] = None  # clock time of the last attempt
+        self._started = clock()                # until a first good answer, outdated() counts from here
         self._ok = False
         self._error: Optional[str] = None
         self._inflight: Optional[threading.Event] = None
@@ -604,6 +618,17 @@ class Catalog:
         """Read catalog.json again at the next use, whatever MJV_CATALOG_TTL_S says."""
         with self._lock:
             self._checked = None
+
+    @property
+    def unread_limit_s(self) -> float:
+        return max(UNREAD_LIMIT_S, UNREAD_TTLS * self.ttl_s)
+
+    def outdated(self) -> bool:
+        """True once no read of catalog.json has succeeded (a 200 that parsed, or a 304) for unread_limit_s: the
+        copy in use may then list an export deleted meanwhile."""
+        with self._lock:
+            last = self._fetched if self._fetched is not None else self._started
+            return self._clock() - last >= self.unread_limit_s
 
     def snapshot(self) -> Tuple[List[dict], List[dict]]:
         """The entries and tombstones in use, without refreshing."""
@@ -1040,6 +1065,7 @@ class Published:
         self._blob_tries: Dict[str, float] = {}  # sha -> clock time of the last DELETE of a deleted export's ZIP
         self._blob_errors: Dict[str, str] = {}   # sha -> the failure last logged for it
         self._blobs_done: Set[str] = set()       # ZIPs storage no longer holds (or that were uploaded again)
+        self._unavailable = False                # catalog.outdated() when it was last checked
         catalog.on_change = self.purge_deleted
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
@@ -1101,11 +1127,37 @@ class Published:
 
     def listing(self) -> Tuple[List[dict], dict]:
         entries = self.catalog.entries()
+        self._require_catalog()
         return [self._item(entry) for entry in entries], self.catalog.status()
 
     def item(self, catalog_id: str) -> Optional[dict]:
         entry = self.catalog.entry(catalog_id)
+        self._require_catalog()
         return self._item(entry) if entry else None
+
+    def _available(self) -> bool:
+        """False while catalog.json has not been read successfully for too long (Catalog.outdated); every export
+        open here is then closed, so that one deleted meanwhile is never served from a copy that still lists it.
+        A change either way is logged."""
+        outdated = self.catalog.outdated()
+        with self._lock:
+            changed, self._unavailable = outdated != self._unavailable, outdated
+            ready = [p for p in self._preps.values() if p.state == 'ready'] if outdated else []
+        self._forget(ready)
+        closed = ''.join('; closed %s' % prep.entry['id'] for prep in ready)
+        if changed and outdated:
+            self._log('catalog: no successful read for %d minutes; no export is served until one succeeds%s'
+                      % (self.catalog.unread_limit_s // 60, closed))
+        elif changed:
+            self._log('catalog: read successfully again; exports are served again')
+        elif closed:
+            self._log('catalog: still no successful read%s' % closed)
+        return not outdated
+
+    def _require_catalog(self) -> None:
+        """CatalogUnavailable (503) while catalog.json has not been read successfully for too long."""
+        if not self._available():
+            raise CatalogUnavailable()
 
     # ------------------------------------------------------------ actions
 
@@ -1117,6 +1169,7 @@ class Published:
         never restart a broken download over and over.
         """
         entry = self.catalog.entry(catalog_id)
+        self._require_catalog()
         if entry is None:
             return None
         self._start(entry, retry=retry)
@@ -1145,6 +1198,7 @@ class Published:
         """
         match = EXPORT_ID_RE.fullmatch(export_id or '')
         entry = self.catalog.entry(match.group(1)) if match else None
+        self._require_catalog()
         if entry is None:
             return None, None  # unknown, or no longer published
         index = self.registry.get(export_id)
@@ -1457,6 +1511,7 @@ class Published:
         if removed:
             self._log('cache: removed %d abandoned download file(s)' % removed)
         entries = self.catalog.entries()
+        self._available()  # closes the exports open here once catalog.json has not been read for too long
         if not self.catalog.loaded:
             return
         self.purge_deleted()

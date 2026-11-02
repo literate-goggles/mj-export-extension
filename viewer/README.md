@@ -294,12 +294,15 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
   and the administrators in `MJV_ADMIN_EMAILS`, see **Delete…** on its card; a
   dialog names the export and asks to confirm. An export without an owner can
   be deleted by administrators only.
-- **What deleting does.** The export disappears from the viewer for everyone at
-  once: it leaves `catalog.json` (a short record of the deletion, with no name
-  or label, stays in its `deleted` list), its ZIP is deleted from the container,
-  and the instance that deleted it deletes its cached copy and thumbnails at
-  once. Other instances do the same as soon as they next read the catalog,
-  within about a minute. It cannot be undone in the viewer. The container is
+- **What deleting does.** The export leaves `catalog.json` (a short record of
+  the deletion, with no name or label, stays in its `deleted` list), its ZIP is
+  deleted from the container, and the instance that deleted it deletes its
+  cached copy and thumbnails at once. Other instances do the same when they
+  next read `catalog.json` successfully, within about a minute. An instance
+  that cannot read it keeps its last good copy for at most 5 minutes (or 5 ×
+  `MJV_CATALOG_TTL_S`, when that is longer); then it closes its exports and
+  says "The viewer can't reach its list of exports right now" until a read
+  succeeds. It cannot be undone in the viewer. The container is
   set up to keep deleted and overwritten files for 7 days (soft delete, which
   cannot be purged sooner), and the dialog says so: the export is removed from
   the viewer at once; the storage keeps a recoverable copy for 7 days, then it
@@ -381,11 +384,13 @@ count, `owner` (optional) must be an email address (kept in lower case), and
 the texts must be short and plain. An entry that fails is skipped,
 listed in the server log by position and reason, counted on the start page, and
 never downloaded. When the catalog cannot be read, the last good copy stays in
-use and the start page says so. An export removed from the catalog disappears
-within `MJV_CATALOG_TTL_S` seconds. Every minute, also while nobody uses the
-viewer, each instance re-reads the catalog, closes the exports it no longer
-lists and deletes their thumbnails; their cached ZIPs are deleted once no
-instance has used them for 10 minutes.
+use and the start page says so, for at most 5 minutes (or 5 ×
+`MJV_CATALOG_TTL_S`, when that is longer) without a successful read: after
+that the instance serves no export until it can read the catalog again. An
+export removed from the catalog disappears within `MJV_CATALOG_TTL_S` seconds.
+Every minute, also while nobody uses the viewer, each instance re-reads the
+catalog, closes the exports it no longer lists and deletes their thumbnails;
+their cached ZIPs are deleted once no instance has used them for 10 minutes.
 
 `deleted` holds one record per deleted export (no name, label or summary). An
 instance that reads one closes that export and deletes its cached ZIP and
@@ -609,7 +614,8 @@ viewer/
   does not revoke a copy of the session cookie; only a new `MJV_AUTH_SECRET`
   does. A changed label shows after a restart. Thumbnails are deleted only with
   their export. An export deleted through one instance can still be browsed
-  through another one that has it open until that instance next reads the
-  catalog (about a minute). A download that stalls inside a network read when
-  the server stops leaves its temporary file and lock to the stale-file rules
-  (another instance takes over after a minute).
+  through another one that has it open until that instance next reads
+  `catalog.json` successfully (about a minute; at most 5 minutes, or 5 ×
+  `MJV_CATALOG_TTL_S`, while its reads fail). A download that stalls inside a
+  network read when the server stops leaves its temporary file and lock to the
+  stale-file rules (another instance takes over after a minute).
