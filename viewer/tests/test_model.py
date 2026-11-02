@@ -371,7 +371,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(self.index.overview()['selection'], {
             'chosen_at': '2026-03-19T09:00:00.000Z', 'moodboards': {'available': 4, 'exported': 2, 'left_out': 2},
             'jobs': {'available': 25, 'exported': 10, 'left_out': 13, 'not_reviewed': 2},
-            'left_out_moodboard_ids': ['board-left']})
+            'left_out_moodboard_ids': ['board-left'], 'left_out_moodboards_used': 1})
         # What the designer left out is reported, never as a warning or an error, under the version that writes it.
         self.assertEqual((self.index.summary['extension_version'], self.index.summary['version_support']),
                          ('0.4.0', 'supported'))
@@ -464,6 +464,15 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(self.check('selection', index)['detail'],
                          '1,234 of 1,234 moodboards and 1,203 of 1,203 generations. Nothing was left out.')
 
+    def test_only_left_out_moodboards_that_references_use_are_counted(self):
+        export = fx.selection_export()
+        export.meta['selection']['left_out_moodboard_ids'] = ['board-left', 'board-unused']
+        export.jobs[0]['personalization_codes'].append(fx.ref('moodboard', 'board-left', 'mbcodeL'))
+        index = build(export, self.tmp)
+        # Two jobs use board-left, and no exported job uses board-unused: one moodboard is in use.
+        self.assertEqual(len(self.check('references_left_out', index)['items']), 2)
+        self.assertEqual(index.overview()['selection']['left_out_moodboards_used'], 1)
+
     def test_the_moodboard_id_wins_over_a_matching_code(self):
         # The reference names the left-out board by id; board-1 sharing its code does not make it board-1's job.
         export = fx.selection_export()
@@ -477,6 +486,9 @@ class SelectionTests(unittest.TestCase):
         export = fx.selection_export()
         export.meta['selection']['left_out_moodboard_ids'] = ['board-left', 'board-1', 'profile-1']
         index = build(export, self.tmp)
+        # Only board-left is used by a reference labelled left out; the overview counts that, not the list.
+        self.assertEqual(index.overview()['selection']['left_out_moodboard_ids'], ['board-left', 'board-1', 'profile-1'])
+        self.assertEqual(index.overview()['selection']['left_out_moodboards_used'], 1)
         self.assertEqual(index.card('job-grid-a')['moodboards'],
                          [{'id': 'board-1', 'name': 'Synthetic board one', 'link': 'exporter'}])
         reference = index.job_detail('job-grid-b')['references'][0]
@@ -508,7 +520,7 @@ class SelectionTests(unittest.TestCase):
         selection = index.overview()['selection']
         self.assertEqual(selection, {'chosen_at': None, 'moodboards': {'available': None, 'exported': None, 'left_out': None},
                                      'jobs': {'available': None, 'exported': None, 'left_out': None, 'not_reviewed': None},
-                                     'left_out_moodboard_ids': ['board-left', '7']})
+                                     'left_out_moodboard_ids': ['board-left', '7'], 'left_out_moodboards_used': 1})
         self.assertEqual(self.check('selection', index)['detail'], 'export_meta.json records the choice, but not its numbers.')
         problems = self.check('selection_invalid', index)['items']
         self.assertEqual([(p['file'], p['field']) for p in problems], [

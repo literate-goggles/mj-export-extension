@@ -231,7 +231,8 @@ function selectionSection(selection) {
     ['Moodboards', cell(boards.available), cell(boards.exported), cell(boards.left_out), h('span', {class: 'muted'}, '—')],
     ['Generations', cell(jobs.available), cell(jobs.exported), cell(jobs.left_out), cell(jobs.not_reviewed)],
   ], {caption: 'What the designer chose to export', cls: 'table--selection'}));
-  const used = arr(selection.left_out_moodboard_ids).length;
+  // Counted by the server from the references it labels left out, not from the id list as written.
+  const used = isNum(selection.left_out_moodboards_used) ? selection.left_out_moodboards_used : 0;
   if (selection.chosen_at || used) {
     sec.body.append(h('div', {class: 'selection-notes'},
       selection.chosen_at ? h('p', null, 'Chosen ', timeEl(selection.chosen_at), '.') : null,

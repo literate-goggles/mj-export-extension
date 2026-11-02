@@ -1096,6 +1096,10 @@ class ExportIndex:
             job.codes = codes
             job.unmatched_codes = {entry['code'] for entry in job.resolved_refs
                                    if entry['code'] and entry['link'] == 'unresolved'}
+        if self.selection is not None:
+            # The left-out moodboards exported jobs use, counted from the references labelled left_out:
+            # a listed id that names an exported board, or that no exported job references, is not one.
+            self.selection['left_out_moodboards_used'] = len({ref['id'] for ref in self.left_out_refs})
 
         for board in self.boards.values():
             board.links = {}

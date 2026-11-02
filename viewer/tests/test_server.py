@@ -362,6 +362,7 @@ class SelectionApiTests(ServerTestCase):
                                          'selection'})
         self.assertEqual(overview['selection']['jobs'], {'available': 25, 'exported': 10, 'left_out': 13, 'not_reviewed': 2})
         self.assertEqual(overview['selection']['left_out_moodboard_ids'], ['board-left'])
+        self.assertEqual(overview['selection']['left_out_moodboards_used'], 1)
         levels = {c['id']: c['level'] for c in overview['checks']}
         self.assertEqual([levels[k] for k in ('selection', 'references_left_out', 'parent_gaps_left_out')], ['info'] * 3)
         self.assertEqual((overview['summary']['warnings'], overview['summary']['errors']), (0, 0))

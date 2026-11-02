@@ -30,12 +30,17 @@ SENTENCE = ('2 of 4 moodboards and 10 of 25 generations. 13 generations and 2 mo
 NOT_EXPORTED = "made with this moodboard are not in this export because of the designer's choice: left out, or made after choosing."
 
 
-def no_exported_generations():
-    """selection_export() in which board-2 has no generation in the export, and two that were not exported."""
+def odd_export():
+    """selection_export() with two things the UI must not take at face value.
+
+    board-2 has no generation in the export, and two that were not exported. left_out_moodboard_ids also
+    lists board-1, which is exported, and board-unused, which no exported job references.
+    """
     export = fx.selection_export()
     export.boards[1].update(generated_job_ids=[], generated_left_out=2)
     export.jobs[3]['personalization_codes'] = []
     export.jobs[3]['flags']['profile'] = []
+    export.meta['selection']['left_out_moodboard_ids'] = ['board-left', 'board-1', 'board-unused']
     return export.sync_counts()
 
 
@@ -46,7 +51,7 @@ class SelectionBrowserTests(unittest.TestCase):
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory(prefix='mjv-e2e-selection-')
         path = fx.write_zip(fx.selection_export(), os.path.join(cls._tmp.name, 'chosen.zip'))
-        other = fx.write_zip(no_exported_generations(), os.path.join(cls._tmp.name, 'chosen-other.zip'))
+        other = fx.write_zip(odd_export(), os.path.join(cls._tmp.name, 'chosen-odd.zip'))
         cls.app = ViewerApp(cache_dir=os.path.join(cls._tmp.name, 'cache'))
         cls.export_id = cls.app.registry.open(path)[0].id
         cls.other_id = cls.app.registry.open(other)[0].id
@@ -125,6 +130,9 @@ class SelectionBrowserTests(unittest.TestCase):
         table = self.page.locator('section', has_text='What the designer chose to export').locator('tbody tr')
         self.assertEqual([' '.join(r.split()) for r in table.all_inner_texts()],
                          ['Moodboards 4 2 2 —', 'Generations 25 10 13 2'])
+        notes = self.page.locator('.selection-notes p')
+        self.assertEqual(notes.nth(1).inner_text().strip(), '1 left-out moodboard was used by exported generations. '
+                         'Job pages label those references Left out by the designer.')
         self.assertEqual(self.page.locator('.selection-notes .link-chip').inner_text(), 'Left out by the designer')
         gaps = self.page.locator('section', has_text='Parent gaps').locator('tbody tr')
         self.assertEqual(gaps.count(), 2)
@@ -188,6 +196,13 @@ class SelectionBrowserTests(unittest.TestCase):
         self.page.wait_for_selector('.section--gen', timeout=15000)
         self.assertEqual(self.page.locator('.section--gen .section__actions').count(), 0)
         self.assertNotIn('left out', self.page.locator('.callout .notes').inner_text())
+
+    def test_the_overview_counts_the_left_out_moodboards_in_use_not_the_listed_ids(self):
+        self.go('#/x/%s/overview' % self.other_id)
+        notes = self.page.locator('.selection-notes p')
+        notes.first.wait_for(timeout=15000)
+        # Three ids are listed: board-1 is in the export and nothing uses board-unused.
+        self.assertIn('1 left-out moodboard was used by exported generations.', notes.all_inner_texts()[-1])
 
     def test_a_board_without_exported_generations_keeps_the_scope_caveat(self):
         self.go('#/x/%s/moodboard/board-2' % self.other_id)

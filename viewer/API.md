@@ -118,7 +118,7 @@ Top-level fields:
 - `scope` is `meta.scope`, or null.
 - `status` and `feed_exhausted` come from `meta`.
 - `failures`, `parent_gaps` and `limitations` are the metadata lists. They are `[]` when absent or not lists.
-- **Deviation (additive):** `selection` is there only when `meta.selection` records that the designer chose what to export: `{chosen_at, moodboards: {available, exported, left_out}, jobs: {available, exported, left_out, not_reviewed}, left_out_moodboard_ids}`. `chosen_at` is normalized ISO UTC, and a value the viewer cannot read is null (an id list `[]`); the `selection_invalid` warning names it. When the designer did not choose (`selection` null or absent) or `meta.selection` is not an object, the key is absent.
+- **Deviation (additive):** `selection` is there only when `meta.selection` records that the designer chose what to export: `{chosen_at, moodboards: {available, exported, left_out}, jobs: {available, exported, left_out, not_reviewed}, left_out_moodboard_ids, left_out_moodboards_used}`. `chosen_at` is normalized ISO UTC, and a value the viewer cannot read is null (an id list `[]`); the `selection_invalid` warning names it. `left_out_moodboard_ids` is the readable ids as written. `left_out_moodboards_used` is computed: how many distinct moodboards the job references labelled `left_out` name, so an id that names an exported board or that no exported job references does not count. When the designer did not choose (`selection` null or absent) or `meta.selection` is not an object, the key is absent.
 
 `counts.observed` holds:
 
