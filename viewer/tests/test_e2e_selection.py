@@ -27,6 +27,16 @@ ENABLED = os.environ.get('MJV_E2E') == '1'
 WIDTH, HEIGHT = 1280, 800
 SENTENCE = ('2 of 4 moodboards and 10 of 25 generations. 13 generations and 2 moodboards were left out; '
             '2 generations appeared after choosing and were not exported.')
+NOT_EXPORTED = "made with this moodboard are not in this export because of the designer's choice: left out, or made after choosing."
+
+
+def no_exported_generations():
+    """selection_export() in which board-2 has no generation in the export, and two that were not exported."""
+    export = fx.selection_export()
+    export.boards[1].update(generated_job_ids=[], generated_left_out=2)
+    export.jobs[3]['personalization_codes'] = []
+    export.jobs[3]['flags']['profile'] = []
+    return export.sync_counts()
 
 
 @unittest.skipUnless(ENABLED, 'set MJV_E2E=1 to run the browser test')
@@ -36,8 +46,10 @@ class SelectionBrowserTests(unittest.TestCase):
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory(prefix='mjv-e2e-selection-')
         path = fx.write_zip(fx.selection_export(), os.path.join(cls._tmp.name, 'chosen.zip'))
+        other = fx.write_zip(no_exported_generations(), os.path.join(cls._tmp.name, 'chosen-other.zip'))
         cls.app = ViewerApp(cache_dir=os.path.join(cls._tmp.name, 'cache'))
         cls.export_id = cls.app.registry.open(path)[0].id
+        cls.other_id = cls.app.registry.open(other)[0].id
         cls.server = make_server(cls.app, '127.0.0.1', 0)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
@@ -160,23 +172,34 @@ class SelectionBrowserTests(unittest.TestCase):
         self.go('#/x/%s/moodboards' % self.export_id)
         self.page.wait_for_selector('article.bcard', timeout=15000)
         first = self.page.locator('article.bcard', has_text='Synthetic board one')
-        self.assertEqual(first.locator('.bcard__stat--gen .bcard__stat-note').inner_text(), '3 left out')
+        # One number counts generations left out and generations made after choosing, so the words cover both.
+        self.assertEqual(first.locator('.bcard__stat--gen .bcard__stat-note').inner_text(), '3 not exported')
         self.assertEqual(self.page.locator('article.bcard', has_text='Synthetic board two')
                          .locator('.bcard__stat--gen .bcard__stat-note').count(), 0)
 
         self.go('#/x/%s/moodboard/board-1' % self.export_id)
         self.wait_title('Synthetic board one')
         self.page.wait_for_selector('.section--gen .grid__item', timeout=15000)
-        self.assertEqual(self.page.locator('.section--gen .section__actions').inner_text().strip(),
-                         '3 more left out by the designer')
-        self.assertEqual(self.page.locator('.callout .notes li').first.inner_text(),
-                         '3 more generations made with this moodboard were left out by the designer.')
+        self.assertEqual(self.page.locator('.section--gen .section__actions').inner_text().strip(), '3 more not exported')
+        self.assertEqual(self.page.locator('.callout .notes li').first.inner_text(), '3 more generations ' + NOT_EXPORTED)
 
         self.go('#/x/%s/moodboard/board-2' % self.export_id)
         self.wait_title('Synthetic board two')
         self.page.wait_for_selector('.section--gen', timeout=15000)
         self.assertEqual(self.page.locator('.section--gen .section__actions').count(), 0)
         self.assertNotIn('left out', self.page.locator('.callout .notes').inner_text())
+
+    def test_a_board_without_exported_generations_keeps_the_scope_caveat(self):
+        self.go('#/x/%s/moodboard/board-2' % self.other_id)
+        self.wait_title('Synthetic board two')
+        empty = self.page.locator('.section--gen .state')
+        empty.wait_for(timeout=15000)
+        self.assertEqual(empty.locator('.state__title').inner_text(), 'No linked generations in this export')
+        self.assertEqual([p.strip() for p in empty.locator('.state__body p').all_inner_texts()], [
+            'No exported job references this board. That does not prove the board was never used: jobs outside the '
+            'export scope are not included, and older jobs may not record the reference.',
+            '2 generations ' + NOT_EXPORTED.replace("'", '’')])
+        self.assertEqual(self.page.locator('.section--gen .section__actions').count(), 0)
 
 
 if __name__ == '__main__':

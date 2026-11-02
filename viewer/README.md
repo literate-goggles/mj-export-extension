@@ -129,7 +129,8 @@ usage problem such as a path that does not exist. The JSON fields are in
   **reference images** (the pictures saved on the board, in amber frames) apart
   from the **generations** (your jobs made using the board, as job cards), and
   says how each generation is linked, and how many more generations made with
-  the board the designer left out of the export.
+  the board are not in the export because of the designer's choice (left out,
+  or made after choosing).
 - **Profiles:** custom profiles with their codes, aggregate rating counts and
   linked jobs; the global profiles the exporter synthesizes from counts; and
   personalization codes that match nothing in the export, each with its jobs.

@@ -885,7 +885,8 @@ class ExportIndex:
                     board.generated_state = 'present'
                 else:
                     board.generated, board.generated_state = None, 'invalid'
-                # Written only when the designer chose what to export: generations not exported because of it.
+                # Written only when the designer chose what to export: the board's generations in scope that the
+                # export does not have because of that choice, whether left out or made after choosing.
                 left_out = row.get('generated_left_out')
                 board.generated_left_out = left_out if _is_int(left_out) and left_out >= 0 else None
                 images = row.get('images') if isinstance(row.get('images'), list) else []
@@ -1788,9 +1789,11 @@ class ExportIndex:
         notes = self._board_notes()
         left_out = board.generated_left_out
         if left_out:
-            notes.insert(0, '{:,} {}{} made with this moodboard {} left out by the designer.'.format(
-                left_out, 'more ' if generations else '', 'generation' if left_out == 1 else 'generations',
-                'was' if left_out == 1 else 'were'))
+            # One number covers both causes, so the note names both.
+            notes.insert(0, "{:,} {}{} made with this moodboard {} not in this export because of the designer's "
+                            'choice: left out, or made after choosing.'.format(
+                                left_out, 'more ' if generations else '', 'generation' if left_out == 1 else 'generations',
+                                'is' if left_out == 1 else 'are'))
         if board.generated_state == 'absent':
             notes.append('This moodboard row has no generated_job_ids; generations are derived from explicit job references.')
         if board.unresolved_generated:

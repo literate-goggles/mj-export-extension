@@ -346,6 +346,8 @@ class SelectionTests(unittest.TestCase):
 
     SENTENCE = ('2 of 4 moodboards and 10 of 25 generations. 13 generations and 2 moodboards were left out; '
                 '2 generations appeared after choosing and were not exported.')
+    NOTE = ("3 more generations made with this moodboard are not in this export because of the designer's choice: "
+            'left out, or made after choosing.')
 
     @classmethod
     def setUpClass(cls):
@@ -416,11 +418,30 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual((items['board-1']['generated_left_out'], items['board-2']['generated_left_out']), (3, 0))
         board = self.index.moodboard_detail('board-1')
         self.assertEqual(board['moodboard']['generated_left_out'], 3)
-        self.assertEqual(board['notes'][0], '3 more generations made with this moodboard were left out by the designer.')
+        self.assertEqual(board['notes'][0], self.NOTE)
         self.assertEqual([(g['job']['job_id'], g['link']) for g in board['generations']], [('job-grid-a', 'exporter')])
         other = self.index.moodboard_detail('board-2')
         self.assertEqual(other['moodboard']['generated_left_out'], 0)
         self.assertFalse([n for n in other['notes'] if 'left out' in n])
+
+    def test_generations_made_after_choosing_are_not_called_left_out(self):
+        # The designer kept everything, then made three more generations with board-1 before the export ran.
+        # The exporter counts them in generated_left_out too, so the board must not say the designer left them out.
+        export = fx.selection_export()
+        export.meta['selection'].update(moodboards={'available': 2, 'exported': 2, 'left_out': 0},
+                                        jobs={'available': 13, 'exported': 10, 'left_out': 0, 'not_reviewed': 3},
+                                        left_out_moodboard_ids=[])
+        export.jobs[4]['personalization_codes'] = []  # job-niji no longer uses a left-out moodboard
+        export.jobs[4]['flags']['profile'] = []
+        index = build(export, self.tmp)
+        self.assertEqual(self.check('selection', index)['detail'],
+                         '2 of 2 moodboards and 10 of 13 generations. Nothing was left out; '
+                         '3 generations appeared after choosing and were not exported.')
+        self.assertEqual(index.moodboards()['items'][0]['generated_left_out'], 3)
+        notes = index.moodboard_detail('board-1')['notes']
+        self.assertEqual(notes[0], self.NOTE)
+        self.assertFalse([n for n in notes if 'left out by the designer' in n])
+        self.assertEqual((index.summary['warnings'], index.summary['errors']), (0, 0))
 
     def test_wording_for_single_items_and_for_nothing_left_out(self):
         export = fx.selection_export()
@@ -435,7 +456,8 @@ class SelectionTests(unittest.TestCase):
                          '1 of 1 moodboard and 10 of 12 generations. 1 generation was left out; '
                          '1 generation appeared after choosing and was not exported.')
         self.assertEqual(index.moodboard_detail('board-2')['notes'][0],
-                         '1 generation made with this moodboard was left out by the designer.')
+                         "1 generation made with this moodboard is not in this export because of the designer's choice: "
+                         'left out, or made after choosing.')
         export.meta['selection'].update(moodboards={'available': 1234, 'exported': 1234, 'left_out': 0},
                                         jobs={'available': 1203, 'exported': 1203, 'left_out': 0, 'not_reviewed': 0})
         index = build(export, os.path.join(self.tmp, 'again'))

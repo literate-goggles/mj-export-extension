@@ -275,7 +275,7 @@ Returns `{total, offset, limit, items: [JobCard]}`.
 
 **Deviation (additive):** `created_at_raw` is the value exactly as recorded (a string or number, else null). The exporter writes board dates without a time zone (`YYYY-MM-DD HH:MM:SS.ffffff`); `created_at` reads them as UTC, while the UI shows the raw value as written and says the zone is not recorded.
 
-**Deviation (additive):** `generated_left_out` is there only when the board row records it as a whole number of 0 or more (exports in which the designer chose what to export): how many generations made with the board were not exported because of that choice.
+**Deviation (additive):** `generated_left_out` is there only when the board row records it as a whole number of 0 or more (exports in which the designer chose what to export): how many generations made with the board are not in the export because of that choice, whether the designer left them out or made them after choosing. The export gives one number for both.
 
 ### `GET /api/exports/{id}/moodboards/{board_id}`
 
@@ -283,7 +283,7 @@ Returns `{total, offset, limit, items: [JobCard]}`.
 
 `references` are the board's own pictures. `generations` are jobs made with the board, newest first. The two lists never mix.
 
-**Deviation (additive):** `moodboard.generated_left_out` is there as in the list. When it is above 0, `notes` starts with `<N> more generations made with this moodboard were left out by the designer.` (without "more" when none of the board's generations is in the export).
+**Deviation (additive):** `moodboard.generated_left_out` is there as in the list. When it is above 0, `notes` starts with `<N> more generations made with this moodboard are not in this export because of the designer's choice: left out, or made after choosing.` (without "more" when none of the board's generations is in the export).
 
 ### `GET /api/exports/{id}/profiles`
 

@@ -383,7 +383,8 @@ class SelectionApiTests(ServerTestCase):
         self.assertEqual({k: v['generated_left_out'] for k, v in items.items()}, {'board-1': 3, 'board-2': 0})
         board = self.api('/moodboards/board-1')
         self.assertEqual(board['moodboard']['generated_left_out'], 3)
-        self.assertEqual(board['notes'][0], '3 more generations made with this moodboard were left out by the designer.')
+        self.assertEqual(board['notes'][0], "3 more generations made with this moodboard are not in this export because "
+                                            "of the designer's choice: left out, or made after choosing.")
         self.assertEqual(self.live.get_json('/api/exports/%s/moodboards/board-left' % self.eid)[0], 404)
 
 
