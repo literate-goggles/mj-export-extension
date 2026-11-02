@@ -55,7 +55,7 @@
  }
  const scan=options=>exclusive(options,()=>scanScope(options));
  async function showSelection(stored){if(!panel)return;const {selection,run:saved}=stored||await chrome.storage.local.get(['selection','run']);panel.querySelector('[data-selection]').textContent=selectionLine(selection,saved);}
- // The chooser (src/chooser.js) saves the selection itself; a saved export keeps the one it started with.
+ // The chooser (src/chooser.js) saves the selection itself. A saved export keeps the one it started with, and stops rather than export what a newer one leaves out.
  async function choose(options){
   const chooser=globalThis.mjExportChooser;if(!chooser)throw new Error('The chooser did not load: reload this page and try again');
   await exclusive(options,async()=>{
@@ -67,7 +67,7 @@
   const selection=await chooser.open();
   if(!selection){status('Closed without saving. Nothing changed.');return;}
   const stored=await chrome.storage.local.get(['selection','run']);const saved=stored.run;
-  status(`Saved. ${summaryText(choiceCounts(selection))}. `+(!saved?'Export uses this choice.':saved.status==='complete'?'Use New export to export with this choice.':'Your unfinished export keeps the choice it started with: use New export to export with this one.'));
+  status(`Saved. ${summaryText(choiceCounts(selection))}. `+(saved?'Use New export to export with this choice.':'Export uses this choice.'));
   await showSelection(stored);
  }
  async function image(url,file){
@@ -100,12 +100,14 @@
  async function start(options,newRun=false){
   if(active)throw new Error('A run is already active in this tab');validateOptions(options);active=true;try{await worker({type:'acquire'});}catch(error){active=false;throw error;}paused=false;scheduler=new ReadScheduler();let writable=false;
   try{
-   const stored=(await chrome.storage.local.get('run')).run;
-   run=newRun?null:stored;let selection=null;
+   const stored=await chrome.storage.local.get(['run','selection']);
+   run=newRun?null:stored.run||null;let selection=null;const before=run&&JSON.stringify(run);
    if(run){
     if(run.options.mode!==options.mode||run.options.max!==options.max||run.options.since!==options.since||run.options.testSubset!==options.testSubset)throw new Error('Scope differs from saved progress. Use New export to start a separate run.');
+    // A resume stops before it exports anything a newer choice leaves out: here its saved rows, after reading the rows it would export.
+    const problem=resumeProblem(stored.selection,run);if(problem)throw new Error(problem);
     run.options.images=options.images;run.failures=[];
-   }else{selection=(await chrome.storage.local.get('selection')).selection||null;const problem=selectionProblem(selection,options);if(problem)throw new Error(problem);}
+   }else{selection=stored.selection||null;const problem=selectionProblem(selection,options);if(problem)throw new Error(problem);}
    const identity=await api('identity');
    if(run&&run.identity.user_id!==identity.user_id)throw new Error('Account differs from saved export. Use New export.');
    // A new run copies the saved selection; every later attempt of it uses that copy, never a newer choice.
@@ -114,6 +116,7 @@
    const data=await getData(options);
    // Revalidate ownership on every explicit resume before using saved download progress.
    const chosen=applySelection(data,run.selection,options);
+   if(before){const problem=resumeProblem((await chrome.storage.local.get('selection')).selection,run,chosen);if(problem){writable=false;run=JSON.parse(before);await save();throw new Error(problem);}}
    const existing=new Map(run.jobs.map(j=>[j.job_id,j]));
    run.jobs=chosen.jobs.map(j=>({...j,image_files:existing.get(j.job_id)?.image_files||[]}));
    run.boards=chosen.boards;run.profiles=chosen.profiles;

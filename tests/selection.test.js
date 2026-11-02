@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {normalizeJob, normalizeBoards, normalizeProfiles, parentGaps} from '../lib/normalize.js';
 import {
-  applySelection, chooserGroups, choiceCounts, compactScan, groupState, initialChoice, makeSelection,
+  applySelection, chooserGroups, choiceCounts, compactScan, groupState, initialChoice, makeSelection, resumeProblem,
   sameScope, scopeLabel, selectionLine, selectionProblem, setEverything, setGroup, setJobs, summaryText, toggleGroup,
 } from '../lib/selection.js';
 
@@ -233,4 +233,27 @@ test('the one-line selection summary says what Export and New export will use', 
   assert.equal(selectionLine(selection, {selection}), 'What to export: 2 of 3 moodboards · 6 of 7 generations (chosen for All jobs).');
   assert.match(selectionLine(selection, {selection: null}), /Export \/ resume continues your saved export with everything in its scope; New export uses this choice\.$/);
   assert.match(selectionLine(null, {selection}), /with the choice it started with; New export exports everything\.$/);
+  // A saved export without a choice whose rows include job 3, which this choice leaves out.
+  assert.match(selectionLine(selection, {identity, selection: null, jobs: [{job_id: id(3)}], boards: []}), /\(chosen for All jobs\)\. Your saved export includes something this choice leaves out, so Export \/ resume stops: use New export to export with this choice, or Clear selection to finish the saved export as it started\.$/);
+});
+
+test('a resume stops only for a newer choice of its account that leaves out something it would export', () => {
+  const run = {identity, selection, jobs: [{job_id: id(1)}, {job_id: id(2)}], boards: [{id: '101'}]};
+  const newer = {...selection, chosen_at: '2026-03-01T00:00:00.000Z'};
+  const stop = /^You changed what to export after this export started\. To export with your new choice, use New export\. To finish this export as it started, use Clear selection first\.$/;
+  assert.equal(resumeProblem(null, run), null);
+  // The run's own choice, even if its decisions were changed in storage, is not a newer one.
+  assert.equal(resumeProblem({...selection, jobs: {[id(1)]: false}}, run), null);
+  assert.equal(resumeProblem(newer, run), null);
+  assert.match(resumeProblem({...newer, jobs: {...newer.jobs, [id(2)]: false}}, run), stop);
+  assert.match(resumeProblem({...newer, moodboards: {101: false}}, run), stop);
+  // Items the newer choice does not mention, items the run does not export, and another account's choice do not stop it.
+  assert.equal(resumeProblem({...newer, jobs: {}, moodboards: {}}, run), null);
+  assert.equal(resumeProblem({...newer, jobs: {[id(3)]: false}, moodboards: {102: false}}, run), null);
+  assert.equal(resumeProblem({...newer, user_id: 'someone-else', jobs: {[id(1)]: false}}, run), null);
+  // A run without a choice: every saved choice is newer, whatever its scope; the rows it would export can be passed in.
+  const plain = {...run, selection: null};
+  assert.match(resumeProblem({...selection, scope: {...scope, mode: 'max'}, jobs: {[id(2)]: false}}, plain), stop);
+  assert.equal(resumeProblem(newer, plain, {jobs: [{job_id: id(1)}], boards: []}), null);
+  assert.match(resumeProblem(newer, plain, {jobs: [{job_id: id(1)}, {job_id: id(3)}], boards: []}), stop);
 });

@@ -59,11 +59,11 @@ There is no need to click Export again after a completed run.
 - **Select all** and **Select none** at the top apply to everything. The line at the bottom says how much will be exported.
 - **Save selection** keeps the choice. **Cancel** or Esc closes the window, and asks first when you changed something.
 
-Export and New export then save only what is ticked. Nothing left out is downloaded or written: no image, no row, no like and no link to it; moodboard and profile codes come only from exported generations. An exported generation still names its parent, and a parent you left out is listed as a parent gap. Profiles are not part of the choice.
+**New export** then saves only what is ticked, and so does **Export** when there is no saved export to continue. Nothing left out is downloaded or written: no image, no row, no like and no link to it; moodboard and profile codes come only from exported generations. An exported generation still names its parent, and a parent you left out is listed as a parent gap. Profiles are not part of the choice.
 
 The choice belongs to the account and scope it was made for (**Include images** does not matter). An export of another scope or account is refused until you choose again for it or use **Clear selection**. The choice covers the work that was in the scan it was made from: generations and moodboards made after that are not exported until you choose again. With **Small test** on, only the first chosen moodboard is exported.
 
-An export keeps the choice it started with, also when you resume it. If you save a new choice while an export is unfinished, that export does not change: use **New export** to export with the new choice.
+An export keeps the choice it started with when you resume it, but it never exports something your latest choice leaves out. If you save a new choice that leaves out something a saved export would export, finished or not, resuming it (**Export / resume** on the page, **Export** or **Resume** in the popup) stops before it downloads or writes anything and says so. Use **New export** to export with the new choice, or **Clear selection** to finish the saved export as it started. A new choice that only adds things, or leaves out only things the saved export does not include, does not change it.
 
 ## Output
 
@@ -84,7 +84,7 @@ Folder output avoids the 2 GB ZIP limit. Individual images are held in memory br
 
 ## Resume and ownership
 
-`chrome.storage.local` keeps cursor/checkpoint, discovered and completed IDs, normalized metadata, and completed download IDs/paths. `unlimitedStorage` accommodates large metadata sets. On each explicit resume the selected own-feed scope is re-read to establish ownership in the current page session. Already completed files are checked against Chrome's download records and skipped; unfinished files are overwritten at their deterministic paths. A run keeps the choice of what to export that it started with, on every resume, so a folder never mixes two choices. No historical cursor is blindly trusted after an account change.
+`chrome.storage.local` keeps cursor/checkpoint, discovered and completed IDs, normalized metadata, and completed download IDs/paths. `unlimitedStorage` accommodates large metadata sets. On each explicit resume the selected own-feed scope is re-read to establish ownership in the current page session. Already completed files are checked against Chrome's download records and skipped; unfinished files are overwritten at their deterministic paths. A run keeps the choice of what to export that it started with, on every resume, so a folder never mixes two choices. A resume stops before it downloads or writes anything when your latest choice leaves out something it would export. No historical cursor is blindly trusted after an account change.
 
 Resume depends on Chrome retaining its download history. If a finished file is moved/deleted or its download record disappears, it may be downloaded again. A crash between download completion and saving progress may also cause a safe overwrite. Clearing extension storage removes resume state but does not delete exported files. The export folder is local data and should be shared deliberately.
 

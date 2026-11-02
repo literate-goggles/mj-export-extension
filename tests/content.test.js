@@ -172,23 +172,79 @@ test('an export with a saved selection downloads and writes only the chosen jobs
   assert.deepEqual(app.state.run.selection, selection);
 });
 
-test('resuming an export keeps the selection it started with, even after a new choice', async () => {
+// A newer choice that ticks everything: it leaves out nothing.
+const everything = { user_id: 'self', scope, chosen_at: '2026-03-01T00:00:00.000Z', jobs: Object.fromEntries([1, 2, 3, 4, 5, 6].map(n => [jobId(n), true])), moodboards: { 101: true, 102: true, 103: true } };
+const refusal = 'You changed what to export after this export started. To export with your new choice, use New export. To finish this export as it started, use Clear selection first.';
+
+test('resuming an export keeps the selection it started with after a newer choice that leaves out none of it', async () => {
   const first = harness({ feed: boardFeed, stored: { selection }, pauseOnDownload: true });
   await first.run('new', allJobs);
   assert.equal(first.state.run.status, 'paused');
-  const everything = { ...selection, chosen_at: '2026-03-01T00:00:00.000Z', jobs: Object.fromEntries([1, 2, 3, 4, 5, 6].map(n => [jobId(n), true])), moodboards: { 101: true, 102: true, 103: true } };
-  const second = harness({ feed: boardFeed, stored: { run: first.state.run, selection: everything } });
-  await second.run('resume');
-  const downloaded = [...first.downloads, ...second.downloads];
-  for (const url of hiddenDownloads) assert(!downloaded.includes(url), `${url} was downloaded`);
-  assert.deepEqual(new Set(downloaded), new Set(chosenDownloads));
-  const { jobs, boards, meta } = second.output();
-  assert.equal(meta.status, 'complete');
-  assert.deepEqual(jobs.map(j => j.job_id), [1, 2, 4, 6].map(jobId));
-  assert.deepEqual(boards.map(b => b.id), ['101', '103']);
-  assert.equal(meta.selection.chosen_at, selection.chosen_at);
-  assert.deepEqual(second.state.run.selection, selection);
-  assert.match(second.lines.at(-1), /Export \/ resume continues your saved export with the choice it started with; New export uses this choice\./);
+  // A looser choice; one for another scope that says nothing about the exported items; one for another account.
+  const unmentioned = { user_id: 'self', scope: { ...scope, mode: 'max', max: 3 }, chosen_at: '2026-03-02T00:00:00.000Z', jobs: { [jobId(1)]: true, [jobId(3)]: false }, moodboards: { 102: false } };
+  const otherAccount = { ...everything, user_id: 'someone-else', jobs: { [jobId(1)]: false }, moodboards: { 101: false } };
+  for (const newer of [everything, unmentioned, otherAccount]) {
+    const second = harness({ feed: boardFeed, stored: { run: first.state.run, selection: newer } });
+    await second.run('resume');
+    const downloaded = [...first.downloads, ...second.downloads];
+    for (const url of hiddenDownloads) assert(!downloaded.includes(url), `${url} was downloaded`);
+    assert.deepEqual(new Set(downloaded), new Set(chosenDownloads));
+    const { jobs, boards, meta } = second.output();
+    assert.equal(meta.status, 'complete');
+    assert.deepEqual(jobs.map(j => j.job_id), [1, 2, 4, 6].map(jobId));
+    assert.deepEqual(boards.map(b => b.id), ['101', '103']);
+    assert.equal(meta.selection.chosen_at, selection.chosen_at);
+    assert.deepEqual(second.state.run.selection, selection);
+    assert.match(second.lines.at(-1), /Export \/ resume continues your saved export with the choice it started with; New export uses this choice\./);
+  }
+});
+
+test('a resume stops before it downloads or writes anything when a newer choice leaves out what it exports', async () => {
+  // Paused without a choice; paused with a choice; completed with a choice.
+  const plain = harness({ feed: boardFeed, pauseOnDownload: true });
+  await plain.run('new', allJobs);
+  const chosen = harness({ feed: boardFeed, stored: { selection }, pauseOnDownload: true });
+  await chosen.run('new', allJobs);
+  const done = harness({ feed: boardFeed, stored: { selection } });
+  await done.run('new', allJobs);
+  assert.deepEqual([plain, chosen, done].map(app => app.state.run.status), ['paused', 'paused', 'complete']);
+  // Job 6 has a like, and board 102 has reference images.
+  const stricter = { ...everything, jobs: { ...everything.jobs, [jobId(6)]: false }, moodboards: { ...everything.moodboards, 102: false } };
+  const stricterThanSelection = { ...selection, chosen_at: '2026-03-01T00:00:00.000Z', jobs: { ...selection.jobs, [jobId(6)]: false } };
+  for (const [run, newer, command] of [[plain.state.run, stricter, 'export'], [plain.state.run, { ...everything, moodboards: { ...everything.moodboards, 102: false } }, 'resume'], [chosen.state.run, stricterThanSelection, 'resume'], [done.state.run, stricterThanSelection, 'export']]) {
+    const app = harness({ feed: boardFeed, stored: { run, selection: newer } });
+    await app.run(command, allJobs);
+    assert.equal(app.statuses.at(-1), refusal);
+    assert.deepEqual(app.ops, []);
+    assert.deepEqual(app.downloads, []);
+    assert.deepEqual(app.files, {});
+    assert.deepEqual(app.state.run, run);
+    assert.match(app.lines.at(-1), /Your saved export includes something this choice leaves out, so Export \/ resume stops: use New export to export with this choice, or Clear selection to finish the saved export as it started\.$/);
+  }
+  // New export uses the newer choice, and Clear selection lets the saved export finish as it started.
+  const fresh = harness({ feed: boardFeed, stored: { run: plain.state.run, selection: stricter } });
+  await fresh.run('new', allJobs);
+  assert.deepEqual(fresh.output().jobs.map(j => j.job_id), [1, 2, 3, 4, 5].map(jobId));
+  const cleared = harness({ feed: boardFeed, stored: { run: plain.state.run, selection: stricter } });
+  cleared.send('clear');
+  await settle();
+  await cleared.run('export', allJobs);
+  assert.equal(cleared.output().meta.status, 'complete');
+  assert.deepEqual(cleared.output().jobs.map(j => j.job_id), [1, 2, 3, 4, 5, 6].map(jobId));
+});
+
+test('a resume also stops when the work it reads now includes something a newer choice leaves out', async () => {
+  const first = harness({ feed: boardFeed });
+  await first.run('new', allJobs);
+  // Job 7 was made after the export; the newer choice saw it and left it out.
+  const feed = { ...boardFeed, jobs: { ...boardFeed.jobs, data: [apiJob(7, [['101', 'code-a']]), ...boardFeed.jobs.data] } };
+  const app = harness({ feed, stored: { run: first.state.run, selection: { ...everything, jobs: { ...everything.jobs, [jobId(7)]: false } } } });
+  await app.run('export', allJobs);
+  assert.equal(app.statuses.at(-1), refusal);
+  assert.deepEqual(app.ops, ['identity', 'identity', 'jobs', 'moodboards', 'profiles']);
+  assert.deepEqual(app.downloads, []);
+  assert.deepEqual(app.files, {});
+  assert.deepEqual(app.state.run, first.state.run);
 });
 
 test('a saved selection for another scope or account is refused before anything is exported', async () => {
@@ -243,7 +299,7 @@ test('choosing scans first when there is no scan for the account and scope, and 
   assert.deepEqual(app.state.scan_data.boards.map(b => [b.id, b.jobs]), [['101', [jobId(1), jobId(2)]], ['102', [jobId(2), jobId(3)]], ['103', [jobId(5)]]]);
   assert.deepEqual(app.state.run, unfinished);
   assert(app.statuses.some(text => text.startsWith('There is no scan of this scope for this account yet, so it scans first.')));
-  assert.equal(app.statuses.at(-1), 'Saved. Exporting 3 of 3 moodboards · 5 of 6 generations. Your unfinished export keeps the choice it started with: use New export to export with this one.');
+  assert.equal(app.statuses.at(-1), 'Saved. Exporting 3 of 3 moodboards · 5 of 6 generations. Use New export to export with this choice.');
   // With a scan of this account and scope, choosing reads nothing but the account.
   const again = harness({ feed: boardFeed, stored: { scan_data: app.state.scan_data }, chooser });
   await again.run('choose', allJobs);

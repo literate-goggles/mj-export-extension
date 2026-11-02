@@ -211,7 +211,14 @@ function selectionProblem(selection, options, userId) {
  }
  return null;
 }
-// One line for the panel and the popup. A saved export always keeps the choice it started with.
+// A resume keeps the choice its run started with, but never exports what the designer's latest choice for the
+// account leaves out, whatever that choice's scope. rows: what the resume would export; by default the run's own rows.
+function resumeProblem(selection, run, rows = run) {
+ if (!selection || selection.user_id !== run.identity?.user_id || (run.selection && selection.chosen_at === run.selection.chosen_at)) return null;
+ const leftOut = (rows.jobs || []).some(job => choiceOf(selection.jobs, job.job_id) === false) || (rows.boards || []).some(board => choiceOf(selection.moodboards, board.id) === false);
+ return leftOut ? 'You changed what to export after this export started. To export with your new choice, use New export. To finish this export as it started, use Clear selection first.' : null;
+}
+// One line for the panel and the popup. A saved export keeps the choice it started with, unless a newer one leaves out its rows.
 function selectionLine(selection, run) {
  let text = 'What to export: everything in the scope. “Choose what to export” lets you leave out moodboards or generations.';
  if (selection) {
@@ -219,7 +226,9 @@ function selectionLine(selection, run) {
   text = `What to export: ${counts.moodboards.chosen} of ${countLabel(counts.moodboards.total, 'moodboard')} · ${counts.jobs.chosen} of ${countLabel(counts.jobs.total, 'generation')} (chosen for ${selection.scope ? scopeLabel(selection.scope) : 'an unknown scope'}).`;
  }
  if (run && (run.selection?.chosen_at ?? null) !== (selection?.chosen_at ?? null)) {
-  text += ` Export / resume continues your saved export ${run.selection ? 'with the choice it started with' : 'with everything in its scope'}; New export ${selection ? 'uses this choice' : 'exports everything'}.`;
+  text += resumeProblem(selection, run)
+   ? ' Your saved export includes something this choice leaves out, so Export / resume stops: use New export to export with this choice, or Clear selection to finish the saved export as it started.'
+   : ` Export / resume continues your saved export ${run.selection ? 'with the choice it started with' : 'with everything in its scope'}; New export ${selection ? 'uses this choice' : 'exports everything'}.`;
  }
  return text;
 }
