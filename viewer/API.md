@@ -459,6 +459,7 @@ Procedure: `catalog.json` is read from the storage (never the copy in memory) wi
 - An id whose catalog entry is not open in the answering instance: when its ZIP is in the cache and no download of it is running, the instance verifies and opens it, waiting up to 20 seconds, then answers normally. Otherwise **(deviation, additive)** `409 {error: {code: "export_not_ready", message}, catalog: CatalogItem}` at once (during a download it does not wait); a GET never starts a download. The UI then opens it (`POST .../open`), shows the progress and repeats the request.
 - An id that the catalog no longer lists is `404 unknown_export`, even when it is open.
 - **Deviation (additive):** `503 catalog_unavailable` while the catalog has not been read for too long (Unread catalog below).
+- **Deviation:** `/files/...` answers carry `Cache-Control: private, max-age=600` instead of a day, so that the images of a deleted export leave browsers' caches within 10 minutes.
 - `ExportSummary.source` is `{type: "catalog", name: <published file name>, path: null}`; `label` is the catalog label (with ` › <root>` per root when there are several), else as in local mode.
 - `POST /api/exports/open` and `POST /api/exports/upload` (any method) are `404 not_available`; `library` and `failed` are always empty.
 

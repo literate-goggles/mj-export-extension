@@ -302,7 +302,8 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
   that cannot read it keeps its last good copy for at most 5 minutes (or 5 ×
   `MJV_CATALOG_TTL_S`, when that is longer); then it closes its exports and
   says "The viewer can't reach its list of exports right now" until a read
-  succeeds. It cannot be undone in the viewer. The container is
+  succeeds. Images a browser has already shown can stay in its cache for up to
+  10 minutes. It cannot be undone in the viewer. The container is
   set up to keep deleted and overwritten files for 7 days (soft delete, which
   cannot be purged sooner), and the dialog says so: the export is removed from
   the viewer at once; the storage keeps a recoverable copy for 7 days, then it

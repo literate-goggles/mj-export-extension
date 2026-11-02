@@ -784,6 +784,10 @@ class DownloadFlowTests(FlowTestCase):
         status, headers, image = hosted.get(jobs['items'][0]['images'][0]['thumb_url'], session)
         self.assertEqual(status, 200)
         self.assertTrue(headers['Content-Type'].startswith('image/'))
+        # A browser keeps images for 10 minutes at most: a deleted export's are gone from its cache by then.
+        status, original, _ = hosted.get(jobs['items'][0]['images'][0]['url'], session)
+        self.assertEqual([status, headers['Cache-Control'], original['Cache-Control']],
+                         [200, 'private, max-age=600', 'private, max-age=600'])
         # Opening again reuses everything; nothing exposes the cache path.
         self.assertEqual(hosted.post('/api/catalog/%s/open' % entry['id'], session)[0], 200)
         self.assertEqual(self.blob.count(entry['blob']), 1)

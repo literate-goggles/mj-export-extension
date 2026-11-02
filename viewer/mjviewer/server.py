@@ -420,6 +420,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = 'mjviewer'
     sys_version = ''
     timeout = 120
+    file_cache = FILE_CACHE  # Cache-Control of /files answers
 
     # ------------------------------------------------------------ plumbing
 
@@ -792,14 +793,14 @@ class Handler(BaseHTTPRequestHandler):
                     body = b''
                 kind = detect_image_type(body[:64])
                 if kind:
-                    return self._send_bytes(200, body, IMAGE_MIME[kind], FILE_CACHE)
+                    return self._send_bytes(200, body, IMAGE_MIME[kind], self.file_cache)
         mime = IMAGE_MIME.get(rec.kind or '')
         if not mime:
             return self._error(415, 'unsupported_media', 'not a supported image type')
         self.send_response(200)
         self.send_header('Content-Type', mime)
         self.send_header('Content-Length', str(rec.stat.size))
-        self.send_header('Cache-Control', FILE_CACHE)
+        self.send_header('Cache-Control', self.file_cache)
         self.end_headers()
         sent = 0
         try:

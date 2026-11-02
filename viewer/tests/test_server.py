@@ -283,7 +283,7 @@ class ApiTests(ServerTestCase):
         self.assertEqual(headers['Content-Type'], 'image/jpeg')
         self.assertEqual(body, fx.JPEG_8X8)
         self.assertEqual(int(headers['Content-Length']), len(fx.JPEG_8X8))
-        self.assertTrue(headers['Cache-Control'].startswith('private'))
+        self.assertEqual(headers['Cache-Control'], 'private, max-age=86400')
         self.assertNotIn('job-grid-b', card['images'][0]['url'])
 
     def test_non_image_file_is_415(self):

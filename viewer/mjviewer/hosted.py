@@ -57,6 +57,7 @@ SESSION_COOKIE = '__Host-mjv_session'
 OAUTH_COOKIE = '__Host-mjv_oauth'
 OAUTH_TTL_S = 600
 HSTS = 'max-age=31536000; includeSubDomains'
+FILE_CACHE = 'private, max-age=600'  # images of a deleted export stay in a browser's cache for 10 minutes at most
 PROBES = ('/healthz', '/robots933456.txt')
 RESOLVE_WAIT_S = 20.0  # how long a request waits for an export already in the shared cache to open
 MAINTENANCE_S = 60.0  # how often the catalog is re-read and unpublished exports are cleaned up
@@ -572,6 +573,7 @@ class HostedHandler(Handler):
 
     user: Optional[str] = None
     session_value: Optional[str] = None
+    file_cache = FILE_CACHE
 
     @property
     def config(self) -> HostedConfig:
