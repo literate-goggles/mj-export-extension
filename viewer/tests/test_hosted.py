@@ -63,6 +63,7 @@ BASE_ENV = {
     'MJV_CACHE_DIR': '/tmp/mjv-test-unused-cache',
 }
 SIG = 'TESTONLYsignature0123456789'
+WRITE_SIG = 'TESTONLYwritesignature9876543210'
 
 
 def env(**changes):
@@ -148,6 +149,50 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(any(expect in p for p in found), found)
                 self.assertFalse(any(SIG in p or 'storage.example.com' in p for p in found), found)
         self.assertEqual(load_config(env(MJV_CATALOG_URL='http://127.0.0.1:9/c?sp=r&sig=x')).catalog_ttl_s, 60)
+
+    def test_write_url_names_the_same_container_and_may_only_write_and_delete(self):
+        container = 'https://storage.example.com/exports'
+        self.assertIsNone(load_config(env()).catalog_write_url)  # deleting is off unless it is set
+        for good in (container + '?sv=2099-01-01&sp=rwdl&sig=' + WRITE_SIG, container + '/?sp=dw&sig=' + WRITE_SIG,
+                     'https://STORAGE.example.com:443/exports?sp=wd&sig=' + WRITE_SIG):
+            with self.subTest(url=good[-30:]):
+                config = load_config(env(MJV_CATALOG_WRITE_URL=good))
+                self.assertEqual(config.catalog_write_url.reveal(), good)
+                self.assertNotIn(WRITE_SIG, repr(config) + str(config))
+        for bad, expect in [('https://other.example.com/exports?sp=rwdl&sig=' + WRITE_SIG, 'same container'),
+                            (container + '-two?sp=rwdl&sig=' + WRITE_SIG, 'same container'),
+                            ('https://storage.example.com:8443/exports?sp=rwdl&sig=' + WRITE_SIG, 'same container'),
+                            ('http://storage.example.com/exports?sp=rwdl&sig=' + WRITE_SIG, 'https'),
+                            (container + '?sig=' + WRITE_SIG, 'w and d'),
+                            (container + '?sp=rwl&sig=' + WRITE_SIG, 'w and d'),
+                            (container + '?sp=rdl&sig=' + WRITE_SIG, 'w and d'),
+                            (container + '?sp=racwdl&sig=' + WRITE_SIG, 'nothing but r, w, d and l'),
+                            (container + '?sp=rwdlx&sig=' + WRITE_SIG, 'nothing but r, w, d and l'),
+                            (container + '?sp=rwdl&sp=rwdl&sig=' + WRITE_SIG, 'w and d'),
+                            (container, 'w and d'),
+                            (container + '?sp=rwdl&sig=a b', 'spaces'),
+                            (container + '?sp=rwdl&sig=' + WRITE_SIG + '#frag', 'fragment'),
+                            ('https://user:pw@storage.example.com/exports?sp=rwdl&sig=' + WRITE_SIG, 'user name')]:
+            with self.subTest(url=bad[-30:]):
+                found = problems(env(MJV_CATALOG_WRITE_URL=bad))
+                self.assertTrue(any(p.startswith('MJV_CATALOG_WRITE_URL') and expect in p for p in found), found)
+                for secret in (WRITE_SIG, SIG, 'storage.example.com', 'pw'):
+                    self.assertFalse(any(secret in p for p in found), found)
+        local = load_config(env(MJV_CATALOG_URL='http://127.0.0.1:9/c?sp=rl&sig=x',
+                                MJV_CATALOG_WRITE_URL='http://127.0.0.1:9/c?sp=rwdl&sig=y'))
+        self.assertIsNotNone(local.catalog_write_url)  # tests on this machine may use http, like MJV_CATALOG_URL
+
+    def test_admin_emails(self):
+        config = load_config(env(MJV_ADMIN_EMAILS=' Carol@Example.com, dave@example.com\terin@example.com,,'))
+        self.assertEqual(config.admin_emails, frozenset({'carol@example.com', 'dave@example.com', 'erin@example.com'}))
+        for empty in (None, '', ' , '):
+            with self.subTest(value=empty):
+                self.assertEqual(load_config(env(MJV_ADMIN_EMAILS=empty)).admin_emails, frozenset())
+        found = problems(env(MJV_ADMIN_EMAILS='carol@example.com, mallory@other.example not-an-address,'
+                                              'a@b@example.com x@sub.example.com'))
+        self.assertEqual(found, ['MJV_ADMIN_EMAILS: entry %d is not an email address at example.com' % n
+                                 for n in (2, 3, 4, 5)])
+        self.assertFalse(any('mallory' in p or 'not-an-address' in p for p in found))
 
     def test_numbers_commit_and_test_endpoints(self):
         config = load_config(env(PORT='8080', MJV_CACHE_MAX_GB='0.5', MJV_SESSION_DAYS='7', MJV_CATALOG_TTL_S='0',
@@ -326,8 +371,9 @@ class ProbeAndHeaderTests(HostedTestCase):
             data = self.json_of(body)
             self.assertEqual(set(data), {'ok', 'mode', 'commit', 'catalog', 'cache'})
             self.assertEqual((data['ok'], data['mode'], data['cache']), (True, 'hosted', {'ok': True}))
-            self.assertEqual(set(data['catalog']), {'exports', 'ok', 'age_s'})
+            self.assertEqual(set(data['catalog']), {'exports', 'ok', 'age_s', 'delete_enabled'})
             self.assertEqual((data['catalog']['exports'], data['catalog']['ok']), (1, catalog_ok))
+            self.assertIs(data['catalog']['delete_enabled'], False)
             for leak in (self.entry['id'], self.entry['sha256'], self.entry['name'], self.entry['label'], 'Synthetic',
                          self.entry['published_by'], 'publisher', self.hosted.config.cache_dir, 'alice', '@',
                          self.blob.secret, '127.0.0.1', 'HTTP 403', 'storage'):
@@ -399,7 +445,8 @@ class ProbeAndHeaderTests(HostedTestCase):
 
 class UnauthenticatedTests(HostedTestCase):
     ROUTES = ['/', '/index.html', '/x/abc/gallery', '/api/health', '/api/exports', '/api/exports/open',
-              '/api/exports/upload', '/api/catalog/{cid}', '/api/catalog/{cid}/open', '/api/exports/{cid}/overview',
+              '/api/exports/upload', '/api/catalog/{cid}', '/api/catalog/{cid}/open', '/api/catalog/{cid}/delete',
+              '/api/exports/{cid}/overview',
               '/api/exports/{cid}/jobs', '/api/exports/{cid}/jobs/job-grid-a', '/api/exports/{cid}/moodboards',
               '/api/exports/{cid}/moodboards/board-1', '/api/exports/{cid}/profiles', '/api/exports/{cid}/likes',
               '/files/{cid}/0123456789abcdef0123', '/files/{cid}/0123456789abcdef0123?size=thumb', '/missing.txt',
@@ -657,6 +704,19 @@ class SessionRouteTests(HostedTestCase):
         data = self.json_of(self.hosted.get('/api/health', self.session)[2])
         self.assertEqual((data['mode'], data['user'], data['max_upload_bytes']), ('hosted', 'alice@example.com', 0))
 
+    def test_deleting_is_off_without_a_write_url(self):
+        health = self.json_of(self.hosted.get('/api/health', self.session)[2])
+        self.assertEqual((health['delete_enabled'], health['can_delete_any']), (False, False))
+        items = self.json_of(self.hosted.get('/api/exports', self.session)[2])['catalog']['items']
+        self.assertEqual([(i['owner'], i['can_delete']) for i in items], [(None, False)])
+        before = self.blob.read_json('catalog.json')
+        status, _, body = self.hosted.post('/api/catalog/%s/delete' % self.entry['id'], self.session,
+                                           body=json.dumps({'confirm': self.entry['id']}).encode())
+        self.assertEqual((status, self.json_of(body)['error']['code']), (403, 'delete_disabled'))
+        self.assertEqual(self.blob.read_json('catalog.json'), before)
+        self.assertEqual([self.blob.count('catalog.json', method='PUT'), self.blob.count(self.entry['blob'], method='DELETE')],
+                         [0, 0])
+
     def test_upload_open_by_path_and_library_are_refused(self):
         for path in ('/api/exports/open', '/api/exports/upload'):
             for method in ('GET', 'POST'):
@@ -700,6 +760,149 @@ class SessionRouteTests(HostedTestCase):
         self.assertEqual(self.hosted.get('/api/exports/../../etc/overview', self.session)[0], 404)
         self.assertEqual(self.hosted.get('/api/catalog/%s/nope' % self.entry['id'], self.session)[0], 404)
         self.assertEqual(self.hosted.request('PUT', '/api/health', cookies=self.session.cookies)[0], 405)
+
+
+class DeleteTests(unittest.TestCase):
+    """Who may delete a published export, and the checks on the request. alice@example.com owns one export,
+    the other has no owner recorded, carol@example.com is an administrator and bob@example.com neither."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix='mjv-delete-')
+        cls.blob = FakeBlob(os.path.join(cls._tmp.name, 'blob'))
+        cls.google = FakeGoogle()
+        cls.hosted = Hosted(cls._tmp.name, cls.blob, cls.google, env={
+            'MJV_CATALOG_WRITE_URL': cls.blob.write_url, 'MJV_ADMIN_EMAILS': 'Carol@example.com'})
+        cls.sessions = {name: cls.hosted.session('%s@example.com' % name) for name in ('alice', 'bob', 'carol')}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.hosted.stop()
+        cls.blob.stop()
+        cls.google.stop()
+        cls._tmp.cleanup()
+
+    def setUp(self):
+        # Only the catalog is read and written here, so the ZIPs need not be real ones.
+        self.blob.faults.clear()
+        self.blob.write_faults.clear()
+        self.mine = self.blob.put_export(b'invented export of alice ' * 4, name='mj_export_alice.zip',
+                                         owner='Alice@Example.com')
+        self.orphan = self.blob.put_export(b'invented export without owner ' * 4, name='mj_export_orphan.zip')
+        self.blob.write_catalog([self.mine, self.orphan])
+
+    def delete(self, who, entry, body=None, headers=None):
+        body = json.dumps({'confirm': entry['id']}).encode() if body is None else body
+        status, _, answer = self.hosted.post('/api/catalog/%s/delete' % entry['id'], self.sessions[who], body=body,
+                                             headers=headers)
+        return status, json.loads(answer)
+
+    def listed(self):
+        return [e['id'] for e in self.blob.read_json('catalog.json')['exports']]
+
+    def rights(self, who):
+        items = json.loads(self.hosted.get('/api/exports', self.sessions[who])[2])['catalog']['items']
+        return {i['id']: (i['owner'], i['can_delete']) for i in items}
+
+    def assert_unchanged(self):
+        self.assertEqual(self.listed(), [self.mine['id'], self.orphan['id']])
+        for entry in (self.mine, self.orphan):
+            self.assertIsNotNone(self.blob.file(entry['blob']))
+
+    def test_owners_and_administrators_may_delete(self):
+        mine, orphan = self.mine['id'], self.orphan['id']
+        writes = self.blob.count('catalog.json', method='PUT')
+        self.assertEqual(self.rights('alice'), {mine: ('alice@example.com', True), orphan: (None, False)})
+        self.assertEqual(self.rights('bob'), {mine: ('alice@example.com', False), orphan: (None, False)})
+        self.assertEqual(self.rights('carol'), {mine: ('alice@example.com', True), orphan: (None, True)})
+        for who, admin in (('alice', False), ('bob', False), ('carol', True)):
+            with self.subTest(who=who):
+                health = json.loads(self.hosted.get('/api/health', self.sessions[who])[2])
+                self.assertEqual((health['delete_enabled'], health['can_delete_any']), (True, admin))
+        # Everyone else is refused, and nothing changes.
+        for who, entry, says in (('bob', self.mine, 'only the owner'), ('bob', self.orphan, 'no owner recorded'),
+                                 ('alice', self.orphan, 'no owner recorded')):
+            with self.subTest(who=who, entry=entry['name']):
+                status, answer = self.delete(who, entry)
+                self.assertEqual((status, answer['error']['code']), (403, 'not_owner'))
+                self.assertIn(says, answer['error']['message'])
+                self.assert_unchanged()
+        self.assertEqual(self.blob.count('catalog.json', method='PUT'), writes)
+        # The owner, then an administrator.
+        self.assertEqual(self.delete('alice', self.mine), (200, {'deleted': mine}))
+        self.assertEqual(self.delete('carol', self.orphan), (200, {'deleted': orphan}))
+        self.assertEqual(self.listed(), [])
+        stones = self.blob.read_json('catalog.json')['deleted']
+        self.assertEqual([(s['id'], s['owner'], s['deleted_by']) for s in stones],
+                         [(mine, 'alice@example.com', 'alice@example.com'), (orphan, None, 'carol@example.com')])
+        for entry in (self.mine, self.orphan):
+            self.assertIsNone(self.blob.file(entry['blob']))
+        status, answer = self.delete('alice', self.mine)  # already gone
+        self.assertEqual((status, answer['error']['code']), (404, 'unknown_catalog_entry'))
+        log = self.hosted.log.getvalue()
+        self.assertEqual(log.count('deleted %s by alice@example.com' % mine), 1)
+        self.assertEqual(log.count('deleted %s by carol@example.com' % orphan), 1)
+
+    def test_an_administrator_may_delete_an_export_someone_owns(self):
+        self.assertEqual(self.delete('carol', self.mine), (200, {'deleted': self.mine['id']}))
+        self.assertEqual(self.listed(), [self.orphan['id']])
+
+    def test_the_request_must_confirm_the_id(self):
+        path = '/api/catalog/%s/delete' % self.mine['id']
+        for body, status, code in ((b'', 400, 'bad_request'), (b'not json', 400, 'bad_request'),
+                                   (b'[]', 400, 'bad_request'), (b'{}', 400, 'bad_request'),
+                                   (b'{"confirm": null}', 400, 'bad_request'),
+                                   (json.dumps({'confirm': self.orphan['id']}).encode(), 400, 'bad_request'),
+                                   (json.dumps({'confirm': self.mine['id'].upper()}).encode(), 400, 'bad_request'),
+                                   (json.dumps({'confirm': [self.mine['id']]}).encode(), 400, 'bad_request'),
+                                   (b'{"confirm": "' + b'a' * 5000 + b'"}', 413, 'too_large')):
+            with self.subTest(body=body[:24]):
+                answered, answer = self.delete('alice', self.mine, body=body)
+                self.assertEqual((answered, answer['error']['code']), (status, code))
+                self.assert_unchanged()
+        self.assertEqual(self.hosted.get(path, self.sessions['alice'])[0], 405)
+        for catalog_id in ('0123456789abcdef', 'not-an-id', self.mine['id'] + '-1'):
+            with self.subTest(catalog_id=catalog_id):
+                status, _, answer = self.hosted.post('/api/catalog/%s/delete' % catalog_id, self.sessions['carol'],
+                                                     body=json.dumps({'confirm': catalog_id}).encode())
+                self.assertEqual((status, json.loads(answer)['error']['code']), (404, 'unknown_catalog_entry'))
+        self.assert_unchanged()
+
+    def test_token_and_origin_are_still_required(self):
+        for headers, code in [({'X-MJV-Token': ''}, 'forbidden'),
+                              ({'X-MJV-Token': self.sessions['carol'].token}, 'forbidden'),
+                              ({'Origin': 'http://evil.example'}, 'forbidden_origin'),
+                              ({'Origin': 'null'}, 'forbidden_origin'),
+                              ({'Origin': 'http://evil.example', 'X-Forwarded-Host': 'evil.example'}, 'forbidden_origin')]:
+            with self.subTest(headers=headers):
+                status, answer = self.delete('alice', self.mine, headers=headers)
+                self.assertEqual((status, answer['error']['code']), (403, code))
+        status, _, body = self.hosted.request('POST', '/api/catalog/%s/delete' % self.mine['id'],
+                                              body=json.dumps({'confirm': self.mine['id']}).encode(),
+                                              cookies=self.sessions['alice'].cookies,
+                                              headers={'X-MJV-Token': self.sessions['alice'].token})  # no Origin
+        self.assertEqual((status, json.loads(body)['error']['code']), (403, 'forbidden_origin'))
+        self.assert_unchanged()
+
+    def test_healthz_says_deleting_is_on_and_names_nobody(self):
+        status, _, body = self.hosted.request('GET', '/healthz', host='internal-probe')
+        data = json.loads(body)
+        self.assertEqual((status, data['catalog']['delete_enabled']), (200, True))
+        for leak in (b'@', b'carol', b'alice', self.blob.write_secret.encode(), self.blob.secret.encode()):
+            self.assertNotIn(leak, body)
+
+    def test_secrets_never_reach_an_answer_or_the_log(self):
+        responses = [self.hosted.get(path, self.sessions['alice']) for path in ('/api/exports', '/api/health', '/')]
+        for fault in ('403', '500'):
+            self.blob.write_faults['catalog.json'] = fault
+            responses.append(self.hosted.post('/api/catalog/%s/delete' % self.mine['id'], self.sessions['alice'],
+                                              body=json.dumps({'confirm': self.mine['id']}).encode()))
+        texts = [self.hosted.log.getvalue(), repr(self.hosted.config), repr(self.hosted.app.store)]
+        texts += [str(headers) + body.decode('utf-8', 'replace') for _, headers, body in responses]
+        for text in texts:
+            for secret in (self.blob.write_secret, self.blob.write_query, self.blob.secret, self.blob.query):
+                self.assertNotIn(secret, text)
+        self.assertEqual(json.loads(responses[-1][2])['error']['code'], 'storage_error')
 
 
 class CacheCheckTests(unittest.TestCase):
@@ -768,7 +971,8 @@ class RunTests(unittest.TestCase):
                     health = json.loads(client.get('/healthz')[2])
                     time.sleep(0.05)
                 self.assertEqual((health['catalog'], health['cache']), ({'exports': 1, 'ok': True,
-                                                                        'age_s': health['catalog']['age_s']},
+                                                                        'age_s': health['catalog']['age_s'],
+                                                                        'delete_enabled': False},
                                                                        {'ok': True}))
                 self.assertEqual(self.blob.count('catalog.json'), 1)
                 self.assertEqual(listdir(zips), [])  # abandoned downloads removed at start

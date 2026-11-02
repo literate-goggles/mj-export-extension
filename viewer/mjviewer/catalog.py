@@ -1,10 +1,12 @@
-"""Hosted mode: the published catalog and the verified ZIP cache.
+"""Hosted mode: the published catalog, the verified ZIP cache and deleting exports.
 
 A deployment publishes exports to a private blob container that holds
 catalog.json and exports/<sha256>.zip. The server reads both with a read-only
-query string (for example an Azure container SAS with sp=rl). That query string
-is treated like a password: no log line, API response, error message or
-exception ever contains it, and redirects are never followed.
+query string (for example an Azure container SAS with sp=rl). Optionally a
+second query string for the same container may also write and delete (sp=rwdl
+at most): then the owner of an export, or an administrator, can delete it. Both
+query strings are treated like passwords: no log line, API response, error
+message or exception ever contains them, and redirects are never followed.
 
 Opening a catalog entry downloads its ZIP in the background into
 <cache>/zips/<sha256>.zip: the bytes stream into a unique temporary file in the
@@ -18,14 +20,23 @@ are evicted least recently used first when the cache would pass its size limit
 (a ZIP used in the last 10 minutes is never evicted: the download fails
 instead), and every minute ZIPs (and thumbnails) of exports the catalog no
 longer lists are deleted once unused for 10 minutes.
+
+Deleting rewrites catalog.json from its raw JSON, so fields this version does
+not know survive, with If-Match on the ETag just read: the entry leaves the
+exports list and a tombstone joins the top-level deleted list. Then the ZIP is
+deleted from storage. Every instance closes a deleted export and deletes its
+cached ZIP and thumbnails as soon as its catalog shows the tombstone, used
+recently or not.
 """
 from __future__ import annotations
 
 import contextlib
+import email.utils
 import hashlib
 import http.client
 import json
 import os
+import random
 import re
 import secrets
 import shutil
@@ -63,11 +74,17 @@ PRUNE_MIN_AGE_S = 600.0  # ZIPs used this recently are never pruned or evicted (
 TOUCH_EVERY_S = PRUNE_MIN_AGE_S / 2  # a ZIP in use is touched this often, so it always looks recently used
 POLL_S = 1.0
 CLOSE_WAIT_S = 5.0       # on shutdown, how long preparations get to remove their temporary files and locks
+WRITE_ATTEMPTS = 5       # conditional writes of catalog.json before giving up (another writer kept getting there first)
+BLOB_RETRY_S = 60.0      # a deleted export's ZIP still in storage is deleted again at most this often...
+TOMBSTONE_RETRY_S = 30 * 86400.0  # ...and only while its tombstone is this recent
 BUSY = ('queued', 'waiting', 'downloading', 'verifying', 'opening')
 LOOPBACK = ('localhost', '127.0.0.1')
 USER_AGENT = 'mjviewer/%s' % __version__
 SUMMARY_COUNTS = ('jobs', 'moodboards', 'profiles', 'images')
 SUMMARY_TEXT = ('extension_version', 'status')
+EMAIL_RE = re.compile(r"[a-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                      r"[a-z][a-z0-9-]{0,61}[a-z0-9]")
+NOT_LISTED = 'this export is not published any more; it may have been deleted already'
 _CONTROL = re.compile('[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]')
 
 
@@ -118,10 +135,10 @@ def describe(exc: BaseException) -> str:
     return type(reason).__name__
 
 
-def _http_problem(what: str, status: int) -> CatalogError:
+def _http_problem(what: str, status: int, access: str = 'read-only') -> CatalogError:
     if status == 403:
         return CatalogError('forbidden', '%s: storage refused the request (HTTP 403); '
-                                         'the read-only access may have expired' % what)
+                                         'the %s access may have expired' % (what, access))
     if status == 404:
         return CatalogError('not_found', '%s: not found in storage (HTTP 404)' % what)
     if 300 <= status < 400:
@@ -130,31 +147,40 @@ def _http_problem(what: str, status: int) -> CatalogError:
     return CatalogError('storage_error', '%s: storage answered HTTP %d' % (what, status))
 
 
-def _secret_parts(query: str) -> List[str]:
-    """The query string and its long values, in the forms they could take inside a message."""
-    found = {query}
-    for _, value in urllib.parse.parse_qsl(query, keep_blank_values=True):
-        if len(value) >= 16:
-            found.update({value, urllib.parse.quote(value, safe=''), urllib.parse.quote_plus(value)})
+def _secret_parts(*queries: str) -> List[str]:
+    """The query strings and their long values, in the forms they could take inside a message."""
+    found = set()
+    for query in filter(None, queries):
+        found.add(query)
+        for _, value in urllib.parse.parse_qsl(query, keep_blank_values=True):
+            if len(value) >= 16:
+                found.update({value, urllib.parse.quote(value, safe=''), urllib.parse.quote_plus(value)})
     return sorted((s for s in found if len(s) >= 8), key=len, reverse=True)
 
 
 class BlobStore:
-    """Objects of one private container, read with a fixed read-only query string."""
+    """Objects of one private container, read with a fixed read-only query string and, when write_url gives
+    a second one for the same container, written and deleted with that one."""
 
-    def __init__(self, url: str, timeout: float = 30.0):
+    def __init__(self, url: str, timeout: float = 30.0, write_url: Optional[str] = None):
         parts = urllib.parse.urlsplit(url)
         self._base = '%s://%s%s' % (parts.scheme, parts.netloc, parts.path.rstrip('/'))
         self._query = parts.query
-        self._secrets = _secret_parts(parts.query)
+        self._write_query = urllib.parse.urlsplit(write_url).query if write_url else None
+        self._secrets = _secret_parts(parts.query, self._write_query or '')
         self._opener = opener_for(url)
         self.timeout = timeout
 
     def __repr__(self) -> str:
         return '<BlobStore>'
 
-    def url(self, name: str) -> str:
-        return '%s/%s?%s' % (self._base, urllib.parse.quote(name, safe='/'), self._query)
+    @property
+    def writable(self) -> bool:
+        return self._write_query is not None
+
+    def url(self, name: str, write: bool = False) -> str:
+        query = self._write_query if write else self._query
+        return '%s/%s?%s' % (self._base, urllib.parse.quote(name, safe='/'), query)
 
     def scrub(self, text: str) -> str:
         """Defence in depth: blank out the query string should it ever reach a message."""
@@ -200,6 +226,59 @@ class BlobStore:
         finally:
             response.close()
 
+    def _write(self, method: str, name: str, what: str, headers: Dict[str, str], data: Optional[bytes] = None):
+        """The answer's headers to a PUT or DELETE sent with the write query string; HTTPError as raised."""
+        if self._write_query is None:
+            raise CatalogError('read_only', '%s: this server has no write access to the storage' % what)
+        sent = {'User-Agent': USER_AGENT}
+        sent.update(headers)
+        request = urllib.request.Request(self.url(name, write=True), data=data, headers=sent, method=method)
+        with self._opener.open(request, timeout=self.timeout) as response:
+            response.read(65536)
+            return response.headers
+
+    def put(self, name: str, data: bytes, what: str, if_match: Optional[str] = None,
+            if_none_match: Optional[str] = None) -> Optional[str]:
+        """Replace a whole JSON object (a block blob) on a condition; returns its new ETag. CatalogError
+        'changed' when the condition failed (HTTP 412, or 409): another writer got there first."""
+        headers = {'x-ms-blob-type': 'BlockBlob', 'Content-Type': 'application/json'}
+        if if_match:
+            headers['If-Match'] = if_match
+        if if_none_match:
+            headers['If-None-Match'] = if_none_match
+        try:
+            return self._write('PUT', name, what, headers, data).get('ETag')
+        except CatalogError:
+            raise
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if exc.code in (409, 412):
+                raise CatalogError('changed', '%s changed while it was being written' % what) from None
+            raise _http_problem(what, exc.code, 'write') from None
+        except Exception as exc:
+            raise CatalogError('unreachable', '%s: storage unreachable (%s)' % (what, describe(exc))) from None
+
+    def delete(self, name: str, what: str, unmodified_since: Optional[float] = None) -> bool:
+        """Delete an object and its snapshots; False when it was already gone. With unmodified_since (epoch
+        seconds) only when it was not written after that: CatalogError 'changed' otherwise."""
+        headers = {'x-ms-delete-snapshots': 'include'}
+        if unmodified_since is not None:
+            headers['If-Unmodified-Since'] = email.utils.formatdate(unmodified_since, usegmt=True)
+        try:
+            self._write('DELETE', name, what, headers)
+        except CatalogError:
+            raise
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            if exc.code == 404:
+                return False
+            if exc.code == 412:
+                raise CatalogError('changed', '%s was written again since' % what) from None
+            raise _http_problem(what, exc.code, 'write') from None
+        except Exception as exc:
+            raise CatalogError('unreachable', '%s: storage unreachable (%s)' % (what, describe(exc))) from None
+        return True
+
 
 # ---------------------------------------------------------------- catalog
 
@@ -212,6 +291,14 @@ def _plain(value, limit: int) -> Optional[str]:
 
 def _count(value) -> bool:
     return value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
+
+
+def email_address(value) -> Optional[str]:
+    """value in lower case when it is a plausible email address (ASCII, one @, a dotted domain), else None."""
+    if not isinstance(value, str) or len(value) > 254 or not value.isascii():
+        return None
+    value = value.lower()
+    return value if EMAIL_RE.fullmatch(value) else None
 
 
 def _entry(item) -> Tuple[Optional[dict], str]:
@@ -246,6 +333,13 @@ def _entry(item) -> Tuple[Optional[dict], str]:
         published_by = None
     if published_by is not None and _plain(published_by, 200) is None:
         return None, 'published_by is not a short text'
+    owner = item.get('owner')
+    if owner == '':
+        owner = None
+    if owner is not None:
+        owner = email_address(owner)
+        if owner is None:
+            return None, 'owner is not an email address'
     raw_summary = item.get('summary')
     if raw_summary is None:
         raw_summary = {}
@@ -265,15 +359,31 @@ def _entry(item) -> Tuple[Optional[dict], str]:
     summary['export_time'] = iso_utc(parse_date(export_time)) if isinstance(export_time, (str, int, float)) \
         and not isinstance(export_time, bool) else None
     return {'id': sha[:16], 'sha256': sha, 'blob': 'exports/%s.zip' % sha, 'size': size, 'name': name,
-            'label': label, 'published_at': published_at, 'published_by': published_by, 'summary': summary}, ''
+            'label': label, 'published_at': published_at, 'published_by': published_by, 'owner': owner,
+            'summary': summary}, ''
+
+
+def _tombstone(item) -> Optional[dict]:
+    """What the server uses of one entry of the top-level deleted list ({id, sha256, deleted_ts}), or None.
+    It needs a valid sha256, the id that goes with it and a deleted_at date; the rest is kept as written."""
+    if not isinstance(item, dict):
+        return None
+    sha = item.get('sha256')
+    if not isinstance(sha, str) or not SHA_RE.fullmatch(sha) or item.get('id') != sha[:16]:
+        return None
+    deleted_at = item.get('deleted_at')
+    moment = parse_date(deleted_at) if _plain(deleted_at, 64) else None
+    if moment is None:
+        return None
+    return {'id': sha[:16], 'sha256': sha, 'deleted_ts': moment.timestamp()}
 
 
 def _reject_constant(name: str):
     raise ValueError('%s is not valid JSON' % name)
 
 
-def parse_catalog(raw: bytes) -> Tuple[List[dict], List[dict], Optional[str]]:
-    """(entries, skipped, updated_at). Bad entries are skipped with a reason, never used."""
+def _load(raw: bytes) -> dict:
+    """catalog.json as its whole JSON object (every field kept), checked to be a version 1 catalog."""
     try:
         data = json.loads(raw.decode('utf-8'), parse_constant=_reject_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -281,9 +391,39 @@ def parse_catalog(raw: bytes) -> Tuple[List[dict], List[dict], Optional[str]]:
     version = data.get('version') if isinstance(data, dict) else None
     if type(version) is not int or version != 1:
         raise CatalogError('bad_catalog', 'catalog.json is not a version 1 catalog')
-    items = data.get('exports')
-    if not isinstance(items, list):
+    if not isinstance(data.get('exports'), list):
         raise CatalogError('bad_catalog', 'catalog.json has no exports list')
+    return data
+
+
+def dump_catalog(data: dict) -> bytes:
+    """catalog.json as indented UTF-8 JSON with a final newline."""
+    try:
+        return (json.dumps(data, indent=1, ensure_ascii=False) + '\n').encode('utf-8')
+    except UnicodeEncodeError:  # a lone surrogate somewhere in the catalog: escape everything
+        return (json.dumps(data, indent=1, ensure_ascii=True) + '\n').encode('ascii')
+
+
+def parse_catalog(raw: bytes, deleted: Optional[List[dict]] = None) -> Tuple[List[dict], List[dict], Optional[str]]:
+    """(entries, skipped, updated_at). Bad entries are skipped with a reason, never used. deleted, when given,
+    receives the usable tombstones of the top-level deleted list (the newest MAX_ENTRIES)."""
+    data = _load(raw)
+    entries, skipped = _entries(data['exports'])
+    stones = data.get('deleted')
+    if deleted is not None and isinstance(stones, list):
+        for item in stones[-MAX_ENTRIES:]:
+            try:
+                stone = _tombstone(item)
+            except Exception:  # like a bad entry, a bad tombstone only skips itself
+                stone = None
+            if stone is not None:
+                deleted.append(stone)
+    updated = data.get('updated_at')
+    return entries, skipped, iso_utc(parse_date(updated)) if _plain(updated, 64) else None
+
+
+def _entries(items: list) -> Tuple[List[dict], List[dict]]:
+    """The usable entries of an exports list, and the skipped ones as {index, reason}."""
     entries: List[dict] = []
     skipped: List[dict] = []
     seen: Set[str] = set()
@@ -301,8 +441,7 @@ def parse_catalog(raw: bytes) -> Tuple[List[dict], List[dict], Optional[str]]:
         entries.append(entry)
     if len(items) > MAX_ENTRIES:
         skipped.append({'index': MAX_ENTRIES, 'reason': 'more than %d entries; the rest are ignored' % MAX_ENTRIES})
-    updated = data.get('updated_at')
-    return entries, skipped, iso_utc(parse_date(updated)) if _plain(updated, 64) else None
+    return entries, skipped
 
 
 class Catalog:
@@ -319,6 +458,7 @@ class Catalog:
         self._entries: List[dict] = []
         self._by_id: Dict[str, dict] = {}
         self._skipped: List[dict] = []
+        self._deleted: List[dict] = []  # tombstones: {id, sha256, deleted_ts}
         self._updated_at: Optional[str] = None
         self._etag: Optional[str] = None
         self._fetched: Optional[float] = None  # clock time of the last good answer (200 or 304)
@@ -326,6 +466,8 @@ class Catalog:
         self._ok = False
         self._error: Optional[str] = None
         self._inflight: Optional[threading.Event] = None
+        self._version = 0  # counts catalogs this instance wrote itself (adopt)
+        self.on_change: Optional[Callable[[], None]] = None  # called after a changed catalog was read
 
     def refresh(self, force: bool = False) -> None:
         """Fetch when stale, one request at a time. The caller that finds it stale fetches; others
@@ -351,7 +493,7 @@ class Catalog:
 
     def _fetch(self) -> None:
         with self._lock:
-            etag = self._etag
+            etag, version = self._etag, self._version
         try:
             status, tag, body = self.store.get(CATALOG_NAME, 'catalog.json', etag=etag, timeout=self.timeout)
             if status == 304:
@@ -361,7 +503,8 @@ class Catalog:
                 return
             if status != 200:
                 raise CatalogError('storage_error', 'catalog.json: storage answered HTTP %d' % status)
-            entries, skipped, updated = parse_catalog(body)
+            deleted: List[dict] = []
+            entries, skipped, updated = parse_catalog(body, deleted)
         except Exception as exc:  # CatalogError, or a bug: either way the last good catalog stays in use
             message = self.store.scrub(exc.message if isinstance(exc, CatalogError)
                                        else 'catalog.json could not be read (%s)' % type(exc).__name__)
@@ -373,13 +516,39 @@ class Catalog:
                 self._log('catalog: %s; keeping the last good catalog' % message)
             return
         with self._lock:
-            self._entries, self._skipped, self._updated_at = entries, skipped, updated
-            self._by_id = {entry['id']: entry for entry in entries}
-            self._etag = tag
-            self._fetched = self._checked = self._clock()
-            self._ok, self._error = True, None
+            if self._version != version:
+                return  # this instance wrote a newer catalog while this answer was on its way: keep that one
+            self._install(entries, skipped, updated, deleted, tag)
         self._log('catalog: %d export(s) listed%s' % (len(entries), ''.join(
             '; entry %d skipped (%s)' % (s['index'], s['reason']) for s in skipped[:20])))
+        if self.on_change is not None:
+            try:
+                self.on_change()
+            except Exception:  # cleaning up after deleted exports must never break reading the catalog
+                self._log(self.store.scrub(traceback.format_exc(limit=5)).rstrip())
+
+    def _install(self, entries: List[dict], skipped: List[dict], updated: Optional[str], deleted: List[dict],
+                 etag: Optional[str]) -> None:
+        """Under the lock: serve this catalog from now on."""
+        self._entries, self._skipped, self._updated_at, self._deleted = entries, skipped, updated, deleted
+        self._by_id = {entry['id']: entry for entry in entries}
+        self._etag = etag
+        self._fetched = self._checked = self._clock()
+        self._ok, self._error = True, None
+
+    def adopt(self, raw: bytes, etag: Optional[str]) -> None:
+        """Serve a catalog this instance has just written (with the ETag storage gave it) at once, instead of
+        after the next refresh; a refresh already on its way with the older one is dropped."""
+        deleted: List[dict] = []
+        entries, skipped, updated = parse_catalog(raw, deleted)
+        with self._lock:
+            self._version += 1
+            self._install(entries, skipped, updated, deleted, etag)
+
+    def snapshot(self) -> Tuple[List[dict], List[dict]]:
+        """The entries and tombstones in use, without refreshing."""
+        with self._lock:
+            return list(self._entries), list(self._deleted)
 
     @property
     def loaded(self) -> bool:
@@ -723,6 +892,16 @@ class ZipCache:
             pass
         return found
 
+    def remove(self, shas: Set[str]) -> List[str]:
+        """Delete these ZIPs at once, however recently used (their exports were deleted); returns those removed."""
+        removed = []
+        for _, _, path, sha in self._zips():
+            if sha in shas:
+                self._remove(path)
+                self._forget(sha)
+                removed.append(sha)
+        return removed
+
     def prune(self, listed: Set[str], in_use: Set[str]) -> List[str]:
         """Delete ZIPs the catalog no longer lists, unless used recently or open here."""
         removed = []
@@ -769,6 +948,8 @@ class _Prep:
         self.export_ids: List[str] = []
         self.failed_roots: List[dict] = []  # export roots of the ZIP that could not be read (the others opened)
         self.finished = threading.Event()
+        self.cancel = threading.Event()  # the server stops, or the export was deleted
+        self.deleted = False
 
     def stage(self, state: str, done: int = 0) -> None:
         self.state, self.done = state, done
@@ -781,18 +962,25 @@ class Published:
     """Catalog entries, their state in this process, and the exports opened from them."""
 
     def __init__(self, catalog: Catalog, cache: ZipCache, registry, thumbs_dir: str,
-                 log: Optional[Callable[[str], None]] = None, slots: int = 2):
+                 log: Optional[Callable[[str], None]] = None, slots: int = 2,
+                 clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time):
         self.catalog = catalog
         self.store = catalog.store
         self.cache = cache
         self.registry = registry
         self.thumbs_dir = thumbs_dir
         self._log = log or (lambda message: None)
+        self._clock = clock
+        self._wall = wall
         self._lock = threading.Lock()
         self._preps: Dict[str, _Prep] = {}
         self._threads: Set[threading.Thread] = set()
         self._slots = threading.BoundedSemaphore(slots)
         self._stop = threading.Event()
+        self._blob_tries: Dict[str, float] = {}  # sha -> clock time of the last DELETE of a deleted export's ZIP
+        self._blob_errors: Dict[str, str] = {}   # sha -> the failure last logged for it
+        self._blobs_done: Set[str] = set()       # ZIPs storage no longer holds (or that were uploaded again)
+        catalog.on_change = self.purge_deleted
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
         """Stop every preparation and wait for them (up to timeout), so that a download in progress
@@ -801,6 +989,8 @@ class Published:
         deadline = time.monotonic() + timeout
         with self._lock:
             threads = list(self._threads)
+            for prep in self._preps.values():
+                prep.cancel.set()
         for thread in threads:
             thread.join(max(0.0, deadline - time.monotonic()))
 
@@ -845,7 +1035,7 @@ class Published:
             state, done = 'downloading', self.cache.foreign_progress(sha) or 0
         return {'id': entry['id'], 'name': entry['name'], 'label': entry['label'], 'size': size,
                 'published_at': entry['published_at'], 'published_by': entry['published_by'],
-                'summary': dict(entry['summary']), 'state': state,
+                'owner': entry['owner'], 'summary': dict(entry['summary']), 'state': state,
                 'progress': {'done': done, 'total': size} if state in ('downloading', 'verifying') else None,
                 'error': error, 'exports': exports, 'failed_roots': failed_roots}
 
@@ -878,6 +1068,8 @@ class Published:
             if prep is not None and prep.entry['sha256'] == entry['sha256'] and (prep.state != 'failed' or not retry):
                 return prep
             prep = self._preps[entry['id']] = _Prep(entry)
+            if self._stop.is_set():
+                prep.cancel.set()
             thread = threading.Thread(target=self._run, args=(prep,), name='mjv-prepare-%s' % entry['id'], daemon=True)
             self._threads.add(thread)
         thread.start()
@@ -936,8 +1128,15 @@ class Published:
             prep.finished.set()
             with self._lock:
                 self._threads.discard(threading.current_thread())
+                orphan = prep.deleted and self._preps.get(prep.entry['id']) is prep
+            if orphan:  # deleted while it ran: what it opened or wrote goes now
+                self._purge({prep.entry['id']: prep.entry['sha256']}, quiet=True)
 
     def _fail(self, prep: _Prep, code: str, message: str) -> None:
+        if prep.deleted:
+            prep.error = {'code': 'deleted', 'message': 'this export was deleted'}
+            prep.stage('failed')
+            return
         prep.error = {'code': code, 'message': self.store.scrub(message)}
         prep.stage('failed')
         self._log('prepare %s failed: %s' % (prep.entry['id'], prep.error['message']))
@@ -947,12 +1146,12 @@ class Published:
         entry = prep.entry
         sha, size = entry['sha256'], entry['size']
         while True:
-            if self._stop.is_set():
+            if prep.cancel.is_set():
                 raise CatalogError('cancelled', 'the server is stopping')
             if self.cache.present(sha):
                 if not self.cache.is_verified(sha, size):
                     prep.stage('verifying')
-                    if not self.cache.verify(sha, size, prep.progress, self._stop):
+                    if not self.cache.verify(sha, size, prep.progress, prep.cancel):
                         self._log('cache: %s did not match its SHA-256; downloading it again' % entry['id'])
                         self.cache.discard(sha)
                         continue
@@ -967,12 +1166,12 @@ class Published:
                     reserved = sum(sizes.get(other, 0) for other in self.cache.active_downloads() if other != sha)
                     self._evicted(self.cache.make_room(size, keep=sha, in_use=self._in_flight(), reserved=reserved))
                     prep.stage('downloading')
-                    self.cache.download(entry, self.store, prep.progress, self._stop)
+                    self.cache.download(entry, self.store, prep.progress, prep.cancel)
                 finally:
                     self.cache.unlock(sha)
                 continue
             prep.stage('waiting', self.cache.foreign_progress(sha) or 0)
-            self._stop.wait(POLL_S)
+            prep.cancel.wait(POLL_S)
 
     def _evicted(self, shas: List[str]) -> None:
         if shas:
@@ -980,18 +1179,178 @@ class Published:
                 gone = [p for p in self._preps.values() if p.entry['sha256'] in shas and p.state not in BUSY]
             self._forget(gone)
 
+    # ---------------------------------------------------------- deleting
+
+    def delete(self, catalog_id: str, user: str, admin: bool = False) -> dict:
+        """Delete a published export for user, its owner or an administrator; returns its entry.
+
+        catalog.json is read fresh with its ETag, the request is checked against that copy, and the file is
+        written back from its raw JSON without the entry and with a tombstone, on that ETag only. When
+        another writer got there first, all of it starts over, WRITE_ATTEMPTS times at most. Then the ZIP
+        is deleted from storage (already gone is fine; a failure is retried by maintain()), and this instance
+        closes the export and deletes its cached ZIP and thumbnails at once. CatalogError codes:
+        delete_disabled, unknown_catalog_entry, not_owner, catalog_busy, storage_error."""
+        if not self.store.writable:
+            raise CatalogError('delete_disabled', 'deleting exports is not turned on for this viewer')
+        match = EXPORT_ID_RE.fullmatch(catalog_id or '')
+        if not match or match.group(2):
+            raise CatalogError('unknown_catalog_entry', NOT_LISTED)
+        for attempt in range(1, WRITE_ATTEMPTS + 1):
+            data, etag = self._fresh_catalog()
+            entry = next((e for e in _entries(data['exports'])[0] if e['id'] == catalog_id), None)
+            if entry is None:
+                raise CatalogError('unknown_catalog_entry', NOT_LISTED)
+            owner, sha = entry['owner'], entry['sha256']
+            if not admin and (owner is None or owner != user):
+                raise CatalogError('not_owner', 'only the owner of this export or an administrator can delete it'
+                                   if owner else 'this export has no owner recorded, so only an administrator '
+                                                 'can delete it')
+            stones = data.get('deleted')
+            if stones is None:
+                stones = []
+            if not isinstance(stones, list):
+                raise CatalogError('storage_error', 'catalog.json has a deleted field that is not a list; '
+                                                    'nothing was deleted')
+            now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(self._wall()))
+            data['exports'] = [item for item in data['exports'] if not (
+                isinstance(item, dict) and (item.get('id') == catalog_id or item.get('sha256') == sha))]
+            data['deleted'] = stones + [{'id': catalog_id, 'sha256': sha, 'size': entry['size'], 'owner': owner,
+                                         'deleted_at': now, 'deleted_by': user}]
+            data['updated_at'] = now
+            body = dump_catalog(data)
+            try:
+                tag = self.store.put(CATALOG_NAME, body, 'catalog.json', if_match=etag)
+            except CatalogError as exc:
+                if exc.code != 'changed':
+                    raise CatalogError('storage_error', '%s; nothing was deleted' % exc.message) from None
+                if attempt < WRITE_ATTEMPTS:
+                    time.sleep(random.uniform(0.05, 0.25) * attempt)
+                continue
+            self.catalog.adopt(body, tag)
+            self._log('deleted %s by %s' % (catalog_id, user))
+            self._delete_blob(catalog_id, sha)
+            self._purge({catalog_id: sha}, wait_s=CLOSE_WAIT_S, quiet=True)
+            return entry
+        raise CatalogError('catalog_busy', 'the list of exports kept changing while it was being updated; '
+                                           'nothing was deleted, try again')
+
+    def _fresh_catalog(self) -> Tuple[dict, str]:
+        """catalog.json as storage holds it right now (never the copy in use), with its ETag."""
+        try:
+            status, etag, raw = self.store.get(CATALOG_NAME, 'catalog.json', timeout=self.catalog.timeout)
+            if status != 200 or not etag:
+                raise CatalogError('storage_error', 'catalog.json: storage answered HTTP %d without an ETag' % status)
+            return _load(raw), etag
+        except CatalogError as exc:
+            if exc.code == 'not_found':
+                raise CatalogError('unknown_catalog_entry', NOT_LISTED) from None
+            raise CatalogError('storage_error', '%s; nothing was deleted' % exc.message) from None
+
+    def _delete_blob(self, catalog_id: str, sha: str, since: Optional[float] = None) -> None:
+        """DELETE the ZIP of a deleted export, unless (with since) it was uploaded again after that time. A
+        failure is logged once per message; maintain() tries again every BLOB_RETRY_S."""
+        with self._lock:
+            self._blob_tries[sha] = self._clock()
+        try:
+            existed = self.store.delete('exports/%s.zip' % sha, 'the published ZIP', unmodified_since=since)
+        except CatalogError as exc:
+            if exc.code != 'changed':
+                message = self.store.scrub(exc.message)
+                with self._lock:
+                    repeated = self._blob_errors.get(sha) == message
+                    self._blob_errors[sha] = message
+                if not repeated:
+                    self._log('catalog: the ZIP of %s is still in storage (%s); trying again every minute'
+                              % (catalog_id, message))
+                return
+            existed = False
+            self._log('catalog: kept the ZIP of %s, which was uploaded again after it was deleted' % catalog_id)
+        with self._lock:
+            self._blobs_done.add(sha)
+            self._blob_errors.pop(sha, None)
+        if existed and since is not None:
+            self._log('catalog: deleted the ZIP of %s from storage' % catalog_id)
+
+    def _purge(self, gone: Dict[str, str], wait_s: float = 0.0, quiet: bool = False) -> None:
+        """Close the exports of deleted entries ({catalog id: sha256}) and delete their cached ZIPs and
+        thumbnails at once, however recently used. A preparation still running is stopped (and waited for up
+        to wait_s); one that has not ended by then does this itself when it ends."""
+        if not gone:
+            return
+        with self._lock:
+            preps = [p for p in self._preps.values() if p.entry['id'] in gone]
+            for prep in preps:
+                prep.deleted = True
+                prep.cancel.set()
+        deadline = time.monotonic() + wait_s
+        for prep in preps:
+            prep.finished.wait(max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            idle = [p for p in preps if p.state not in BUSY]
+        self._forget(idle)
+        touched = {p.entry['id'] for p in idle if p.state == 'ready'}
+        touched.update(sha[:16] for sha in self.cache.remove(set(gone.values())))
+        folders = []
+        try:
+            with os.scandir(self.thumbs_dir) as it:
+                for entry in it:
+                    match = EXPORT_ID_RE.fullmatch(entry.name)
+                    if match and match.group(1) in gone and entry.is_dir(follow_symlinks=False):
+                        folders.append((entry.path, match.group(1)))
+        except OSError:
+            folders = []
+        for path, catalog_id in folders:
+            shutil.rmtree(path, ignore_errors=True)
+            touched.add(catalog_id)
+        if not quiet:
+            for catalog_id in sorted(touched):
+                self._log('removed %s from this instance: it was deleted' % catalog_id)
+
+    def purge_deleted(self) -> None:
+        """When a changed catalog arrives, and every minute: the exports its tombstones name, unless it lists
+        them again, are closed here and their cached ZIPs and thumbnails deleted at once."""
+        entries, stones = self.catalog.snapshot()
+        listed = {entry['id'] for entry in entries}
+        self._purge({stone['id']: stone['sha256'] for stone in stones if stone['id'] not in listed})
+
+    def _retry_blob_deletes(self) -> None:
+        """Delete the ZIPs of exports deleted in the last TOMBSTONE_RETRY_S that storage may still hold (an
+        earlier DELETE failed, or another instance wrote the tombstone), each at most every BLOB_RETRY_S and
+        once confirmed gone never again; never the ZIP of an export that is listed again, nor one uploaded
+        again after its latest tombstone."""
+        if not self.store.writable:
+            return
+        entries, stones = self.catalog.snapshot()
+        listed = {entry['sha256'] for entry in entries}
+        latest: Dict[str, dict] = {}
+        for stone in stones:
+            known = latest.get(stone['sha256'])
+            if known is None or stone['deleted_ts'] > known['deleted_ts']:
+                latest[stone['sha256']] = stone
+        now, wall = self._clock(), self._wall()
+        with self._lock:
+            due = [stone for sha, stone in latest.items()
+                   if sha not in listed and sha not in self._blobs_done
+                   and wall - stone['deleted_ts'] <= TOMBSTONE_RETRY_S
+                   and (sha not in self._blob_tries or now - self._blob_tries[sha] >= BLOB_RETRY_S)]
+        for stone in due:
+            self._delete_blob(stone['id'], stone['sha256'], since=stone['deleted_ts'])
+
     # ------------------------------------------------------- maintenance
 
     def maintain(self) -> None:
         """Run every minute (HostedApp): remove abandoned downloads; then, on the latest good catalog, close
         the exports it no longer lists and delete their thumbnails, and their cached ZIPs once unused for
-        PRUNE_MIN_AGE_S. No cached ZIP or thumbnail is deleted before a catalog has been read once."""
+        PRUNE_MIN_AGE_S (deleted exports at once), and delete again the ZIPs of deleted exports that storage
+        may still hold. No cached ZIP or thumbnail is deleted before a catalog has been read once."""
         removed = self.cache.cleanup()
         if removed:
             self._log('cache: removed %d abandoned download file(s)' % removed)
         entries = self.catalog.entries()
         if not self.catalog.loaded:
             return
+        self.purge_deleted()
+        self._retry_blob_deletes()
         listed = {entry['id']: entry['sha256'] for entry in entries}
         with self._lock:
             gone = [p for cid, p in self._preps.items()

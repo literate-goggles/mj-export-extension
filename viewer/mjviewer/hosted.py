@@ -14,8 +14,12 @@ python3 -m mjviewer --hosted takes its whole configuration from the environment
   platform's start probe, which carry no data.
 * Exports come only from the published catalog (catalog.py). There is no
   upload, no opening by path and no library, and no file path is shown.
+* Everyone signed in sees every published export. With MJV_CATALOG_WRITE_URL
+  set, an export's owner (the email recorded when it was published) or an
+  administrator (MJV_ADMIN_EMAILS) can delete it: it leaves catalog.json and
+  its ZIP is deleted from storage. Without it nothing is ever written there.
 
-The OAuth client secret, the signing secret and the storage query string are
+The OAuth client secret, the signing secret and the storage query strings are
 held as Secret values: they never appear in a log line, a page or a response.
 """
 from __future__ import annotations
@@ -40,7 +44,8 @@ from dataclasses import dataclass
 from typing import List, Mapping, Optional, Tuple
 
 from . import API_VERSION, __version__
-from .catalog import (LOOPBACK, USER_AGENT, BlobStore, Catalog, Published, ZipCache, describe, opener_for)
+from .catalog import (LOOPBACK, USER_AGENT, BlobStore, Catalog, CatalogError, Published, ZipCache, describe,
+                      email_address, opener_for)
 from .server import (DEFAULT_STATIC, PIL_IMAGE, Handler, ViewerApp, ViewerServer, default_cache_dir, dump_json)
 from .sources import Limits
 
@@ -56,7 +61,9 @@ PROBES = ('/healthz', '/robots933456.txt')
 RESOLVE_WAIT_S = 20.0  # how long a request waits for an export already in the shared cache to open
 MAINTENANCE_S = 60.0  # how often the catalog is re-read and unpublished exports are cleaned up
 MAX_GOOGLE_BYTES = 256 * 1024
-MAX_OPEN_BODY = 4096
+MAX_POST_BODY = 4096
+DELETE_STATUS = {'delete_disabled': 403, 'not_owner': 403, 'unknown_catalog_entry': 404, 'catalog_busy': 409,
+                 'storage_error': 502}
 _HOST_RE = re.compile(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?')
 _DOMAIN_RE = re.compile(r'(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]')
 _SIGNED_RE = re.compile(r'[A-Za-z0-9_-]{2,4000}\.[A-Za-z0-9_-]{43}')
@@ -111,6 +118,8 @@ class HostedConfig:
     google_auth_url: str = GOOGLE_AUTH_URL
     google_token_url: str = GOOGLE_TOKEN_URL
     google_tokeninfo_url: str = GOOGLE_TOKENINFO_URL
+    catalog_write_url: Optional[Secret] = None  # None: deleting is turned off
+    admin_emails: frozenset = frozenset()
 
     @property
     def redirect_uri(self) -> str:
@@ -159,6 +168,51 @@ def _catalog_problems(value: str) -> List[str]:
         if set(permissions) - set('rl'):
             problems.append('MJV_CATALOG_URL must be read-only: its sp parameter allows more than r and l')
     return problems
+
+
+def _container(url: str) -> tuple:
+    """(scheme, host, port, path) of a container URL, to tell whether two URLs name the same container."""
+    parts = urllib.parse.urlsplit(url)
+    try:
+        port = parts.port or {'https': 443, 'http': 80}.get(parts.scheme)
+    except ValueError:
+        port = 'invalid'
+    return parts.scheme, (parts.hostname or '').lower(), port, parts.path.rstrip('/')
+
+
+def _write_url_problems(value: str, catalog: str) -> List[str]:
+    """Problems with MJV_CATALOG_WRITE_URL. Never quotes the value: its query string is a credential."""
+    if any(ord(ch) <= 32 or ord(ch) >= 127 for ch in value):
+        return ['MJV_CATALOG_WRITE_URL contains spaces, control or non-ASCII characters']
+    parts = urllib.parse.urlsplit(value)
+    host = (parts.hostname or '').lower()
+    problems = []
+    if not (parts.scheme == 'https' or (parts.scheme == 'http' and host in LOOPBACK)):
+        problems.append('MJV_CATALOG_WRITE_URL must use https (http only for localhost or 127.0.0.1, in tests)')
+    if parts.username is not None or parts.password is not None or parts.fragment:
+        problems.append('MJV_CATALOG_WRITE_URL must not contain a user name, password or fragment')
+    if catalog and _container(value) != _container(catalog):
+        problems.append('MJV_CATALOG_WRITE_URL must name the same container as MJV_CATALOG_URL '
+                        '(the same scheme, host and path)')
+    permissions = urllib.parse.parse_qs(parts.query).get('sp', [])
+    if len(permissions) != 1 or not set('wd') <= set(permissions[0]) or set(permissions[0]) - set('rwdl'):
+        problems.append('MJV_CATALOG_WRITE_URL needs its own query string for the container (for example a SAS) '
+                        'whose sp parameter allows write and delete (w and d) and nothing but r, w, d and l')
+    return problems
+
+
+def _admin_emails(value: str, domain: str, problems: List[str]) -> frozenset:
+    """The addresses in MJV_ADMIN_EMAILS (separated by commas and/or spaces), in lower case. A bad one is
+    reported by its position only."""
+    found = set()
+    for n, item in enumerate((part for part in re.split(r'[\s,]+', value) if part), 1):
+        address = email_address(item)
+        if address is None or (domain and address.rpartition('@')[2] != domain):
+            problems.append('MJV_ADMIN_EMAILS: entry %d is not an email address at %s'
+                            % (n, domain or 'MJV_ALLOWED_DOMAIN'))
+        else:
+            found.add(address)
+    return frozenset(found)
 
 
 def _loopback_url(value: str) -> bool:
@@ -226,7 +280,8 @@ def load_config(env: Mapping[str, str], cache_base: str = '/home') -> HostedConf
     if secret and (len(secret) < 32 or len(set(secret)) < 10):
         problems.append('MJV_AUTH_SECRET is too weak: use at least 32 random characters')
     domain = required('MJV_ALLOWED_DOMAIN').lower()
-    if domain and not _DOMAIN_RE.fullmatch(domain):
+    domain_ok = bool(_DOMAIN_RE.fullmatch(domain))
+    if domain and not domain_ok:
         problems.append('MJV_ALLOWED_DOMAIN must be a domain name such as example.com')
     client_id = required('GOOGLE_CLIENT_ID')
     if client_id and not _TOKEN_RE.fullmatch(client_id):
@@ -237,6 +292,10 @@ def load_config(env: Mapping[str, str], cache_base: str = '/home') -> HostedConf
     catalog = required('MJV_CATALOG_URL')
     if catalog:
         problems.extend(_catalog_problems(catalog))
+    write = (env.get('MJV_CATALOG_WRITE_URL') or '').strip()
+    if write:
+        problems.extend(_write_url_problems(write, catalog))
+    admins = _admin_emails(env.get('MJV_ADMIN_EMAILS') or '', domain if domain_ok else '', problems)
     port = int(_number(env, 'PORT', 8000, 1, 65535, problems, integer=True))
     max_gb = _number(env, 'MJV_CACHE_MAX_GB', 50, 0.001, 1_000_000, problems)
     days = _number(env, 'MJV_SESSION_DAYS', 30, 0.01, 366, problems)
@@ -259,7 +318,8 @@ def load_config(env: Mapping[str, str], cache_base: str = '/home') -> HostedConf
                         client_id=client_id, client_secret=Secret(client_secret), catalog_url=Secret(catalog),
                         cache_dir=cache_dir, cache_warning=warning, port=port,
                         cache_max_bytes=int(max_gb * 1024 ** 3), session_days=days, catalog_ttl_s=ttl,
-                        commit=commit, **google)
+                        commit=commit, catalog_write_url=Secret(write) if write else None, admin_emails=admins,
+                        **google)
 
 
 # ----------------------------------------------------------------- signing
@@ -611,9 +671,9 @@ class HostedHandler(Handler):
 
     def _probe(self, path: str) -> None:
         if path == '/healthz':
+            catalog = dict(self.app.catalog.health(), delete_enabled=self.app.delete_enabled)
             return self._send(200, dump_json({'ok': True, 'mode': 'hosted', 'commit': self.config.commit,
-                                              'catalog': self.app.catalog.health(),
-                                              'cache': {'ok': self.app.cache_ok}}),
+                                              'catalog': catalog, 'cache': {'ok': self.app.cache_ok}}),
                               'application/json; charset=utf-8')
         return self._send(200, b'User-agent: *\nDisallow: /\n', 'text/plain; charset=utf-8')
 
@@ -709,13 +769,14 @@ class HostedHandler(Handler):
                 return self._method_not_allowed()
             return self._json(200, {'ok': True, 'api': API_VERSION, 'version': __version__,
                                     'thumbnails': self.app.thumbs.available, 'max_upload_bytes': 0,
-                                    'mode': 'hosted', 'user': self.user})
+                                    'mode': 'hosted', 'user': self.user, 'delete_enabled': self.app.delete_enabled,
+                                    'can_delete_any': self.app.delete_enabled and self._admin()})
         if parts == ['exports']:
             if method != 'GET':
                 return self._method_not_allowed()
             items, status = self.app.published.listing()
             catalog = {key: status[key] for key in ('ok', 'updated_at', 'age_s', 'error', 'skipped')}
-            catalog['items'] = items
+            catalog['items'] = [self._for_user(item) for item in items]
             return self._json(200, {'exports': [s for item in items for s in item['exports']],
                                     'library': [], 'failed': [], 'catalog': catalog})
         if parts in (['exports', 'open'], ['exports', 'upload']):
@@ -732,30 +793,59 @@ class HostedHandler(Handler):
         elif len(parts) == 3 and parts[2] == 'open':
             if method != 'POST':
                 return self._method_not_allowed()
-            options = self._open_options()
+            options = self._body_object('{"retry": true}')
             if options is None:
                 return None
             item = self.app.published.open(parts[1], retry=options.get('retry') is True)
+        elif len(parts) == 3 and parts[2] == 'delete':
+            return self._delete(parts[1]) if method == 'POST' else self._method_not_allowed()
         else:
             return self._error(404, 'not_found', 'unknown API route')
         if item is None:
             return self._error(404, 'unknown_catalog_entry', 'no published export with this id')
-        return self._json(202 if method == 'POST' and item['state'] not in ('ready', 'failed') else 200, item)
+        return self._json(202 if method == 'POST' and item['state'] not in ('ready', 'failed') else 200,
+                          self._for_user(item))
 
-    def _open_options(self) -> Optional[dict]:
-        """The optional JSON body of POST .../open: {"retry": true} restarts a failed preparation."""
+    def _delete(self, catalog_id: str) -> None:
+        """POST /api/catalog/<id>/delete with {"confirm": "<id>"}: for the export's owner or an administrator."""
+        if not self.app.delete_enabled:
+            return self._error(403, 'delete_disabled', 'deleting exports is not turned on for this viewer')
+        body = self._body_object('{"confirm": "<id>"}', required=True)
+        if body is None:
+            return None
+        if body.get('confirm') != catalog_id:
+            return self._error(400, 'bad_request', 'confirm the deletion with the id of the export: {"confirm": "<id>"}')
+        try:
+            self.app.published.delete(catalog_id, self.user, admin=self._admin())
+        except CatalogError as exc:
+            code = exc.code if exc.code in DELETE_STATUS else 'storage_error'
+            return self._error(DELETE_STATUS[code], code, self.app.store.scrub(exc.message))
+        return self._json(200, {'deleted': catalog_id})
+
+    def _admin(self) -> bool:
+        return self.user in self.config.admin_emails
+
+    def _for_user(self, item: dict) -> dict:
+        """A catalog item, plus whether the signed-in user may delete it."""
+        mine = item.get('owner') is not None and item.get('owner') == self.user
+        return dict(item, can_delete=self.app.delete_enabled and (mine or self._admin()))
+
+    def _body_object(self, example: str, required: bool = False) -> Optional[dict]:
+        """The small JSON object a POST sends ({} without a body, unless one is required); None once an
+        error has been answered."""
         length = (self.headers.get('Content-Length') or '').strip()
         if not length or length == '0':
-            return {}
-        if not length.isascii() or not length.isdigit() or int(length) > MAX_OPEN_BODY:
+            return self._error(400, 'bad_request', 'body must be a JSON object such as %s' % example) \
+                if required else {}
+        if not length.isascii() or not length.isdigit() or int(length) > MAX_POST_BODY:
             return self._error(413, 'too_large', 'request body is too large', close=True)
         try:
-            options = json.loads(self.rfile.read(int(length)).decode('utf-8'))
+            value = json.loads(self.rfile.read(int(length)).decode('utf-8'))
         except (UnicodeDecodeError, ValueError):
-            options = None
-        if not isinstance(options, dict):
-            return self._error(400, 'bad_request', 'body must be a JSON object such as {"retry": true}')
-        return options
+            value = None
+        if not isinstance(value, dict):
+            return self._error(400, 'bad_request', 'body must be a JSON object such as %s' % example)
+        return value
 
     def _export_or_404(self, export_id: str):
         index, item = self.app.published.resolve(export_id, RESOLVE_WAIT_S)
@@ -765,7 +855,7 @@ class HostedHandler(Handler):
             else:
                 self._json(409, {'error': {'code': 'export_not_ready',
                                            'message': 'this export is not open yet; open it from the start page'},
-                                 'catalog': item})
+                                 'catalog': self._for_user(item)})
         return index
 
 
@@ -780,13 +870,19 @@ class HostedApp(ViewerApp):
                          max_upload_bytes=0, limits=limits, pil=pil, log=log)
         self.config = config
         self.google = GoogleAuth(config)
-        self.store = BlobStore(config.catalog_url.reveal())
+        self.store = BlobStore(config.catalog_url.reveal(), write_url=config.catalog_write_url.reveal()
+                               if config.catalog_write_url else None)
         self.catalog = Catalog(self.store, config.catalog_ttl_s, log=self.log)
         self.cache = ZipCache(self.cache_dir, config.cache_max_bytes, log=self.log)
         self.published = Published(self.catalog, self.cache, self.registry, self.thumbs.dir, log=self.log)
         self.cache_ok = True
         self._stopping = threading.Event()
         self._maintainer: Optional[threading.Thread] = None
+
+    @property
+    def delete_enabled(self) -> bool:
+        """MJV_CATALOG_WRITE_URL is set: owners and administrators can delete exports."""
+        return self.store.writable
 
     def check_cache(self) -> bool:
         """Whether downloads and thumbnails can be written (/healthz reports it)."""

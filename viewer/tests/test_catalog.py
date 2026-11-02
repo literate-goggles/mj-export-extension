@@ -1,7 +1,8 @@
-"""Hosted mode: catalog validation and refresh, the verified ZIP cache, downloads and their faults.
+"""Hosted mode: catalog validation and refresh, the verified ZIP cache, downloads and their faults, deleting.
 
 Runs against tests/fake_blob.py with invented exports only. The fake container's
-read-only query string stands in for a real SAS and must never leak.
+query strings (read-only, and one that may write and delete) stand in for real
+SAS tokens and must never leak.
 """
 import concurrent.futures
 import contextlib
@@ -15,11 +16,13 @@ import threading
 import time
 import unittest
 import urllib.parse
+from datetime import datetime, timezone
 from unittest import mock
 
 from mjviewer import catalog as catalog_module
 from mjviewer import server as server_module
 from mjviewer.catalog import (BlobStore, Catalog, CatalogError, Published, ZipCache, parse_catalog)
+from mjviewer.model import parse_date
 from mjviewer.server import PIL_IMAGE
 from tests import fixtures as fx
 from tests.fake_blob import REDIRECT_TARGET, FakeBlob
@@ -130,6 +133,43 @@ class ParseCatalogTests(unittest.TestCase):
         self.assertEqual(len(entries), 2)
         self.assertIn('more than 2 entries', skipped[-1]['reason'])
 
+    def test_owner_is_an_email_address_kept_in_lower_case(self):
+        for value, expect in (('Alice@Example.COM', 'alice@example.com'), (None, None), ('', None),
+                              ('a.b+tag@sub.example.org', 'a.b+tag@sub.example.org')):
+            with self.subTest(owner=value):
+                entries, skipped, _ = parse_catalog(catalog_bytes([good_entry(owner=value)]))
+                self.assertEqual((skipped, entries[0]['owner']), ([], expect))
+        entries, _, _ = parse_catalog(catalog_bytes([good_entry()]))  # a catalog from before owners were recorded
+        self.assertIsNone(entries[0]['owner'])
+        bad = ['alice', 'alice@', '@example.com', 'a@b@example.com', 'alice@example', 'al ice@example.com',
+               'alice@example.com\n', 'ålice@example.com', 'alice@exa_mple.com', 5, True, ['alice@example.com'],
+               'a' * 250 + '@example.com', 'K@example.com']  # the Kelvin sign would lower-case to a plain k
+        entries, skipped, _ = parse_catalog(catalog_bytes([good_entry(owner=value) for value in bad]))
+        self.assertEqual(entries, [])
+        self.assertEqual([s['reason'] for s in skipped], ['owner is not an email address'] * len(bad))
+
+    def test_tombstones_are_validated_and_never_hide_an_entry(self):
+        other = hashlib.sha256(b'y').hexdigest()
+        stones = [{'id': SHA[:16], 'sha256': SHA, 'size': 1000, 'owner': 'p@example.com',
+                   'deleted_at': '2026-05-01T10:00:00Z', 'deleted_by': 'p@example.com'},
+                  {'id': other[:16], 'sha256': other, 'deleted_at': '2026-05-02T10:00:00.000Z', 'x_more': [1]},
+                  {'id': SHA[:15], 'sha256': SHA, 'deleted_at': '2026-05-01T10:00:00Z'},
+                  {'id': SHA[:16], 'sha256': SHA.upper(), 'deleted_at': '2026-05-01T10:00:00Z'},
+                  {'id': SHA[:16], 'sha256': SHA, 'deleted_at': 'soon'},
+                  {'id': SHA[:16], 'sha256': SHA},
+                  'not an object', None]
+        deleted = []
+        entries, skipped, _ = parse_catalog(catalog_bytes([good_entry()], deleted=stones), deleted)
+        moment = datetime(2026, 5, 1, 10, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(deleted, [{'id': SHA[:16], 'sha256': SHA, 'deleted_ts': moment},
+                                   {'id': other[:16], 'sha256': other, 'deleted_ts': moment + 86400}])
+        self.assertEqual(([e['id'] for e in entries], skipped), ([SHA[:16]], []))
+        for odd in ({}, 'x', None, 5):  # a deleted field that is not a list is ignored
+            with self.subTest(deleted=odd):
+                found = []
+                self.assertEqual(len(parse_catalog(catalog_bytes([good_entry()], deleted=odd), found)[0]), 1)
+                self.assertEqual(found, [])
+
 
 class BlobTestCase(unittest.TestCase):
     def setUp(self):
@@ -148,7 +188,7 @@ class BlobTestCase(unittest.TestCase):
     def assert_no_secret(self, *texts):
         for text in texts:
             text = text if isinstance(text, str) else json.dumps(text)
-            for secret in (self.blob.secret, self.blob.query, 'sig='):
+            for secret in (self.blob.secret, self.blob.query, self.blob.write_secret, self.blob.write_query, 'sig='):
                 self.assertNotIn(secret, text)
 
 
@@ -272,6 +312,92 @@ class CatalogRefreshTests(BlobTestCase):
         self.assertLess(time.monotonic() - started, 0.5)
         leader.join(10)
         self.assertFalse(leader.is_alive())
+
+
+class BlobWriteTests(BlobTestCase):
+    def test_conditional_writes_and_deletes(self):
+        store = BlobStore(self.blob.url, write_url=self.blob.write_url)
+        self.assertTrue(store.writable)
+        self.blob.write_catalog([])
+        _, etag, _ = store.get('catalog.json', 'catalog.json')
+        body = b'{"version": 1, "exports": []}\n'
+        new = store.put('catalog.json', body, 'catalog.json', if_match=etag)
+        self.assertTrue(new and new != etag)
+        for condition in ({'if_match': etag}, {'if_none_match': '*'}):  # changed since it was read; exists already
+            with self.subTest(condition=condition):
+                with self.assertRaises(CatalogError) as caught:
+                    store.put('catalog.json', b'{}', 'catalog.json', **condition)
+                self.assertEqual(caught.exception.code, 'changed')
+        self.assertEqual(self.blob.read_json('catalog.json'), {'version': 1, 'exports': []})
+        self.assertTrue(store.put('new.json', b'{}', 'new.json', if_none_match='*'))
+        self.assertNotEqual(store.put('catalog.json', body, 'catalog.json', if_match=new), new)  # same bytes, new ETag
+        puts = [r for r in self.blob.requests if r['method'] == 'PUT']
+        self.assertEqual([r['status'] for r in puts], [201, 412, 412, 201, 201])
+        self.assertEqual({r['content_type'] for r in puts}, {'application/json'})
+        self.assertTrue(store.delete('new.json', 'new.json'))
+        self.assertFalse(store.delete('new.json', 'new.json'))  # already gone
+        self.assertEqual([r['status'] for r in self.blob.requests if r['method'] == 'DELETE'], [202, 404])
+        # Reads always carry the read-only query string; writes and deletes the other one.
+        self.assertEqual({(r['method'], r['sas']) for r in self.blob.requests},
+                         {('GET', 'read'), ('PUT', 'write'), ('DELETE', 'write')})
+
+    def test_a_read_only_query_string_never_writes(self):
+        self.blob.write_catalog([])
+        before = self.blob.read_json('catalog.json')
+        store = BlobStore(self.blob.url)  # no write access configured: nothing is even sent
+        self.assertFalse(store.writable)
+        for call in (lambda s: s.put('catalog.json', b'{}', 'catalog.json', if_match='"x"'),
+                     lambda s: s.delete('catalog.json', 'catalog.json')):
+            with self.assertRaises(CatalogError) as caught:
+                call(store)
+            self.assertEqual(caught.exception.code, 'read_only')
+        self.assertEqual(self.blob.requests, [])
+        store = BlobStore(self.blob.url, write_url=self.blob.url)  # the read-only query string used to write: refused
+        for call in (lambda s: s.put('catalog.json', b'{}', 'catalog.json', if_match='"x"'),
+                     lambda s: s.delete('catalog.json', 'catalog.json')):
+            with self.assertRaises(CatalogError) as caught:
+                call(store)
+            self.assertEqual(caught.exception.code, 'forbidden')
+            self.assertIn('write access may have expired', caught.exception.message)
+        self.assertEqual([r['status'] for r in self.blob.requests], [403, 403])
+        self.assertEqual(self.blob.read_json('catalog.json'), before)
+
+    def test_write_faults_and_redirects(self):
+        store = BlobStore(self.blob.url, write_url=self.blob.write_url)
+        self.blob.write_catalog([])
+        for fault, put_code, delete_code in (('302', 'redirected', 'redirected'), ('500', 'storage_error', 'storage_error'),
+                                             ('403', 'forbidden', 'forbidden'), ('409', 'changed', 'storage_error'),
+                                             ('412', 'changed', 'changed')):
+            with self.subTest(fault=fault):
+                self.blob.write_faults['catalog.json'] = fault
+                for call, code in ((lambda: store.put('catalog.json', b'{}', 'catalog.json', if_match='"x"'), put_code),
+                                   (lambda: store.delete('catalog.json', 'catalog.json'), delete_code)):
+                    with self.assertRaises(CatalogError) as caught:
+                        call()
+                    self.assertEqual(caught.exception.code, code)
+                    self.assert_no_secret(caught.exception.message, repr(caught.exception))
+        self.assertEqual(self.blob.count(REDIRECT_TARGET), 0)
+        self.assertIsNotNone(self.blob.file('catalog.json'))
+        unreachable = BlobStore('http://127.0.0.1:9/c?sp=rl&sig=' + 'R' * 30, timeout=2,
+                                write_url='http://127.0.0.1:9/c?sp=rwdl&sig=' + 'W' * 30)
+        for call in (lambda: unreachable.put('catalog.json', b'{}', 'catalog.json'),
+                     lambda: unreachable.delete('catalog.json', 'catalog.json')):
+            with self.assertRaises(CatalogError) as caught:
+                call()
+            self.assertEqual(caught.exception.code, 'unreachable')
+            self.assertNotIn('W' * 30, caught.exception.message)
+
+    def test_scrub_blanks_both_query_strings(self):
+        store = BlobStore(self.blob.url, write_url=self.blob.write_url)
+        for query in (self.blob.query, self.blob.write_query):
+            sig = dict(urllib.parse.parse_qsl(query))['sig']
+            forms = (sig, urllib.parse.quote(sig, safe=''), urllib.parse.quote_plus(sig), query)
+            for text in ('%s?%s failed' % (self.blob.base_url, query), 'sig=%s' % sig, 'quoted %s' % forms[1]):
+                with self.subTest(text=text[:24]):
+                    scrubbed = store.scrub(text)
+                    self.assertIn('***', scrubbed)
+                    for form in forms:
+                        self.assertNotIn(form, scrubbed)
 
 
 class ZipCacheTests(BlobTestCase):
@@ -508,8 +634,8 @@ class ZipCacheTests(BlobTestCase):
         self.assertTrue(cache.present(recent['sha256']))  # used recently: another instance may list it already
 
 
-class DownloadFlowTests(BlobTestCase):
-    """Through the HTTP API: open, poll, ready, faults, concurrency and two instances."""
+class FlowTestCase(BlobTestCase):
+    """Hosted instances on the fake container, driven through the HTTP API."""
 
     def setUp(self):
         super().setUp()
@@ -558,6 +684,10 @@ class DownloadFlowTests(BlobTestCase):
     def slow(self, entry, chunk=4096, delay=0.02):
         self.blob.faults[entry['blob']] = 'slow'
         self.blob.chunk, self.blob.slow_delay = chunk, delay
+
+
+class DownloadFlowTests(FlowTestCase):
+    """Through the HTTP API: open, poll, ready, faults, concurrency and two instances."""
 
     def test_open_download_verify_and_view(self):
         entry = self.publish(label='Team export', name='mj_export_team.zip')
@@ -928,6 +1058,316 @@ class DownloadFlowTests(BlobTestCase):
         texts.append(repr(hosted.app.store) + repr(hosted.config))
         self.assert_no_secret(*texts)
         self.assertIn('HTTP 403', hosted.log.getvalue())
+
+
+class DeleteFlowTests(FlowTestCase):
+    """Deleting through the HTTP API: the conditional rewrite of catalog.json, the ZIP in storage, and every
+    instance's copies. The signed-in account is alice@example.com, who owns the exports she deletes."""
+
+    def start(self, cache='cache', **env):
+        env.setdefault('MJV_CATALOG_WRITE_URL', self.blob.write_url)
+        return super().start(cache, **env)
+
+    def publish(self, export=None, **kwargs):
+        kwargs.setdefault('owner', 'alice@example.com')
+        return super().publish(export, **kwargs)
+
+    def delete(self, hosted, session, entry):
+        status, _, body = hosted.post('/api/catalog/%s/delete' % entry['id'], session,
+                                      body=json.dumps({'confirm': entry['id']}).encode())
+        return status, json.loads(body)
+
+    def stored(self):
+        return self.blob.read_json('catalog.json')
+
+    def thumbs(self):
+        folder = os.path.join(self.base, 'cache', 'thumbs')
+        return sorted(os.listdir(folder)) if os.path.isdir(folder) else []
+
+    def view(self, hosted, session, entry):
+        """Open an export and request one thumbnail, so that it has a cached ZIP and a thumbnail folder."""
+        self.open(hosted, session, entry['id'])
+        self.assertEqual(self.wait(hosted, session, entry['id'])[0]['state'], 'ready')
+        jobs = json.loads(hosted.get('/api/exports/%s/jobs?limit=1' % entry['id'], session)[2])
+        self.assertEqual(hosted.get(jobs['items'][0]['images'][0]['thumb_url'], session)[0], 200)
+
+    def test_a_concurrent_writer_is_never_overwritten_and_unknown_fields_survive(self):
+        mine = dict(self.publish(name='mine.zip'), x_note={'kept': True})
+        other = dict(self.publish(fx.gallery_export(6), name='other.zip', owner='bob@example.com'), x_note='kept too')
+        earlier = {'id': 'f' * 16, 'sha256': 'f' * 64, 'size': 99, 'owner': None, 'deleted_at': '2026-01-01T00:00:00Z',
+                   'deleted_by': 'carol@example.com', 'x_reason': 'invented'}
+        self.blob.write_catalog([mine, other], x_publisher={'tool': 'invented', 'n': 2}, deleted=[earlier])
+        hosted, session = self.start()
+        late = self.publish(fx.gallery_export(7), name='late.zip')
+        written = []
+
+        def another_writer(name, method):  # publishes an export between the viewer's read and its write, once
+            if name == 'catalog.json' and not written:
+                written.append(method)
+                data = self.stored()
+                data['exports'].append(late)
+                data['x_added_meanwhile'] = [1, 2]
+                self.blob.put('catalog.json', json.dumps(data).encode())
+
+        self.blob.before_write = another_writer
+        started = time.time()
+        self.assertEqual(self.delete(hosted, session, mine), (200, {'deleted': mine['id']}))
+        puts = [r for r in self.blob.requests if r['method'] == 'PUT']
+        self.assertEqual([r['status'] for r in puts], [412, 201])
+        self.assertTrue(all(r['if_match'] and r['if_none_match'] is None and r['sas'] == 'write' for r in puts))
+        self.assertNotEqual(puts[0]['if_match'], puts[1]['if_match'])  # read again before writing again
+        data = self.stored()
+        self.assertEqual([e['id'] for e in data['exports']], [other['id'], late['id']])
+        self.assertEqual(data['exports'][0]['x_note'], 'kept too')
+        self.assertEqual((data['x_publisher'], data['x_added_meanwhile']), ({'tool': 'invented', 'n': 2}, [1, 2]))
+        self.assertEqual(data['deleted'][0], earlier)
+        stone = data['deleted'][1]
+        self.assertEqual(set(stone), {'id', 'sha256', 'size', 'owner', 'deleted_at', 'deleted_by'})
+        self.assertEqual((stone['id'], stone['sha256'], stone['size'], stone['owner'], stone['deleted_by']),
+                         (mine['id'], mine['sha256'], mine['size'], 'alice@example.com', 'alice@example.com'))
+        self.assertTrue(started - 1 <= parse_date(stone['deleted_at']).timestamp() <= time.time())
+        self.assertEqual(data['updated_at'], stone['deleted_at'])
+        self.assertIsNone(self.blob.file(mine['blob']))
+        self.assertIsNotNone(self.blob.file(other['blob']))
+        self.assertEqual(self.blob.count(mine['blob'], status=202, method='DELETE'), 1)
+
+    def test_a_catalog_that_keeps_changing_is_left_alone(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        self.blob.before_write = lambda name, method: self.blob.write_catalog([mine], x_touched=time.time())
+        status, answer = self.delete(hosted, session, mine)
+        self.assertEqual((status, answer['error']['code']), (409, 'catalog_busy'))
+        self.assertIn('nothing was deleted', answer['error']['message'])
+        self.assertEqual(self.blob.count('catalog.json', status=412, method='PUT'), catalog_module.WRITE_ATTEMPTS)
+        self.assertEqual(([e['id'] for e in self.stored()['exports']], 'deleted' in self.stored()), ([mine['id']], False))
+        self.assertIsNotNone(self.blob.file(mine['blob']))
+        self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 0)
+
+    def test_a_zip_already_gone_from_storage_is_fine(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        self.blob.remove(mine['blob'])
+        self.assertEqual(self.delete(hosted, session, mine)[0], 200)
+        self.assertEqual(self.stored()['exports'], [])
+        self.assertEqual(self.blob.count(mine['blob'], status=404, method='DELETE'), 1)
+        hosted.app.maintain()  # nothing left to try again
+        self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 1)
+        self.assertNotIn('still in storage', hosted.log.getvalue())
+
+    def test_storage_errors_delete_nothing_and_quote_no_secret(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        before = self.stored()
+        for faults, fault, text in ((self.blob.faults, '500', 'HTTP 500'), (self.blob.faults, '403', 'HTTP 403'),
+                                    (self.blob.write_faults, '500', 'HTTP 500'),
+                                    (self.blob.write_faults, '403', 'write access may have expired'),
+                                    (self.blob.write_faults, '302', 'redirect')):
+            with self.subTest(fault=fault, write=faults is self.blob.write_faults):
+                faults['catalog.json'] = fault
+                try:
+                    status, answer = self.delete(hosted, session, mine)
+                finally:
+                    faults.clear()
+                self.assertEqual((status, answer['error']['code']), (502, 'storage_error'))
+                self.assertIn(text, answer['error']['message'])
+                self.assertIn('nothing was deleted', answer['error']['message'])
+                self.assert_no_secret(answer)
+                self.assertEqual(self.stored(), before)
+                self.assertIsNotNone(self.blob.file(mine['blob']))
+        for raw, text in ((b'{not json', 'not valid JSON'),
+                          (json.dumps({'version': 1, 'exports': [mine], 'deleted': {'not': 'a list'}}).encode(),
+                           'deleted field that is not a list')):
+            with self.subTest(text=text):
+                self.blob.put('catalog.json', raw)
+                status, answer = self.delete(hosted, session, mine)
+                self.assertEqual((status, answer['error']['code']), (502, 'storage_error'))
+                self.assertIn(text, answer['error']['message'])
+                with open(self.blob.file('catalog.json'), 'rb') as handle:
+                    self.assertEqual(handle.read(), raw)
+        self.assertEqual(self.blob.count(REDIRECT_TARGET), 0)
+        self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 0)
+        self.assert_no_secret(hosted.log.getvalue())
+
+    def test_the_deleting_instance_closes_the_export_and_deletes_its_files_at_once(self):
+        mine, keep = self.publish(fx.gallery_export(12), name='mine.zip'), self.publish(name='keep.zip')
+        self.blob.write_catalog([mine, keep])
+        hosted, session = self.start(MJV_CATALOG_TTL_S='600')
+        for entry in (mine, keep):
+            self.view(hosted, session, entry)
+        if PIL_IMAGE is not None:  # without Pillow there are no thumbnails (CI runs both ways)
+            self.assertEqual(self.thumbs(), sorted([mine['id'], keep['id']]))
+        reads = self.blob.count('catalog.json', method='GET')
+        logged = len(hosted.log.getvalue())
+        self.assertEqual(self.delete(hosted, session, mine)[0], 200)
+        # One line records the deletion and who made it; nothing else is said about it.
+        self.assertEqual(hosted.log.getvalue()[logged:].splitlines(),
+                         ['deleted %s by alice@example.com' % mine['id'], 'POST /api/catalog/%s/delete 200' % mine['id']])
+        self.assertIsNone(hosted.app.registry.get(mine['id']))
+        self.assertIsNone(hosted.app.published._prep(mine['id']))
+        self.assertEqual(self.zips(), ['%s.zip' % keep['sha256']])  # used a moment ago, deleted all the same
+        if PIL_IMAGE is not None:
+            self.assertEqual(self.thumbs(), [keep['id']])
+        # The new catalog is in use at once, without waiting for the next refresh (MJV_CATALOG_TTL_S).
+        listing = json.loads(hosted.get('/api/exports', session)[2])
+        self.assertEqual([i['id'] for i in listing['catalog']['items']], [keep['id']])
+        self.assertEqual([e['id'] for e in listing['exports']], [keep['id']])
+        self.assertEqual(hosted.get('/api/exports/%s/overview' % mine['id'], session)[0], 404)
+        self.assertEqual(hosted.get('/api/catalog/%s' % mine['id'], session)[0], 404)
+        self.assertEqual(self.blob.count('catalog.json', method='GET'), reads + 1)  # only the fresh read before writing
+        self.assertEqual(self.delete(hosted, session, mine)[1]['error']['code'], 'unknown_catalog_entry')
+
+    def test_another_instance_catches_up_at_its_next_catalog_refresh(self):
+        mine = self.publish(fx.gallery_export(12), name='mine.zip')
+        self.blob.write_catalog([mine])
+        first, first_session = self.start()
+        second, second_session = self.start()  # the same cache folder
+        for hosted, session in ((first, first_session), (second, second_session)):
+            self.view(hosted, session, mine)
+        self.assertEqual(self.delete(first, first_session, mine)[0], 200)
+        self.assertEqual(self.zips(), [])  # the shared copy is gone at once
+        self.assertIsNotNone(second.app.registry.get(mine['id']))  # still open there until it reads the catalog again
+        # Files the other instance writes meanwhile (a thumbnail, a download it finishes) go as well.
+        zips, thumbs = os.path.join(self.base, 'cache', 'zips'), os.path.join(self.base, 'cache', 'thumbs')
+
+        def leave_files():
+            os.makedirs(os.path.join(thumbs, mine['id'], 'ab'), exist_ok=True)
+            with open(os.path.join(thumbs, mine['id'], 'ab', 'thumb'), 'wb') as handle:
+                handle.write(b'x')
+            with open(os.path.join(zips, '%s.zip' % mine['sha256']), 'wb') as handle:
+                handle.write(b'left behind')
+
+        leave_files()
+        listing = json.loads(second.get('/api/exports', second_session)[2])  # any request reads the catalog (TTL 0)
+        self.assertEqual(listing['catalog']['items'], [])
+        self.assertIsNone(second.app.registry.get(mine['id']))
+        self.assertEqual((self.zips(), self.thumbs()), ([], []))
+        self.assertIn('removed %s from this instance: it was deleted' % mine['id'], second.log.getvalue())
+        self.assertNotIn('by alice@example.com', second.log.getvalue())  # only the deleting instance says who
+        leave_files()
+        second.app.maintain()  # and every minute, also while nobody uses the viewer
+        self.assertEqual((self.zips(), self.thumbs()), ([], []))
+
+    def test_a_download_under_way_stops_and_leaves_nothing(self):
+        mine = self.publish(fx.gallery_export(60))
+        self.blob.write_catalog([mine])
+        self.slow(mine, chunk=1024, delay=0.05)
+        hosted, session = self.start()
+        self.open(hosted, session, mine['id'])
+        self.wait(hosted, session, mine['id'], states=('downloading',))
+        self.assertEqual(self.delete(hosted, session, mine)[0], 200)
+        self.assertEqual(self.zips(), [])  # no ZIP, no temporary file, no lock
+        self.assertIsNone(hosted.app.published._prep(mine['id']))
+        self.assertNotIn('prepare %s failed' % mine['id'], hosted.log.getvalue())
+        self.blob.slow_delay = 0
+
+    def test_a_zip_storage_kept_is_deleted_again_by_maintenance(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        clock = [1000.0]
+        hosted.app.published._clock = lambda: clock[0]
+        self.blob.write_faults[mine['blob']] = '500'
+        self.assertEqual(self.delete(hosted, session, mine)[0], 200)  # gone from the viewer; the ZIP follows
+        self.assertEqual(self.stored()['exports'], [])
+        self.assertIsNotNone(self.blob.file(mine['blob']))
+        hosted.app.maintain()  # less than a minute later: not yet
+        self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 1)
+        clock[0] += catalog_module.BLOB_RETRY_S
+        hosted.app.maintain()  # failing again: tried again, the same failure is logged once
+        self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 2)
+        self.assertEqual(hosted.log.getvalue().count('the ZIP of %s is still in storage' % mine['id']), 1)
+        self.blob.write_faults.clear()
+        clock[0] += catalog_module.BLOB_RETRY_S
+        hosted.app.maintain()
+        self.assertIsNone(self.blob.file(mine['blob']))
+        retry = [r for r in self.blob.requests if r['method'] == 'DELETE'][-1]
+        self.assertEqual((retry['status'], retry['delete_snapshots']), (202, 'include'))
+        self.assertTrue(retry['if_unmodified_since'])  # never a ZIP uploaded again after the deletion
+        self.assertIn('deleted the ZIP of %s from storage' % mine['id'], hosted.log.getvalue())
+        clock[0] += 3600
+        hosted.app.maintain()  # once gone, never again
+        self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 3)
+        self.assert_no_secret(hosted.log.getvalue())
+
+    def test_an_export_published_again_is_left_alone(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        clock = [1000.0]
+        hosted.app.published._clock = lambda: clock[0]
+        self.blob.write_faults[mine['blob']] = '500'
+        self.assertEqual(self.delete(hosted, session, mine)[0], 200)
+        self.blob.write_faults.clear()
+        stones = self.stored()['deleted']
+        # Uploaded again after the deletion, not listed yet: the retry keeps it.
+        path = self.blob.file(mine['blob'])
+        later = time.time() + 30
+        os.utime(path, (later, later))
+        clock[0] += catalog_module.BLOB_RETRY_S
+        hosted.app.maintain()
+        self.assertEqual(self.blob.count(mine['blob'], status=412, method='DELETE'), 1)
+        self.assertIsNotNone(self.blob.file(mine['blob']))
+        self.assertIn('kept the ZIP of %s' % mine['id'], hosted.log.getvalue())
+        # Listed again, tombstone and all: it opens, and nothing deletes it or its copy.
+        self.blob.write_catalog([mine], deleted=stones)
+        self.open(hosted, session, mine['id'])
+        self.assertEqual(self.wait(hosted, session, mine['id'])[0]['state'], 'ready')
+        clock[0] += catalog_module.BLOB_RETRY_S
+        other, _ = self.start()  # an instance that never tried to delete it
+        for instance in (hosted, other):
+            instance.app.maintain()
+        self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 2)
+        self.assertEqual(self.zips(), ['%s.zip' % mine['sha256']])
+        self.assertEqual(hosted.get('/api/exports/%s/overview' % mine['id'], session)[0], 200)
+
+    def test_tombstones_from_elsewhere_are_followed_for_30_days(self):
+        old, recent = self.publish(name='old.zip'), self.publish(fx.gallery_export(5), name='recent.zip')
+        month_ago = time.time() - 31 * 86400
+        for entry, uploaded in ((old, month_ago - 60), (recent, time.time() - 7200)):
+            os.utime(self.blob.file(entry['blob']), (uploaded, uploaded))
+        stamp = lambda t: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
+        self.blob.write_catalog([], deleted=[
+            {'id': old['id'], 'sha256': old['sha256'], 'size': old['size'], 'owner': None,
+             'deleted_at': stamp(month_ago), 'deleted_by': 'carol@example.com'},
+            {'id': recent['id'], 'sha256': recent['sha256'], 'size': recent['size'], 'owner': 'alice@example.com',
+             'deleted_at': stamp(time.time() - 3600), 'deleted_by': 'alice@example.com'}])
+        hosted, _ = self.start()
+        hosted.app.maintain()
+        self.assertEqual(self.blob.count(old['blob'], method='DELETE'), 0)
+        self.assertIsNone(self.blob.file(recent['blob']))
+        hosted_without_write, _ = self.start(cache='other-cache', MJV_CATALOG_WRITE_URL='')
+        hosted_without_write.app.maintain()  # deleting is off there: it never tries
+        self.assertEqual([self.blob.count(e['blob'], method='DELETE') for e in (old, recent)], [0, 1])
+
+    def test_the_write_query_string_never_leaks(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            hosted, session = self.start()
+            responses = []
+            for faults, name, fault in ((self.blob.write_faults, 'catalog.json', '403'),
+                                        (self.blob.write_faults, 'catalog.json', '500'),
+                                        (self.blob.write_faults, 'catalog.json', '302'),
+                                        (self.blob.write_faults, mine['blob'], '500'),
+                                        (self.blob.write_faults, mine['blob'], '403')):
+                faults[name] = fault
+                if self.blob.file('catalog.json') and not self.stored()['exports']:
+                    self.blob.write_catalog([mine])
+                responses.append(hosted.post('/api/catalog/%s/delete' % mine['id'], session,
+                                             body=json.dumps({'confirm': mine['id']}).encode()))
+                faults.clear()
+            hosted.app.maintain()
+            for path in ('/api/exports', '/api/health', '/healthz', '/'):
+                responses.append(hosted.get(path, session))
+        texts = [hosted.log.getvalue(), stderr.getvalue(), repr(hosted.app.store), repr(hosted.config)]
+        for _, headers, body in responses:
+            texts.extend((str(headers), body.decode('utf-8', 'replace')))
+        self.assert_no_secret(*texts)
+        self.assertIn('HTTP 403', hosted.log.getvalue() + ''.join(texts))
 
 
 class PublishedUnitTests(BlobTestCase):
