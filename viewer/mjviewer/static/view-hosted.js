@@ -209,9 +209,32 @@ export function renderHostedHome(root, route, ctx) {
   };
 }
 
-/** What the delete dialog says when deleting failed. */
+const SIGNED_IN_AGAIN = 'Your sign-in changed. Reload the page and try again.';
+const SIGNED_OUT = 'Your sign-in has ended. Signing in again…';
+const NOT_UPDATED = 'The viewer could not update its list right now. Nothing was deleted. Try again in a few minutes.';
+const UNCONFIRMED = 'The viewer could not confirm whether the export was deleted. Reload the page to check.';
+const DELETE_FAILURES = {
+  forbidden: SIGNED_IN_AGAIN,
+  forbidden_origin: SIGNED_IN_AGAIN,
+  unauthenticated: SIGNED_OUT,
+  http_401: SIGNED_OUT,  // api.js starts the sign-in
+  storage_error: NOT_UPDATED,
+  catalog_busy: NOT_UPDATED,
+  delete_unconfirmed: UNCONFIRMED,
+  network: UNCONFIRMED,  // the request may have reached the server
+  internal: UNCONFIRMED,
+  unknown_catalog_entry: 'This export is not published any more. It may have been deleted already.',
+};
+
+/**
+ * What the delete dialog says when deleting failed: a plain sentence for each error code. Only the refusals the
+ * server words for people show its own message; technical details stay in the server log.
+ */
 function deleteFailure(err) {
-  return `Could not delete: ${str(err && err.message) || 'unknown error'}`;
+  const code = str(err && err.code);
+  if (code === 'not_owner' || code === 'delete_disabled') return `Could not delete: ${str(err.message)}`;
+  if (DELETE_FAILURES[code]) return DELETE_FAILURES[code];
+  return /^http_5\d\d$/.test(code) ? UNCONFIRMED : 'Could not delete this export. Reload the page and try again.';
 }
 
 /** An error callout above whatever view is open, until the reader dismisses it. */

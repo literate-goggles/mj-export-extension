@@ -292,8 +292,10 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
   Everyone who signs in sees every published export with its owner (or "No owner
   recorded"). When deleting is turned on (`MJV_CATALOG_WRITE_URL`), the owner,
   and the administrators in `MJV_ADMIN_EMAILS`, see **Delete…** on its card; a
-  dialog names the export and asks to confirm. An export without an owner can
-  be deleted by administrators only.
+  dialog names the export and asks to confirm. It stays open until the request
+  ends; when deleting fails it says so in plain words (whether anything was
+  deleted, and what to do), and the server log has the details. An export
+  without an owner can be deleted by administrators only.
 - **What deleting does.** The export leaves `catalog.json` (a short record of
   the deletion, with no name or label, stays in its `deleted` list), its ZIP is
   deleted from the container, and the instance that deleted it deletes its

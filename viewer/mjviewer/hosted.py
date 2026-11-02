@@ -831,7 +831,9 @@ class HostedHandler(Handler):
             self.app.published.delete(catalog_id, self.user, admin=self._admin())
         except CatalogError as exc:
             code = exc.code if exc.code in DELETE_STATUS else 'storage_error'
-            return self._error(DELETE_STATUS[code], code, self.app.store.scrub(exc.message))
+            message = self.app.store.scrub(exc.message)
+            self.app.log('could not delete %s for %s (%s): %s' % (catalog_id, self.user, code, message))
+            return self._error(DELETE_STATUS[code], code, message)
         return self._json(200, {'deleted': catalog_id})
 
     def _admin(self) -> bool:

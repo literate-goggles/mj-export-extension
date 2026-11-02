@@ -31,8 +31,8 @@ except Exception:  # pragma: no cover - optional dependency
 ENABLED = os.environ.get('MJV_E2E') == '1'
 WIDTH, HEIGHT = 1280, 800
 LOCAL = ('127.0.0.1', 'localhost')
-REFUSED = ('Could not delete: catalog.json: storage refused the request (HTTP 403); the write access may have expired; '
-           'nothing was deleted')  # what the dialog says when storage refuses to write catalog.json
+# What the dialog says when storage refuses to write catalog.json.
+REFUSED = 'The viewer could not update its list right now. Nothing was deleted. Try again in a few minutes.'
 
 
 class _BrowserCase(unittest.TestCase):
@@ -71,7 +71,7 @@ class _BrowserCase(unittest.TestCase):
         # No script errors or CSP refusals; failed requests the UI handles (an ended session, an export not open yet,
         # a storage failure it reports) and the machine's network changing under Chromium are expected.
         self.assertEqual([m for m in self.console if not any(s in m for s in (
-            'net::ERR_NETWORK_CHANGED', 'status of 401', 'status of 409', 'status of 502'))], [])
+            'net::ERR_NETWORK_CHANGED', 'status of 401', 'status of 403', 'status of 409', 'status of 502'))], [])
         self.assertEqual(self.aborted, [])
 
 
@@ -184,19 +184,44 @@ class DeleteBrowserTests(_BrowserCase):
         self.assertTrue(self.active("a.classList.contains('page-title')"))
         self.assertEqual(self.page.locator('#announcer').inner_text(), 'Deleted Coast studies')
 
-    def test_a_failure_shows_the_servers_message_and_keeps_the_dialog(self):
-        self.blob.write_faults['catalog.json'] = '403'
+    def test_failures_are_said_in_plain_words_and_keep_the_dialog(self):
+        """Each failure gets a plain sentence; what storage answered goes to the server log only."""
         self.card(self.mine).locator('button', has_text='Delete…').click()
-        self.dialog().locator('button', has_text='Delete export').click()
+        button = self.dialog().locator('button', has_text='Delete export')
         error = self.dialog().locator('.confirm__error')
-        error.wait_for(timeout=15000)
-        self.assertEqual(error.inner_text(), REFUSED)
-        self.assertTrue(self.dialog().locator('button', has_text='Delete export').is_enabled())
-        self.assertEqual(self.active('a.textContent'), 'Cancel')
-        self.assertEqual(self.listed(), [self.mine['id'], self.theirs['id'], self.unowned['id']])
-        # Trying again once storage answers works from the same dialog.
-        self.blob.write_faults.clear()
-        self.dialog().locator('button', has_text='Delete export').click()
+        tamper = lambda route: route.continue_(headers=dict(route.request.headers, **{'x-mjv-token': 'x' * 43}))
+        bob_owns_it = [dict(self.mine, owner='bob@example.com'), self.theirs, self.unowned]
+        for case, says in (('storage refuses', REFUSED),
+                           ('no clear answer', 'The viewer could not confirm whether the export was deleted. '
+                                               'Reload the page to check.'),
+                           ('signed in elsewhere', 'Your sign-in changed. Reload the page and try again.'),
+                           ('another owner', 'Could not delete: only the owner of this export or an administrator '
+                                             'can delete it')):
+            with self.subTest(case=case):
+                if case == 'storage refuses':
+                    self.blob.write_faults['catalog.json'] = '403'
+                elif case == 'no clear answer':
+                    self.blob.write_faults['catalog.json'] = '500'
+                elif case == 'signed in elsewhere':
+                    self.page.route('**/api/catalog/*/delete', tamper)
+                else:
+                    self.blob.write_catalog(bob_owns_it)
+                button.click()
+                self.page.wait_for_function('t => (document.querySelector(".confirm__error:not([hidden])") || {})'
+                                            '.textContent === t', arg=says, timeout=15000)
+                self.assertTrue(button.is_enabled())
+                self.assertEqual(self.active('a.textContent'), 'Cancel')
+                self.blob.write_faults.clear()
+                self.page.unroute('**/api/catalog/*/delete')
+                self.assertIn(self.mine['id'], self.listed())
+        log = self.hosted.log.getvalue()
+        for detail in ('(storage_error): catalog.json: storage refused the request (HTTP 403)',
+                       '(delete_unconfirmed): catalog.json: storage answered HTTP 500', '(not_owner): only the owner'):
+            self.assertIn('could not delete %s for alice@example.com %s' % (self.mine['id'], detail), log)
+        self.assertNotIn('HTTP', self.dialog().inner_text())
+        # Trying again once all is well works from the same dialog.
+        self.blob.write_catalog([self.mine, self.theirs, self.unowned])
+        button.click()
         self.page.wait_for_selector('text=Deleted Coast studies.', timeout=15000)
         self.assertEqual(self.listed(), [self.theirs['id'], self.unowned['id']])
 

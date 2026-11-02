@@ -1242,6 +1242,8 @@ class DeleteFlowTests(FlowTestCase):
                 self.assertEqual((status, answer['error']['code']), (502, 'storage_error'))
                 self.assertIn(text, answer['error']['message'])
                 self.assertIn('nothing was deleted', answer['error']['message'])
+                self.assertIn('could not delete %s for alice@example.com (storage_error): %s'
+                              % (mine['id'], answer['error']['message']), hosted.log.getvalue())
                 self.assert_no_secret(answer)
                 self.assertEqual(self.stored(), before)
                 self.assertIsNotNone(self.blob.file(mine['blob']))

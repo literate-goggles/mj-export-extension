@@ -848,6 +848,8 @@ class DeleteTests(unittest.TestCase):
                 status, answer = self.delete(who, entry)
                 self.assertEqual((status, answer['error']['code']), (403, 'not_owner'))
                 self.assertIn(says, answer['error']['message'])
+                self.assertIn('could not delete %s for %s@example.com (not_owner): %s' % (
+                    entry['id'], who, answer['error']['message']), self.hosted.log.getvalue())
                 self.assert_unchanged()
         self.assertEqual(self.blob.count('catalog.json', method='PUT'), writes)
         # The owner, then an administrator.
