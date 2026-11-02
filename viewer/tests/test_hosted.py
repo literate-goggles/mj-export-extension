@@ -847,6 +847,41 @@ class DeleteTests(unittest.TestCase):
         self.assertEqual(self.delete('carol', self.mine), (200, {'deleted': self.mine['id']}))
         self.assertEqual(self.listed(), [self.orphan['id']])
 
+    def test_the_owner_is_checked_in_catalog_json_as_storage_holds_it(self):
+        """Never in the copy an instance keeps for MJV_CATALOG_TTL_S: an owner changed in storage counts at once,
+        for the owner it no longer names and for the one it names now."""
+        instances = []
+        for n in range(2):  # both keep the catalog for 10 minutes, read before the owners change
+            hosted = Hosted(self._tmp.name, self.blob, self.google, ttl='600', env={
+                'MJV_CATALOG_WRITE_URL': self.blob.write_url, 'MJV_CACHE_DIR': os.path.join(self._tmp.name, 'ttl-%d' % n)})
+            self.addCleanup(hosted.stop)
+            sessions = {name: hosted.session('%s@example.com' % name) for name in ('alice', 'bob')}
+            hosted.get('/api/exports', sessions['alice'])
+            instances.append((hosted, sessions))
+        self.blob.write_catalog([dict(self.mine, owner='bob@example.com'), dict(self.orphan, owner='bob@example.com')])
+        stored, writes = self.blob.read_json('catalog.json'), self.blob.count('catalog.json', method='PUT')
+        (first, at_first), (second, at_second) = instances
+        cached = json.loads(first.get('/api/exports', at_first['bob'])[2])['catalog']['items']
+        self.assertEqual([(i['owner'], i['can_delete']) for i in cached], [('alice@example.com', False), (None, False)])
+
+        def delete(hosted, session, entry):
+            status, _, answer = hosted.post('/api/catalog/%s/delete' % entry['id'], session,
+                                            body=json.dumps({'confirm': entry['id']}).encode())
+            return status, json.loads(answer)
+
+        # The owner the instance's copy names, but storage no longer does: refused, and nothing is written.
+        status, answer = delete(first, at_first['alice'], self.mine)
+        self.assertEqual((status, answer.get('error', {}).get('code')), (403, 'not_owner'))
+        self.assertEqual((self.blob.read_json('catalog.json'), self.blob.count('catalog.json', method='PUT')),
+                         (stored, writes))
+        self.assertIsNotNone(self.blob.file(self.mine['blob']))
+        # The owner storage names now, where the instance's copy names nobody, then someone else.
+        self.assertEqual(delete(first, at_first['bob'], self.orphan), (200, {'deleted': self.orphan['id']}))
+        self.assertEqual(delete(second, at_second['bob'], self.mine), (200, {'deleted': self.mine['id']}))
+        self.assertEqual(self.listed(), [])
+        self.assertEqual([s['deleted_by'] for s in self.blob.read_json('catalog.json')['deleted']],
+                         ['bob@example.com', 'bob@example.com'])
+
     def test_the_request_must_confirm_the_id(self):
         path = '/api/catalog/%s/delete' % self.mine['id']
         for body, status, code in ((b'', 400, 'bad_request'), (b'not json', 400, 'bad_request'),
