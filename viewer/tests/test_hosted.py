@@ -105,6 +105,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((config.port, config.session_days, config.catalog_ttl_s), (8000, 30, 60))
         self.assertEqual(config.cache_max_bytes, 50 * 1024 ** 3)
         self.assertEqual(config.commit, 'unknown')
+        self.assertIsNone(config.soft_delete_days)  # the dialog then leaves it to the storage's own settings
         self.assertTrue(config.google_token_url.startswith('https://oauth2.googleapis.com/'))
         # Secrets never show in repr(), and so never in a traceback's message or a log line.
         text = repr(config) + str(config)
@@ -139,6 +140,7 @@ class ConfigTests(unittest.TestCase):
             'MJV_CACHE_MAX_GB': ['0', '-1', 'lots'],
             'MJV_SESSION_DAYS': ['0', '999', 'x'],
             'MJV_CATALOG_TTL_S': ['-1', 'soon'],
+            'MJV_SOFT_DELETE_DAYS': ['0', '366', '-7', '7.5', '1e1', 'week'],
             'MJV_GOOGLE_TOKEN_URL': ['https://oauth2.example.com/token', 'http://10.0.0.1/token'],
         }
         for name, values in cases.items():
@@ -208,10 +210,13 @@ class ConfigTests(unittest.TestCase):
 
     def test_numbers_commit_and_test_endpoints(self):
         config = load_config(env(PORT='8080', MJV_CACHE_MAX_GB='0.5', MJV_SESSION_DAYS='7', MJV_CATALOG_TTL_S='0',
-                                 MJV_COMMIT='abc1234', MJV_GOOGLE_AUTH_URL='http://127.0.0.1:9/auth',
+                                 MJV_SOFT_DELETE_DAYS=' 14 ', MJV_COMMIT='abc1234',
+                                 MJV_GOOGLE_AUTH_URL='http://127.0.0.1:9/auth',
                                  MJV_GOOGLE_TOKEN_URL='http://localhost:9/token',
                                  MJV_GOOGLE_TOKENINFO_URL='https://127.0.0.1:9/info'))
-        self.assertEqual((config.port, config.session_days, config.catalog_ttl_s), (8080, 7, 0))
+        self.assertEqual((config.port, config.session_days, config.catalog_ttl_s, config.soft_delete_days), (8080, 7, 0, 14))
+        self.assertEqual([load_config(env(MJV_SOFT_DELETE_DAYS=days)).soft_delete_days for days in ('1', '365', '')],
+                         [1, 365, None])
         self.assertEqual(config.cache_max_bytes, 512 * 1024 ** 2)
         self.assertEqual(config.commit, 'abc1234')
         self.assertEqual(config.google_auth_url, 'http://127.0.0.1:9/auth')
@@ -383,10 +388,12 @@ class ProbeAndHeaderTests(HostedTestCase):
             data = self.json_of(body)
             self.assertEqual(set(data), {'ok', 'mode', 'commit', 'catalog', 'cache'})
             self.assertEqual((data['ok'], data['mode'], data['cache']), (True, 'hosted', {'ok': True}))
-            self.assertEqual(set(data['catalog']), {'exports', 'ok', 'age_s', 'delete_enabled', 'zip_deletes_pending'})
+            self.assertEqual(set(data['catalog']), {'exports', 'ok', 'age_s', 'delete_enabled', 'zip_deletes_pending',
+                                                    'soft_delete_days'})
             self.assertEqual((data['catalog']['exports'], data['catalog']['ok']), (1, catalog_ok))
             self.assertIs(data['catalog']['delete_enabled'], False)
             self.assertEqual(data['catalog']['zip_deletes_pending'], 0)
+            self.assertIsNone(data['catalog']['soft_delete_days'])
             for leak in (self.entry['id'], self.entry['sha256'], self.entry['name'], self.entry['label'], 'Synthetic',
                          self.entry['published_by'], 'publisher', self.hosted.config.cache_dir, 'alice', '@',
                          self.blob.secret, '127.0.0.1', 'HTTP 403', 'storage'):
@@ -716,6 +723,7 @@ class SessionRouteTests(HostedTestCase):
     def test_health_names_the_user(self):
         data = self.json_of(self.hosted.get('/api/health', self.session)[2])
         self.assertEqual((data['mode'], data['user'], data['max_upload_bytes']), ('hosted', 'alice@example.com', 0))
+        self.assertIsNone(data['soft_delete_days'])
 
     def test_deleting_is_off_without_a_write_url(self):
         health = self.json_of(self.hosted.get('/api/health', self.session)[2])
@@ -785,7 +793,8 @@ class DeleteTests(unittest.TestCase):
         cls.blob = FakeBlob(os.path.join(cls._tmp.name, 'blob'))
         cls.google = FakeGoogle()
         cls.hosted = Hosted(cls._tmp.name, cls.blob, cls.google, env={
-            'MJV_CATALOG_WRITE_URL': cls.blob.write_url, 'MJV_ADMIN_EMAILS': 'Carol@example.com'})
+            'MJV_CATALOG_WRITE_URL': cls.blob.write_url, 'MJV_ADMIN_EMAILS': 'Carol@example.com',
+            'MJV_SOFT_DELETE_DAYS': '7'})
         cls.sessions = {name: cls.hosted.session('%s@example.com' % name) for name in ('alice', 'bob', 'carol')}
 
     @classmethod
@@ -940,7 +949,9 @@ class DeleteTests(unittest.TestCase):
     def test_healthz_says_deleting_is_on_and_names_nobody(self):
         status, _, body = self.hosted.request('GET', '/healthz', host='internal-probe')
         data = json.loads(body)
-        self.assertEqual((status, data['catalog']['delete_enabled']), (200, True))
+        self.assertEqual((status, data['catalog']['delete_enabled'], data['catalog']['soft_delete_days']), (200, True, 7))
+        health = json.loads(self.hosted.get('/api/health', self.sessions['bob'])[2])
+        self.assertEqual(health['soft_delete_days'], 7)
         for leak in (b'@', b'carol', b'alice', self.blob.write_secret.encode(), self.blob.secret.encode()):
             self.assertNotIn(leak, body)
 
@@ -1027,7 +1038,8 @@ class RunTests(unittest.TestCase):
                 self.assertEqual((health['catalog'], health['cache']), ({'exports': 1, 'ok': True,
                                                                         'age_s': health['catalog']['age_s'],
                                                                         'delete_enabled': False,
-                                                                        'zip_deletes_pending': 0},
+                                                                        'zip_deletes_pending': 0,
+                                                                        'soft_delete_days': None},
                                                                        {'ok': True}))
                 self.assertEqual(self.blob.count('catalog.json'), 1)
                 self.assertEqual(listdir(zips), [])  # abandoned downloads removed at start

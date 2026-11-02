@@ -121,6 +121,7 @@ class HostedConfig:
     google_tokeninfo_url: str = GOOGLE_TOKENINFO_URL
     catalog_write_url: Optional[Secret] = None  # None: deleting is turned off
     admin_emails: frozenset = frozenset()
+    soft_delete_days: Optional[int] = None  # how long the storage keeps a deleted file recoverable, when stated
 
     @property
     def redirect_uri(self) -> str:
@@ -245,8 +246,8 @@ def hosted_cache_dir(base: str = '/home') -> Tuple[str, str]:
     return fallback, '%s is not writable; caching in %s, which other instances do not share' % (base, fallback)
 
 
-def _number(env: Mapping[str, str], name: str, default: float, low: float, high: float,
-            problems: List[str], integer: bool = False) -> float:
+def _number(env: Mapping[str, str], name: str, default: Optional[float], low: float, high: float,
+            problems: List[str], integer: bool = False) -> Optional[float]:
     raw = (env.get(name) or '').strip()
     if not raw:
         return default
@@ -301,6 +302,7 @@ def load_config(env: Mapping[str, str], cache_base: str = '/home') -> HostedConf
     max_gb = _number(env, 'MJV_CACHE_MAX_GB', 50, 0.001, 1_000_000, problems)
     days = _number(env, 'MJV_SESSION_DAYS', 30, 0.01, 366, problems)
     ttl = _number(env, 'MJV_CATALOG_TTL_S', 60, 0, 86400, problems)
+    soft_days = _number(env, 'MJV_SOFT_DELETE_DAYS', None, 1, 365, problems, integer=True)
     commit = (env.get('MJV_COMMIT') or '').strip()
     commit = commit if _COMMIT_RE.fullmatch(commit) else 'unknown'
     google = {}
@@ -320,7 +322,7 @@ def load_config(env: Mapping[str, str], cache_base: str = '/home') -> HostedConf
                         cache_dir=cache_dir, cache_warning=warning, port=port,
                         cache_max_bytes=int(max_gb * 1024 ** 3), session_days=days, catalog_ttl_s=ttl,
                         commit=commit, catalog_write_url=Secret(write) if write else None, admin_emails=admins,
-                        **google)
+                        soft_delete_days=soft_days, **google)
 
 
 # ----------------------------------------------------------------- signing
@@ -679,7 +681,8 @@ class HostedHandler(Handler):
     def _probe(self, path: str) -> None:
         if path == '/healthz':
             catalog = dict(self.app.catalog.health(), delete_enabled=self.app.delete_enabled,
-                           zip_deletes_pending=self.app.published.zip_deletes_pending())
+                           zip_deletes_pending=self.app.published.zip_deletes_pending(),
+                           soft_delete_days=self.config.soft_delete_days)
             return self._send(200, dump_json({'ok': True, 'mode': 'hosted', 'commit': self.config.commit,
                                               'catalog': catalog, 'cache': {'ok': self.app.cache_ok}}),
                               'application/json; charset=utf-8')
@@ -778,7 +781,8 @@ class HostedHandler(Handler):
             return self._json(200, {'ok': True, 'api': API_VERSION, 'version': __version__,
                                     'thumbnails': self.app.thumbs.available, 'max_upload_bytes': 0,
                                     'mode': 'hosted', 'user': self.user, 'delete_enabled': self.app.delete_enabled,
-                                    'can_delete_any': self.app.delete_enabled and self._admin()})
+                                    'can_delete_any': self.app.delete_enabled and self._admin(),
+                                    'soft_delete_days': self.config.soft_delete_days})
         if parts == ['exports']:
             if method != 'GET':
                 return self._method_not_allowed()

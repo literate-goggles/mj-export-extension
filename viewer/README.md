@@ -303,11 +303,14 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
   `MJV_CATALOG_TTL_S`, when that is longer); then it closes its exports and
   says "The viewer can't reach its list of exports right now" until a read
   succeeds. Images a browser has already shown can stay in its cache for up to
-  10 minutes. It cannot be undone in the viewer. The container is
-  set up to keep deleted and overwritten files for 7 days (soft delete, which
-  cannot be purged sooner), and the dialog says so: the export is removed from
-  the viewer at once; the storage keeps a recoverable copy for 7 days, then it
-  is gone.
+  10 minutes. It cannot be undone in the viewer. Whether the container keeps a
+  recoverable copy of a deleted file, and for how long, is its own setting
+  (soft delete in Azure Blob Storage, for example): set `MJV_SOFT_DELETE_DAYS`
+  to that number of days and the dialog says the storage keeps a recoverable
+  copy that long, then deletes it; without it the dialog says that the
+  storage's own settings decide. The dialog also says that copies shared in
+  other ways (the ZIP that was sent to publish it, for example) are not
+  affected.
 - **Opening a published export** downloads its ZIP in the background into the
   cache, checks its size and SHA-256 against the catalog, makes it read-only,
   and then reads it like a local ZIP. The start page shows the progress; with a
@@ -332,6 +335,7 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | required | A Google OAuth client of type "Web application". |
 | `MJV_CATALOG_URL` | required | The container URL with its read-only query string, such as `https://<account>.blob.core.windows.net/<container>?sv=...&sp=rl&sig=...`. https only. A SAS whose `sp` allows more than read and list is refused. Treat it like a password. |
 | `MJV_CATALOG_WRITE_URL` | none | Turns deleting on. The same container as `MJV_CATALOG_URL` (the same scheme, host and path) with a query string of its own that may also write and delete: a SAS whose `sp` contains `w` and `d` and nothing but `r`, `w`, `d` and `l`, such as `sp=rwdl`. https only. It is used only to rewrite `catalog.json` and to delete the ZIPs of deleted exports; everything is still read with `MJV_CATALOG_URL`. Treat it like a password. Without it the viewer never writes to the container and nobody can delete. |
+| `MJV_SOFT_DELETE_DAYS` | none | How many days the container keeps a deleted file recoverable (its soft-delete setting), a whole number from 1 to 365. The delete dialog states it. The viewer cannot check it, so set it to what the container really keeps; without it the dialog says that the storage's own settings decide whether a recoverable copy is kept. |
 | `MJV_ADMIN_EMAILS` | none | Administrators: email addresses, separated by commas and/or spaces, who may delete any export, also one without an owner. Each must be an address at `MJV_ALLOWED_DOMAIN`; they are compared in lower case. They can delete only while deleting is turned on. |
 | `PORT` | 8000 | Port to listen on; hosted mode binds all interfaces. |
 | `MJV_CACHE_DIR` | `/home/mjv-cache`, else `~/.cache/mj-export-viewer` | Downloaded ZIPs and thumbnails. The first default is used when that folder exists and accepts writes, or when `/home` accepts writes to create it (a shared, persistent mount on some platforms); otherwise the second (under `$XDG_CACHE_HOME` when that is set) is used and the log says so. Whichever folder is used is checked for writes at start and every minute; `/healthz` reports the result as `cache.ok`. |
@@ -345,9 +349,10 @@ The server refuses to start, with exit status 2 and one line per problem, when
 a required setting is missing or weak (a short or repetitive secret, an http
 address, a storage query string that is not read-only), when
 `MJV_CATALOG_WRITE_URL` names another container or does not allow write and
-delete (or allows more than read, write, delete and list), or when an
-administrator's address is not at `MJV_ALLOWED_DOMAIN`. It never prints a
-secret value.
+delete (or allows more than read, write, delete and list), when an
+administrator's address is not at `MJV_ALLOWED_DOMAIN`, or when a number
+(`PORT`, `MJV_SOFT_DELETE_DAYS` and the like) is not one or is out of its range.
+It never prints a secret value.
 
 ### Catalog
 
@@ -408,13 +413,14 @@ write the same way.
 ### Health and start probe
 
 - `GET /healthz` answers without sign-in and for any `Host`:
-  `{"ok": true, "mode": "hosted", "commit": "...", "catalog": {"exports": 2, "ok": true, "age_s": 12.5, "delete_enabled": false, "zip_deletes_pending": 0}, "cache": {"ok": true}}`.
+  `{"ok": true, "mode": "hosted", "commit": "...", "catalog": {"exports": 2, "ok": true, "age_s": 12.5, "delete_enabled": false, "zip_deletes_pending": 0, "soft_delete_days": null}, "cache": {"ok": true}}`.
   It names no export, user, path or secret. `catalog.ok` is false while the
   catalog cannot be read; `age_s` is the age of the copy in use;
   `delete_enabled` says whether `MJV_CATALOG_WRITE_URL` is set;
   `zip_deletes_pending` counts the ZIPs of deleted exports that the instance
   still has to delete from storage (it keeps trying every minute; alert when
-  it stays above 0). `cache.ok` is
+  it stays above 0); `soft_delete_days` is `MJV_SOFT_DELETE_DAYS` (null when
+  it is not set). `cache.ok` is
   false while the cache folder does not accept writes (nothing can be opened
   then); the answer stays `200`, so check it after a deploy.
 - `GET /robots933456.txt` answers `200` with plain text. Some platforms (App

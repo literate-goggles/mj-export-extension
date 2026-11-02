@@ -277,6 +277,19 @@ export function prepareExport(item, {signal, retry = false} = {}) {
   return untilAborted(run, signal);
 }
 
+let health = null;
+
+/** GET /api/health, asked once per page; a failure is forgotten, so the next call asks again. */
+export function loadHealth() {
+  if (!health) {
+    health = getJSON(paths.health()).catch((err) => {
+      health = null;
+      throw err;
+    });
+  }
+  return health;
+}
+
 /** True when an export id (the catalog id, or <catalog id>-<n> per root) belongs to this catalog entry. */
 export function fromCatalogItem(exportId, catalogId) {
   const x = String(exportId || '');

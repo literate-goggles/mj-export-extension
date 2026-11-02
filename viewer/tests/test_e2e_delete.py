@@ -4,10 +4,10 @@ Run from viewer/:   MJV_E2E=1 python3 -m unittest tests.test_e2e_delete -v
 
 Like tests/test_e2e_browser.py it needs Playwright for Python and its Chromium
 build, and is skipped without MJV_E2E=1, without Playwright, or when Chromium
-cannot start. A hosted viewer with deleting turned on runs on 127.0.0.1 against
-tests/fake_google.py (signed in as alice@example.com) and tests/fake_blob.py,
-which holds three invented exports: one alice owns, one bob@example.com owns and
-one without an owner. The browser aborts every request that is not for
+cannot start. A hosted viewer with deleting turned on (and a stated 7-day
+recoverable copy) runs on 127.0.0.1 against tests/fake_google.py (signed in as
+alice@example.com) and tests/fake_blob.py, which holds three invented exports:
+one alice owns, one bob@example.com owns and one without an owner. The browser aborts every request that is not for
 127.0.0.1. A local-mode run checks that none of this shows there.
 """
 import os
@@ -81,7 +81,8 @@ class DeleteBrowserTests(_BrowserCase):
         cls._tmp = tempfile.TemporaryDirectory(prefix='mjv-e2e-delete-')
         cls.blob = FakeBlob(os.path.join(cls._tmp.name, 'blob'))
         cls.google = FakeGoogle(email='alice@example.com', hd='example.com')
-        cls.hosted = Hosted(cls._tmp.name, cls.blob, cls.google, env={'MJV_CATALOG_WRITE_URL': cls.blob.write_url})
+        cls.hosted = Hosted(cls._tmp.name, cls.blob, cls.google, env={'MJV_CATALOG_WRITE_URL': cls.blob.write_url,
+                                                                      'MJV_SOFT_DELETE_DAYS': '7'})
         cls.zips = {'mine': fx.export_zip_bytes(fx.gallery_export(12), root='mj_export_alice_20260430'),
                     'theirs': fx.export_zip_bytes(fx.standard_export()),
                     'unowned': fx.export_zip_bytes(fx.gallery_export(3))}
@@ -146,8 +147,9 @@ class DeleteBrowserTests(_BrowserCase):
                 text = self.dialog().inner_text()
                 for part in ('Delete this export?', 'Coast studies', 'mj_export_alice_20260430.zip',
                              '12 jobs · 48 images · 2 moodboards · 2 profiles', 'alice@example.com',
-                             'disappears from this viewer for everyone at once', 'cannot undo this here',
-                             'recoverable copy for 7 days'):
+                             'It disappears from this viewer within about a minute. You cannot undo this here.',
+                             "The viewer's storage keeps a recoverable copy for 7 days, then deletes it. "
+                             'Copies shared in other ways are not affected.'):
                     self.assertIn(part, text)
                 self.assertEqual(self.active('a.textContent'), 'Cancel')
                 if close == 'Escape':
@@ -184,6 +186,24 @@ class DeleteBrowserTests(_BrowserCase):
         self.dialog().locator('button', has_text='Delete export').click()
         self.page.wait_for_selector('text=Deleted Coast studies.', timeout=15000)
         self.assertEqual(self.listed(), [self.theirs['id'], self.unowned['id']])
+
+    def test_the_dialog_says_what_the_storage_keeps_as_the_deployment_states_it(self):
+        for days, says in ((None, "The storage's own settings decide whether a recoverable copy is kept."),
+                           ('1', "The viewer's storage keeps a recoverable copy for 1 day, then deletes it.")):
+            with self.subTest(days=days):
+                settings = {'MJV_CATALOG_WRITE_URL': self.blob.write_url,
+                            'MJV_CACHE_DIR': os.path.join(self._tmp.name, 'cache-days-%s' % days)}
+                if days:
+                    settings['MJV_SOFT_DELETE_DAYS'] = days
+                other = Hosted(self._tmp.name, self.blob, self.google, env=settings)
+                self.addCleanup(other.stop)
+                self.page.goto(other.origin + '/')
+                self.card(self.mine).locator('button', has_text='Delete…').click()
+                self.dialog().wait_for(timeout=15000)
+                self.assertIn(says + ' Copies shared in other ways are not affected.', self.dialog().inner_text())
+                self.page.keyboard.press('Escape')
+                self.dialog().wait_for(state='detached', timeout=15000)
+        self.assertEqual(self.listed(), [self.mine['id'], self.theirs['id'], self.unowned['id']])
 
     def test_a_deleted_export_open_in_this_tab_returns_to_the_start_page(self):
         # Open it (the card then links to it, the link covering the card), and come back.

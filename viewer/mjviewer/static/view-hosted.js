@@ -4,7 +4,7 @@
 
 import {h, icon, fill} from './dom.js';
 import {hrefs, parseHash} from './router.js';
-import {loadExports, prepareExport, onPrepare, isAbort, deleteExport, fromCatalogItem} from './api.js';
+import {loadExports, loadHealth, prepareExport, onPrepare, isAbort, deleteExport, fromCatalogItem} from './api.js';
 import {arr, str, obj, isNum, fmtInt, fmtBytes, plural} from './format.js';
 import {
   pageHead, section, statusBadge, supportBadge, badge, emptyState, errorState, loadingState, callout, timeEl, announce,
@@ -157,9 +157,11 @@ export function renderHostedHome(root, route, ctx) {
 
   async function remove(item) {
     const name = itemLabel(item);
+    const days = await softDeleteDays();
+    if (!ctx.isActive()) return;
     const done = await confirmAction({
       title: 'Delete this export?',
-      body: deleteSummary(item),
+      body: deleteSummary(item, days),
       confirmLabel: 'Delete export',
       busyLabel: 'Deleting…',
       failure: 'Could not delete',
@@ -186,6 +188,7 @@ export function renderHostedHome(root, route, ctx) {
     load({quiet: true});
   }
 
+  loadHealth().catch(() => {});  // the delete dialog states MJV_SOFT_DELETE_DAYS from it
   load();
   return () => {
     stop();
@@ -193,8 +196,21 @@ export function renderHostedHome(root, route, ctx) {
   };
 }
 
-/** What the delete dialog says: which export (name, file, contents, owner), then what deleting does. */
-function deleteSummary(item) {
+/** MJV_SOFT_DELETE_DAYS as /api/health reports it: a whole number of days, or null when not set or unknown. */
+async function softDeleteDays() {
+  try {
+    const days = obj(await loadHealth()).soft_delete_days;
+    return Number.isInteger(days) && days > 0 ? days : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What the delete dialog says: which export (name, file, contents, owner), then what deleting does. days: how
+ * long the viewer's storage keeps a recoverable copy, or null when the deployment does not say.
+ */
+function deleteSummary(item, days) {
   const it = obj(item);
   const summary = obj(it.summary);
   const exports = arr(it.exports);
@@ -212,8 +228,11 @@ function deleteSummary(item) {
       fact('File', `${str(it.name) || '—'}${isNum(it.size) ? ` (${fmtBytes(it.size)})` : ''}`),
       fact('Contents', contents.length ? contents.join(' · ') : 'Not recorded'),
       fact('Owner', str(it.owner) || 'No owner recorded')),
-    h('p', null, 'It disappears from this viewer for everyone at once. You cannot undo this here.'),
-    h('p', null, 'The storage keeps a recoverable copy for 7 days; after that it is gone for good.'),
+    h('p', null, 'It disappears from this viewer within about a minute. You cannot undo this here.'),
+    h('p', null, days
+      ? `The viewer's storage keeps a recoverable copy for ${plural(days, 'day')}, then deletes it.`
+      : "The storage's own settings decide whether a recoverable copy is kept.",
+    ' Copies shared in other ways are not affected.'),
   ];
 }
 
