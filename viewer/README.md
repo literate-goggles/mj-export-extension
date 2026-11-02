@@ -287,6 +287,23 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
   export: check it with `--check`, upload the ZIP, then add its entry to
   `catalog.json`. The hosted mode has no upload, no opening by path and no
   library, and shows no file path.
+- **Owners and deleting.** An export's catalog entry can name its owner: the
+  email address of the designer it belongs to, recorded when it is published.
+  Everyone who signs in sees every published export with its owner (or "No owner
+  recorded"). When deleting is turned on (`MJV_CATALOG_WRITE_URL`), the owner,
+  and the administrators in `MJV_ADMIN_EMAILS`, see **Delete…** on its card; a
+  dialog names the export and asks to confirm. An export without an owner can
+  be deleted by administrators only.
+- **What deleting does.** The export disappears from the viewer for everyone at
+  once: it leaves `catalog.json` (a short record of the deletion, with no name
+  or label, stays in its `deleted` list), its ZIP is deleted from the container,
+  and the instance that deleted it deletes its cached copy and thumbnails at
+  once. Other instances do the same as soon as they next read the catalog,
+  within about a minute. It cannot be undone in the viewer. The container is
+  set up to keep deleted and overwritten files for 7 days (soft delete, which
+  cannot be purged sooner), and the dialog says so: the export is removed from
+  the viewer at once; the storage keeps a recoverable copy for 7 days, then it
+  is gone.
 - **Opening a published export** downloads its ZIP in the background into the
   cache, checks its size and SHA-256 against the catalog, makes it read-only,
   and then reads it like a local ZIP. The start page shows the progress; with a
@@ -310,6 +327,8 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
 | `MJV_ALLOWED_DOMAIN` | required | Your Workspace domain, such as `example.com`. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | required | A Google OAuth client of type "Web application". |
 | `MJV_CATALOG_URL` | required | The container URL with its read-only query string, such as `https://<account>.blob.core.windows.net/<container>?sv=...&sp=rl&sig=...`. https only. A SAS whose `sp` allows more than read and list is refused. Treat it like a password. |
+| `MJV_CATALOG_WRITE_URL` | none | Turns deleting on. The same container as `MJV_CATALOG_URL` (the same scheme, host and path) with a query string of its own that may also write and delete: a SAS whose `sp` contains `w` and `d` and nothing but `r`, `w`, `d` and `l`, such as `sp=rwdl`. https only. It is used only to rewrite `catalog.json` and to delete the ZIPs of deleted exports; everything is still read with `MJV_CATALOG_URL`. Treat it like a password. Without it the viewer never writes to the container and nobody can delete. |
+| `MJV_ADMIN_EMAILS` | none | Administrators: email addresses, separated by commas and/or spaces, who may delete any export, also one without an owner. Each must be an address at `MJV_ALLOWED_DOMAIN`; they are compared in lower case. They can delete only while deleting is turned on. |
 | `PORT` | 8000 | Port to listen on; hosted mode binds all interfaces. |
 | `MJV_CACHE_DIR` | `/home/mjv-cache`, else `~/.cache/mj-export-viewer` | Downloaded ZIPs and thumbnails. The first default is used when that folder exists and accepts writes, or when `/home` accepts writes to create it (a shared, persistent mount on some platforms); otherwise the second (under `$XDG_CACHE_HOME` when that is set) is used and the log says so. Whichever folder is used is checked for writes at start and every minute; `/healthz` reports the result as `cache.ok`. |
 | `MJV_CACHE_MAX_GB` | 50 | The cache never grows past this size (in GiB). Before a download, the least recently used ZIPs that no instance used in the last 10 minutes are deleted to make room; when that is not enough, opening fails with "the cache is full" until some of them have not been used for 10 minutes. |
@@ -320,7 +339,10 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
 
 The server refuses to start, with exit status 2 and one line per problem, when
 a required setting is missing or weak (a short or repetitive secret, an http
-address, a storage query string that is not read-only). It never prints a
+address, a storage query string that is not read-only), when
+`MJV_CATALOG_WRITE_URL` names another container or does not allow write and
+delete (or allows more than read, write, delete and list), or when an
+administrator's address is not at `MJV_ALLOWED_DOMAIN`. It never prints a
 secret value.
 
 ### Catalog
@@ -341,16 +363,22 @@ secret value.
       "size": 123456789,
       "published_at": "2026-04-01T10:00:00Z",
       "published_by": "someone@example.com",
+      "owner": "designer@example.com",
       "summary": {"jobs": 120, "moodboards": 4, "profiles": 2, "images": 480,
                   "export_time": "2026-03-31T18:00:00Z", "extension_version": "0.3.1", "status": "complete"}
     }
+  ],
+  "deleted": [
+    {"id": "<first 16 hex characters>", "sha256": "<64 hex characters>", "size": 98765,
+     "owner": "designer@example.com", "deleted_at": "2026-04-02T09:00:00Z", "deleted_by": "designer@example.com"}
   ]
 }
 ```
 
 Each entry is checked strictly: `id` must be the first 16 characters of
 `sha256`, `blob` must be exactly `exports/<sha256>.zip`, `size` must be a byte
-count, and the texts must be short and plain. An entry that fails is skipped,
+count, `owner` (optional) must be an email address (kept in lower case), and
+the texts must be short and plain. An entry that fails is skipped,
 listed in the server log by position and reason, counted on the start page, and
 never downloaded. When the catalog cannot be read, the last good copy stays in
 use and the start page says so. An export removed from the catalog disappears
@@ -359,12 +387,25 @@ viewer, each instance re-reads the catalog, closes the exports it no longer
 lists and deletes their thumbnails; their cached ZIPs are deleted once no
 instance has used them for 10 minutes.
 
+`deleted` holds one record per deleted export (no name, label or summary). An
+instance that reads one closes that export and deletes its cached ZIP and
+thumbnails at once, without the 10-minute wait, unless the export is listed
+again (published anew). For 30 days, every minute, an instance that may delete
+also deletes that export's ZIP again while the storage still has it (when the
+first try failed), but never a ZIP uploaded again after the deletion. The
+viewer rewrites `catalog.json` from its raw JSON, so fields it does not know
+survive, and only on the ETag it has just read (`If-Match`); when another
+writer got there first it reads the file again and starts over, a few times at
+most. Whatever else writes `catalog.json` must keep fields it does not know and
+write the same way.
+
 ### Health and start probe
 
 - `GET /healthz` answers without sign-in and for any `Host`:
-  `{"ok": true, "mode": "hosted", "commit": "...", "catalog": {"exports": 2, "ok": true, "age_s": 12.5}, "cache": {"ok": true}}`.
+  `{"ok": true, "mode": "hosted", "commit": "...", "catalog": {"exports": 2, "ok": true, "age_s": 12.5, "delete_enabled": false}, "cache": {"ok": true}}`.
   It names no export, user, path or secret. `catalog.ok` is false while the
-  catalog cannot be read; `age_s` is the age of the copy in use. `cache.ok` is
+  catalog cannot be read; `age_s` is the age of the copy in use;
+  `delete_enabled` says whether `MJV_CATALOG_WRITE_URL` is set. `cache.ok` is
   false while the cache folder does not accept writes (nothing can be opened
   then); the answer stays `200`, so check it after a deploy.
 - `GET /robots933456.txt` answers `200` with plain text. Some platforms (App
@@ -398,7 +439,12 @@ What differs from [local mode](#security-model):
 - **Requests with a body.** Any request that declares one, a GET included,
   closes its connection after the answer, so a front end that shares
   connections between users can never mistake a body for the next request.
-- **Secrets stay on the server.** The storage query string, the OAuth client
+- **Deleting** is a POST like the others (token and `Origin` checked) that must
+  repeat the export's id in its body. Whether the signed-in user may delete is
+  decided on `catalog.json` as read from the storage at that moment: the owner
+  recorded there, or an administrator. Nothing is ever written to the
+  container without `MJV_CATALOG_WRITE_URL`, and reading never uses it.
+- **Secrets stay on the server.** The storage query strings, the OAuth client
   secret and `MJV_AUTH_SECRET` never appear in a log line, a page, an API answer
   or an error message.
 - **Headers.** Responses also carry `Strict-Transport-Security`; the Content
@@ -406,11 +452,12 @@ What differs from [local mode](#security-model):
 - **Signing out** clears the cookies in that browser. Sessions are not stored on
   the server, so to end every session at once, change `MJV_AUTH_SECRET`.
 - **Logs** record sign-ins (with the email address), refused sign-ins (with the
-  reason), failed requests (paths only), catalog problems and download results.
+  reason), failed requests (paths only), catalog problems, download results and
+  deletions (one line each: the export id and who deleted it).
 
-Everyone who can sign in with your domain sees every published export. The
-cache holds the downloaded ZIPs (`zips/`) and the thumbnails viewed
-(`thumbs/`).
+Everyone who can sign in with your domain sees every published export; only its
+owner or an administrator can delete one. The cache holds the downloaded ZIPs
+(`zips/`) and the thumbnails viewed (`thumbs/`).
 
 ### Container image
 
@@ -442,7 +489,10 @@ python3 -m tests.hosted_demo --store DIR          # a folder holding catalog.jso
 It prints the address to open (port 8780 by default, `--port` to change it).
 The fake Google signs in `alice@example.com` at once (`--email` for another
 account, `--chooser` for an account page first, as Google shows). Ctrl+C stops
-it and deletes its temporary folder; a `--store` folder is only read.
+it and deletes its temporary folder; a `--store` folder is only read. In the
+temporary container deleting is on and the signed-in account owns the ZIPs it
+publishes (and the first invented export; the second has no owner), so
+**Delete…** can be tried there.
 
 ## Tests
 
@@ -460,16 +510,21 @@ every endpoint leaves an export byte-for-byte unchanged.
 The hosted mode is tested against two local stand-ins: `tests/fake_google.py`
 (Google's authorization, token and tokeninfo endpoints, with configurable
 claims and failures, and an account page like Google's) and
-`tests/fake_blob.py` (a private container that requires a fixed query string
-and can inject 403, 404, 500, redirected, truncated, slow and length-less
-answers). `tests/test_hosted.py` covers the settings, signing, sign-in and
-every id-token rejection, sessions, the Host, Origin and token rules on every
-route, request bodies on GET, and `python3 -m mjviewer --hosted` as a process
+`tests/fake_blob.py` (a private container that takes two fixed query strings,
+read-only and read-write, and allows each only what its `sp` says; it answers
+conditional writes and deletes as the storage does, and can inject 403, 404,
+500, redirected, truncated, slow and length-less answers, write failures and a
+concurrent writer). `tests/test_hosted.py` covers the settings, signing,
+sign-in and every id-token rejection, sessions, the Host, Origin and token
+rules on every route, request bodies on GET, who may delete what and the
+checks on that request, and `python3 -m mjviewer --hosted` as a process
 (start-up, every address, a clean stop during a download);
 `tests/test_catalog.py` covers catalog validation and refresh, downloads and
 their failures, explicit retries, two instances sharing one cache, eviction,
-unpublishing, and that the storage query string never leaks.
-`tests/test_check.py` covers `--check`.
+unpublishing, deleting (a concurrent writer, fields the viewer does not know,
+storage failures, ZIPs already gone or kept, and every instance's copies), and
+that the storage query strings never leak. `tests/test_check.py` covers
+`--check`.
 
 An end-to-end browser test drives the real UI in Chromium on a synthetic
 150-job export: lazy thumbnails and paging, search, filters, job pages and
@@ -477,12 +532,14 @@ lineage navigation, and a moodboard page. A hosted run signs in through the fake
 Google, opens a published synthetic export, browses it, survives an ended
 session and signs out; others follow a shared link through Google's account
 page, and put two instances behind a strict round-robin front end
-(`tests/hosted_harness.py`) to show that a failed export fails once. It is
-skipped unless enabled:
+(`tests/hosted_harness.py`) to show that a failed export fails once.
+`tests/test_e2e_delete.py` deletes a published export through the dialog
+(cancelled with Esc and Cancel, a storage failure, then for real) and checks
+that local mode shows none of it. Both are skipped unless enabled:
 
 ```sh
 python3 -m pip install --user playwright && python3 -m playwright install chromium
-MJV_E2E=1 python3 -m unittest tests.test_e2e_browser -v
+MJV_E2E=1 python3 -m unittest tests.test_e2e_browser tests.test_e2e_delete -v
 ```
 
 `tests/test_e2e_selection.py`, opt-in the same way, opens a synthetic export
@@ -548,6 +605,8 @@ viewer/
   local reader), and every instance opens it in its own memory. Signing out
   does not revoke a copy of the session cookie; only a new `MJV_AUTH_SECRET`
   does. A changed label shows after a restart. Thumbnails are deleted only with
-  their export. A download that stalls inside a network read when the server
-  stops leaves its temporary file and lock to the stale-file rules (another
-  instance takes over after a minute).
+  their export. An export deleted through one instance can still be browsed
+  through another one that has it open until that instance next reads the
+  catalog (about a minute). A download that stalls inside a network read when
+  the server stops leaves its temporary file and lock to the stale-file rules
+  (another instance takes over after a minute).
