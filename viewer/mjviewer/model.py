@@ -59,6 +59,10 @@ KNOWN_SCOPE = {'mode', 'max', 'since', 'images', 'testSubset'}
 KNOWN_SELECTION = {'chosen_at', 'moodboards', 'jobs', 'left_out_moodboard_ids'}
 SELECTION_COUNTS = (('moodboards', ('available', 'exported', 'left_out')),
                     ('jobs', ('available', 'exported', 'left_out', 'not_reviewed')))
+# A larger whole number is not exact in a browser, where JSON numbers are doubles. Such a selection count is
+# treated as unreadable, so the server's sentences and the page never show different numbers.
+MAX_COUNT = 2 ** 53
+TOO_LARGE = 'too large to be a real count (above 2^53); ignored'
 KNOWN_COUNTS = {'jobs', 'moodboards', 'profiles', 'likes', 'files', 'completed_jobs', 'download_bytes'}
 KNOWN_JOB = {'job_id', 'created_at', 'prompt', 'full_command', 'flags', 'profile_default',
              'unknown_flags', 'parent_id', 'parent_index', 'kind', 'image_files', 'image_urls',
@@ -173,6 +177,11 @@ def _capped(items: list, limit: int = MAX_CHECK_ITEMS) -> Tuple[list, str]:
     if len(items) <= limit:
         return items, ''
     return items[:limit], ' Showing the first %d of %d.' % (limit, len(items))
+
+
+def _count(value: Any) -> Optional[int]:
+    """A selection count the viewer can use: a whole number from 0 to MAX_COUNT, else None."""
+    return value if _is_int(value) and 0 <= value <= MAX_COUNT else None
 
 
 def _things(n: int, one: str) -> str:
@@ -497,11 +506,20 @@ class ExportIndex:
             return
         self.meta = value
 
+    def _contradiction(self, item: dict) -> None:
+        """A selection value that contradicts another one or the files: listed with the warning, but still used."""
+        self.selection_problems.append(item)
+        self.selection_contradicted = True
+
     def _read_selection(self) -> None:
-        """export_meta.selection: absent or null when the designer did not choose. A value that is missing or of
-        the wrong type is ignored and listed (a warning); the readable rest is used."""
+        """export_meta.selection: absent or null when the designer did not choose. A value that is missing, of
+        the wrong type or above MAX_COUNT is ignored and listed (a warning); the readable rest is used. Values
+        that contradict each other or the files are listed too, and shown as recorded."""
         self.selection: Optional[dict] = None
         self.selection_problems: List[dict] = []
+        self.selection_contradicted = False
+        # export_meta.json says that the designer did not choose, so nothing should be marked as left out.
+        self.no_selection = self.meta is not None and self.meta.get('selection') is None
         raw = self.meta.get('selection') if self.meta is not None else None
         if raw is None:
             return
@@ -525,13 +543,21 @@ class ExportIndex:
                 self._note_unknown(META_FILE, ['selection.%s.%s' % (group, k) for k in block if k not in keys])
                 for key in keys:
                     value = block.get(key)
-                    if _is_int(value) and value >= 0:
-                        counts[key] = value
-                    else:
-                        problem('selection.%s.%s' % (group, key), 'missing or not a whole number of 0 or more')
+                    counts[key] = _count(value)
+                    if counts[key] is None:
+                        problem('selection.%s.%s' % (group, key), TOO_LARGE if _is_int(value) and value > MAX_COUNT
+                                else 'missing or not a whole number of 0 or more')
             else:
                 problem('selection.' + group, 'missing or not an object')
             selection[group] = counts
+            # What was exported, left out or not reviewed was all in scope, so it cannot add up to more.
+            parts = [key for key in keys[1:] if counts[key] is not None]
+            total = sum(counts[key] for key in parts)
+            if counts['available'] is not None and total > counts['available']:
+                names = _and_list([key.replace('_', ' ') for key in parts])
+                self._contradiction({'file': META_FILE, 'field': 'selection.' + group,
+                                     'problem': '{} {} {:,}, more than the {:,} available; shown as recorded'.format(
+                                         names, 'is' if len(parts) == 1 else 'add up to', total, counts['available'])})
         ids = raw.get('left_out_moodboard_ids')
         if isinstance(ids, list):
             selection['left_out_moodboard_ids'] = _dedupe(x for x in (_as_id(v) for v in ids) if x)
@@ -542,6 +568,18 @@ class ExportIndex:
             selection['left_out_moodboard_ids'] = []
             problem('selection.left_out_moodboard_ids', 'missing or not a list')
         self.selection = selection
+
+    def _not_exported(self) -> Optional[Tuple[int, str]]:
+        """The most generations the selection can have kept out of the export, and what that number is."""
+        jobs = self.selection['jobs']
+        bounds = []
+        if jobs['left_out'] is not None and jobs['not_reviewed'] is not None:
+            bounds.append((jobs['left_out'] + jobs['not_reviewed'],
+                           'generations not exported because of the selection '
+                           '(selection.jobs left_out + not_reviewed)'))
+        if jobs['available'] is not None:
+            bounds.append((jobs['available'], 'generations in scope (selection.jobs.available)'))
+        return min(bounds, key=lambda bound: bound[0]) if bounds else None
 
     def _iter_lines(self, name: str):
         pieces: List[bytes] = []
@@ -858,6 +896,7 @@ class ExportIndex:
         return slots
 
     def _build_boards(self, rows) -> None:
+        bound = self._not_exported() if self.selection is not None else None
         for line, row in rows:
             try:
                 board_id = _as_id(row.get('id'))
@@ -888,7 +927,7 @@ class ExportIndex:
                 # Written only when the designer chose what to export: the board's generations in scope that the
                 # export does not have because of that choice, whether left out or made after choosing.
                 left_out = row.get('generated_left_out')
-                board.generated_left_out = left_out if _is_int(left_out) and left_out >= 0 else None
+                board.generated_left_out = _count(left_out)
                 images = row.get('images') if isinstance(row.get('images'), list) else []
                 board.slots = []
                 for index, image in enumerate(images):
@@ -911,9 +950,18 @@ class ExportIndex:
                 unknown += ['images[].' + k for im in images if isinstance(im, dict) for k in im if k not in KNOWN_BOARD_IMAGE]
                 board.unknown_fields = self._note_unknown(BOARDS, unknown)
                 self.boards[board_id] = board
-                if 'generated_left_out' in row and board.generated_left_out is None:
-                    self.selection_problems.append({'file': BOARDS, 'line': line, 'id': board_id, 'field': 'generated_left_out',
-                                                    'problem': 'not a whole number of 0 or more; ignored'})
+                if 'generated_left_out' in row:
+                    where = {'file': BOARDS, 'line': line, 'id': board_id, 'field': 'generated_left_out'}
+                    if board.generated_left_out is None:
+                        too_large = _is_int(left_out) and left_out > MAX_COUNT
+                        self.selection_problems.append(
+                            dict(where, problem=TOO_LARGE if too_large else 'not a whole number of 0 or more; ignored'))
+                    elif self.no_selection:
+                        self._contradiction(dict(where, problem='recorded, but export_meta.json records no selection; '
+                                                                'shown as recorded'))
+                    elif bound is not None and board.generated_left_out > bound[0]:
+                        self._contradiction(dict(where, problem='is {:,}, more than the {:,} {}; shown as '
+                                                                'recorded'.format(board.generated_left_out, *bound)))
             except Exception as exc:  # a value nothing anticipated skips its row, not the export root
                 self.row_problems.append({'file': BOARDS, 'line': line,
                                           'message': 'row could not be read (%s); skipped' % type(exc).__name__})
@@ -991,9 +1039,17 @@ class ExportIndex:
         left_out_boards = set(left_out_ids)
         in_export = [board_id for board_id in left_out_ids if board_id in self.boards]
         if in_export:
-            self.selection_problems.append({
+            self._contradiction({
                 'file': META_FILE, 'field': 'selection.left_out_moodboard_ids', 'ids': in_export,
                 'problem': '%d id(s) name moodboards that are in this export; they are shown as exported' % len(in_export)})
+        # The exporter lists only left-out moodboards, so the list cannot be longer than their count.
+        outside = len(left_out_ids) - len(in_export)
+        counted = self.selection['moodboards']['left_out'] if self.selection else None
+        if counted is not None and outside > counted:
+            self._contradiction({'file': META_FILE, 'field': 'selection.left_out_moodboard_ids',
+                                 'problem': 'names {} outside this export, more than the {:,} left out '
+                                            '(selection.moodboards.left_out); shown as recorded'.format(
+                                                _things(outside, 'moodboard'), counted)})
 
         def unmatched(code: str, kind: str, job_id: str) -> None:
             entry = self.unmatched.setdefault(code, {'types': [], 'job_ids': []})
@@ -1199,6 +1255,17 @@ class ExportIndex:
                 self.gaps.append({'job_id': job.id, 'parent_id': job.parent_id,
                                   'reported_by_exporter': (job.id, job.parent_id) in reported if self.gaps_listed else None,
                                   'reason': 'the parent job is not in this export'})
+        if self.left_out_gaps:
+            parents = len({gap['parent_id'] for gap in self.left_out_gaps})
+            bound = self._not_exported() if self.selection is not None else None
+            problem = None
+            if self.no_selection:
+                problem = 'marks %s left_out, but export_meta.json records no selection' % _things(parents, 'parent')
+            elif bound is not None and parents > bound[0]:
+                problem = 'marks {} left_out, more than the {:,} {}'.format(_things(parents, 'parent'), *bound)
+            if problem:
+                self._contradiction({'file': META_FILE, 'field': 'parent_gaps',
+                                     'problem': problem + '; shown as left out'})
         self.stale_gaps = []
         for gap in meta_gaps:
             if not isinstance(gap, dict):
@@ -1393,9 +1460,10 @@ class ExportIndex:
             self._check('selection', 'info', 'The designer chose what to export',
                         self._selection_text() or 'export_meta.json records the choice, but not its numbers.')
         if self.selection_problems:
-            self._check('selection_invalid', 'warning', 'Some selection details were ignored',
-                        "Values about the designer's selection are missing, not understood or contradict the files, "
-                        'so the viewer ignored them. Everything else is shown as found.', self.selection_problems)
+            self._check('selection_invalid', 'warning', 'Some selection details are unreadable or do not add up',
+                        "Values about the designer's selection are missing, not understood, or contradict each other "
+                        'or the files. Each item says whether the viewer ignored the value or shows it as recorded.',
+                        self.selection_problems)
 
         failures = meta.get('failures') if meta else None
         if isinstance(failures, list) and failures:
@@ -1556,8 +1624,8 @@ class ExportIndex:
         if left:
             clauses.append('%s %s left out' % (' and '.join(_things(n, noun) for n, noun in left),
                                                'was' if len(left) == 1 and left[0][0] == 1 else 'were'))
-        elif jobs['left_out'] == 0 and boards['left_out'] == 0:
-            clauses.append('Nothing was left out')
+        elif jobs['left_out'] == 0 and boards['left_out'] == 0 and not self.selection_contradicted:
+            clauses.append('Nothing was left out')  # not when selection_invalid says the record contradicts itself
         late = jobs['not_reviewed']
         if late:
             clauses.append('%s appeared after choosing and %s not exported' % (_things(late, 'generation'),

@@ -77,7 +77,8 @@ class CheckTests(unittest.TestCase):
         root = json.loads(out)['exports'][0]
         self.assertEqual((status, root['selection'], root['errors']), (0, None, []))
         self.assertEqual(len(root['warnings']), 1)
-        self.assertTrue(root['warnings'][0].startswith('Some selection details were ignored'), root['warnings'])
+        self.assertTrue(root['warnings'][0].startswith('Some selection details are unreadable or do not add up'),
+                        root['warnings'])
 
     def test_errors_and_warnings_exit_1(self):
         export = fx.standard_export()

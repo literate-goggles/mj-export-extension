@@ -198,8 +198,9 @@ The viewer copes with:
   everything else is still shown);
 - exports in which the designer chose what to export (`selection` in
   `export_meta.json`): what they left out is labelled as left out, never as
-  missing or unresolved, and selection values the viewer cannot read are
-  ignored with a warning;
+  missing or unresolved; selection values the viewer cannot read are ignored
+  with a warning, and values that contradict each other or the files are
+  shown as recorded with a warning;
 - an export that cannot be read at all: the server reports it and keeps
   running.
 

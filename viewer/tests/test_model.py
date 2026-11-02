@@ -446,7 +446,9 @@ class SelectionTests(unittest.TestCase):
     def test_wording_for_single_items_and_for_nothing_left_out(self):
         export = fx.selection_export()
         export.meta['selection'].update(moodboards={'available': 1, 'exported': 1, 'left_out': 0},
-                                        jobs={'available': 12, 'exported': 10, 'left_out': 1, 'not_reviewed': 1})
+                                        jobs={'available': 12, 'exported': 10, 'left_out': 1, 'not_reviewed': 1},
+                                        left_out_moodboard_ids=[])  # no moodboard was left out
+        export.boards[0]['generated_left_out'] = 1  # each board misses one of the two generations not exported
         export.boards[1]['generated_left_out'] = 1
         export.boards[1]['generated_job_ids'] = []
         export.jobs[3]['personalization_codes'] = []  # board-2 then has no generation in the export
@@ -458,11 +460,16 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(index.moodboard_detail('board-2')['notes'][0],
                          "1 generation made with this moodboard is not in this export because of the designer's choice: "
                          'left out, or made after choosing.')
+        self.assertNotIn('selection_invalid', checks(index))
+        # Nothing left out: no generation is missing from a board, and the parent of job-left-child is an ordinary gap.
         export.meta['selection'].update(moodboards={'available': 1234, 'exported': 1234, 'left_out': 0},
                                         jobs={'available': 1203, 'exported': 1203, 'left_out': 0, 'not_reviewed': 0})
+        export.boards[0]['generated_left_out'] = export.boards[1]['generated_left_out'] = 0
+        del export.meta['parent_gaps'][-1]['left_out']
         index = build(export, os.path.join(self.tmp, 'again'))
         self.assertEqual(self.check('selection', index)['detail'],
                          '1,234 of 1,234 moodboards and 1,203 of 1,203 generations. Nothing was left out.')
+        self.assertNotIn('selection_invalid', checks(index))
 
     def test_only_left_out_moodboards_that_references_use_are_counted(self):
         export = fx.selection_export()
@@ -536,6 +543,98 @@ class SelectionTests(unittest.TestCase):
         unknown = {(i['file'], i['field']) for i in self.check('unknown_fields', index)['items']}
         self.assertEqual(unknown, {('export_meta.json', 'selection.extra'), ('export_meta.json', 'selection.jobs.more')})
         self.assertEqual((index.summary['warnings'], index.summary['errors']), (1, 0))
+
+    def problems(self, index):
+        return [(p['field'], p['problem']) for p in self.check('selection_invalid', index)['items']]
+
+    def test_numbers_that_add_up_to_more_than_available_are_a_warning(self):
+        export = fx.selection_export()
+        export.meta['selection'].update(moodboards={'available': 1, 'exported': 2, 'left_out': 5},
+                                        jobs={'available': 25, 'exported': 30, 'left_out': 13, 'not_reviewed': 2})
+        index = build(export, self.tmp)
+        self.assertEqual(self.problems(index), [
+            ('selection.moodboards', 'exported and left out add up to 7, more than the 1 available; shown as recorded'),
+            ('selection.jobs', 'exported, left out and not reviewed add up to 45, more than the 25 available; '
+                               'shown as recorded')])
+        self.assertEqual(self.check('selection_invalid', index)['level'], 'warning')
+        # The numbers are still shown as recorded.
+        self.assertEqual(self.check('selection', index)['detail'],
+                         '2 of 1 moodboard and 30 of 25 generations. 13 generations and 5 moodboards were left out; '
+                         '2 generations appeared after choosing and were not exported.')
+        self.assertEqual(index.overview()['selection']['jobs']['exported'], 30)
+        # One readable part is enough to contradict 'available'.
+        export.meta['selection']['jobs'] = {'available': 25, 'exported': 30}
+        index = build(export, os.path.join(self.tmp, 'one'))
+        self.assertIn(('selection.jobs', 'exported is 30, more than the 25 available; shown as recorded'),
+                      self.problems(index))
+
+    def test_a_record_that_contradicts_the_files_never_says_nothing_was_left_out(self):
+        # The numbers say nothing was left out, but a reference is to a left-out moodboard, board-1 misses three
+        # generations and a parent is marked left out.
+        export = fx.selection_export()
+        export.meta['selection'].update(moodboards={'available': 2, 'exported': 2, 'left_out': 0},
+                                        jobs={'available': 10, 'exported': 10, 'left_out': 0, 'not_reviewed': 0})
+        index = build(export, self.tmp)
+        self.assertEqual(self.check('selection', index)['detail'], '2 of 2 moodboards and 10 of 10 generations.')
+        bound = 'more than the 0 generations not exported because of the selection (selection.jobs left_out + not_reviewed)'
+        self.assertEqual(self.problems(index), [
+            ('generated_left_out', 'is 3, %s; shown as recorded' % bound),
+            ('selection.left_out_moodboard_ids', 'names 1 moodboard outside this export, more than the 0 left out '
+                                                 '(selection.moodboards.left_out); shown as recorded'),
+            ('parent_gaps', 'marks 1 parent left_out, %s; shown as left out' % bound)])
+        self.assertEqual(self.check('selection_invalid', index)['items'][0]['id'], 'board-1')
+        # What the files say is still shown.
+        self.assertEqual(index.job_detail('job-niji')['references'][0]['link'], 'left_out')
+        self.assertEqual(index.card('job-left-child')['parent_status'], 'left_out')
+        self.assertEqual(index.moodboard_detail('board-1')['moodboard']['generated_left_out'], 3)
+        self.assertEqual((index.summary['warnings'], index.summary['errors']), (1, 0))
+
+    def test_a_board_count_above_the_generations_in_scope_is_a_warning(self):
+        # Without readable left_out and not_reviewed numbers, the generations in scope are the limit.
+        export = fx.selection_export()
+        export.meta['selection']['jobs'] = {'available': 2, 'exported': 2}
+        index = build(export, self.tmp)
+        self.assertIn(('generated_left_out', 'is 3, more than the 2 generations in scope (selection.jobs.available); '
+                                             'shown as recorded'), self.problems(index))
+
+    def test_counts_above_2_53_are_unreadable_so_the_page_and_the_server_agree(self):
+        export = fx.selection_export()
+        export.meta['selection']['jobs'] = {'available': 2 ** 53, 'exported': 10 ** 30, 'left_out': int('9' * 400),
+                                            'not_reviewed': 2 ** 53 + 1}
+        export.boards[0]['generated_left_out'] = 10 ** 40
+        index = build(export, self.tmp)
+        self.assertEqual(index.overview()['selection']['jobs'],
+                         {'available': 2 ** 53, 'exported': None, 'left_out': None, 'not_reviewed': None})
+        too_large = 'too large to be a real count (above 2^53); ignored'
+        self.assertEqual(self.problems(index), [('selection.jobs.exported', too_large), ('selection.jobs.left_out', too_large),
+                                                ('selection.jobs.not_reviewed', too_large), ('generated_left_out', too_large)])
+        self.assertEqual(self.check('selection', index)['detail'], '2 of 4 moodboards. 2 moodboards were left out.')
+        self.assertNotIn('generated_left_out', index.moodboard_detail('board-1')['moodboard'])
+        self.assertNotIn('generated_left_out', index.moodboards()['items'][0])
+        self.assertFalse([n for n in index.moodboard_detail('board-1')['notes'] if 'not in this export' in n])
+
+    def test_left_out_data_without_a_selection_is_a_warning(self):
+        # The exporter writes generated_left_out and left_out gaps only with a selection.
+        for name, selection in (('null', None), ('absent', fx.MISSING)):
+            export = fx.standard_export()
+            if selection is not fx.MISSING:
+                export.meta['selection'] = selection
+            export.boards[0]['generated_left_out'] = 4
+            export.meta['parent_gaps'][0]['left_out'] = True
+            index = build(export, os.path.join(self.tmp, name))
+            self.assertIsNone(index.selection)
+            self.assertEqual(self.problems(index), [
+                ('generated_left_out', 'recorded, but export_meta.json records no selection; shown as recorded'),
+                ('parent_gaps', 'marks 1 parent left_out, but export_meta.json records no selection; shown as left out')])
+            # Shown as recorded.
+            self.assertEqual(index.card('job-gap')['parent_status'], 'left_out')
+            self.assertEqual(index.moodboards()['items'][0]['generated_left_out'], 4)
+            self.assertEqual(index.summary['warnings'], 1)
+        # Without export_meta.json (an interrupted run) nothing says whether the designer chose: no such warning.
+        export.meta = None
+        index = build(export, os.path.join(self.tmp, 'nometa'))
+        self.assertNotIn('selection_invalid', checks(index))
+        self.assertEqual(index.moodboards()['items'][0]['generated_left_out'], 4)
 
     def test_only_a_true_left_out_flag_marks_a_parent(self):
         export = fx.selection_export()
