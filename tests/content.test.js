@@ -86,7 +86,9 @@ function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, sto
   vm.runInContext(fs.readFileSync(new URL('../src/content.js', import.meta.url), 'utf8'), context);
   return {
     state, options, ops, downloads, files, statuses, lines,
-    send(command, customOptions = options) { messageHandler({ type: 'command', command, options: customOptions }, {}, () => {}); },
+    // Sends a message as the popup does and returns the listener's immediate answer.
+    message(message) { let answer; messageHandler(message, {}, value => { answer = structuredClone(value); }); return answer; },
+    send(command, customOptions = options) { return this.message({ type: 'command', command, options: customOptions }); },
     // Runs one command that takes the run lease, until it has released it and settled.
     async run(command, customOptions = options) {
       const released = new Promise(resolve => waiters.push(resolve));
@@ -310,6 +312,31 @@ test('choosing scans first when there is no scan for the account and scope, and 
   await otherScope.run('choose', { ...allJobs, testSubset: true });
   assert.deepEqual(otherScope.ops, ['identity', 'jobs', 'moodboards', 'profiles']);
   assert.equal(otherScope.state.scan_data.scope.testSubset, true);
+});
+
+test('while the chooser is open, other commands are refused and nothing is exported', async () => {
+  let close, opened = 0;
+  const chooser = () => ({ open() { opened++; return new Promise(resolve => { close = resolve; }); } });
+  const app = harness({ feed: boardFeed, chooser });
+  assert.deepEqual(app.send('choose', allJobs), { ok: true });
+  for (let i = 0; i < 50 && !opened; i++) await settle();
+  assert.equal(opened, 1);
+  assert.deepEqual(app.message({ type: 'run-state' }), { active: true, choosing: true });
+  for (const command of ['export', 'new', 'resume', 'scan', 'choose', 'pause', 'clear', 'folder']) {
+    assert.deepEqual(app.send(command, allJobs), { error: 'Finish choosing first: Save or Cancel the open choice.' }, command);
+  }
+  await settle();
+  assert.equal(opened, 1);
+  assert.deepEqual(app.downloads, []);
+  assert.deepEqual(app.files, {});
+  assert.equal(app.state.run, undefined);
+  // Cancel gives the lease back, and the export can start.
+  close(null);
+  await settle();
+  assert.deepEqual(app.message({ type: 'run-state' }), { active: false, choosing: false });
+  assert.equal(app.statuses.at(-1), 'Closed without saving. Nothing changed.');
+  await app.run('export', allJobs);
+  assert.equal(app.output().meta.status, 'complete');
 });
 
 test('clearing the selection goes back to exporting everything', async () => {

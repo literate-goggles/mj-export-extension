@@ -36,7 +36,7 @@ After source changes, reload the extension card and then reload the Midjourney p
 - **Clear selection** goes back to exporting everything in the scope.
 - **Open export folder** reveals the metadata file in its folder. Chrome's own download-directory settings control the base destination. If Chrome asks where to save every download, those prompts still apply.
 
-Only one run may be active across tabs. Run settings, the saved choice of what to export, and errors appear in the popup and on-page panel. An unfinished run restores its saved settings; a fresh install or completed run shows the new defaults; its **Resume** button uses the saved run's settings. **Export** uses the current controls and rejects a changed scope rather than overwriting the saved run.
+Only one run may be active across tabs, and an open chooser counts as one: until you **Save selection** or **Cancel** it, every other command, from the popup or another tab, answers "Finish choosing first". Run settings, the saved choice of what to export, and errors appear in the popup and on-page panel. An unfinished run restores its saved settings; a fresh install or completed run shows the new defaults; its **Resume** button uses the saved run's settings. **Export** uses the current controls and rejects a changed scope rather than overwriting the saved run.
 
 ### Exact sequence after permission to run
 

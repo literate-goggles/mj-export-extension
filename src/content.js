@@ -1,5 +1,6 @@
 (() => {
- const pending=new Map();let panel,active=false,paused=false,scheduler,run,saveTail=Promise.resolve();
+ const pending=new Map();let panel,active=false,choosing=false,paused=false,scheduler,run,saveTail=Promise.resolve();
+ const finishChoosing='Finish choosing first: Save or Cancel the open choice.';
  const allowedPage=()=>/^\/(organize|imagine|personalize|moodboards)(\/|$)/.test(location.pathname);
  const rpc=(op,args={})=>new Promise((resolve,reject)=>{const id=crypto.randomUUID();const timeout=setTimeout(()=>{pending.delete(id);reject(new Error('Page read timed out'));},90000);pending.set(id,result=>{clearTimeout(timeout);resolve(result);});window.postMessage({source:'mj-export-request',id,op,args},location.origin);});
  const worker=async message=>{const r=await chrome.runtime.sendMessage(message);if(r?.error)throw new Error(r.error);return r;};
@@ -46,7 +47,7 @@
  }
  function validateOptions(options){if(options.mode==='max'&&(!Number.isSafeInteger(options.max)||options.max<1))throw new Error('Maximum jobs must be a positive integer');if(options.mode==='since'&&(!options.since||!Number.isFinite(Date.parse(options.since))))throw new Error('Choose a valid since date');if(!['max','since','all'].includes(options.mode))throw new Error('Invalid scope');}
  async function exclusive(options,task){
-  if(active)throw new Error('A run is already active in this tab');validateOptions(options);active=true;try{await worker({type:'acquire'});}catch(error){active=false;throw error;}paused=false;scheduler=new ReadScheduler();const savedRun=run;run=null;
+  if(active)throw new Error(choosing?finishChoosing:'A run is already active in this tab');validateOptions(options);active=true;try{await worker({type:'acquire'});}catch(error){active=false;throw error;}paused=false;scheduler=new ReadScheduler();const savedRun=run;run=null;
   try{return await task();}finally{active=false;run=savedRun;await worker({type:'release'});}
  }
  async function scanScope(options,identity){
@@ -58,13 +59,13 @@
  // The chooser (src/chooser.js) saves the selection itself. A saved export keeps the one it started with, and stops rather than export what a newer one leaves out.
  async function choose(options){
   const chooser=globalThis.mjExportChooser;if(!chooser)throw new Error('The chooser did not load: reload this page and try again');
-  await exclusive(options,async()=>{
+  // The open window keeps the run lease, so nothing can scan or export until it is saved or cancelled.
+  const selection=await exclusive(options,async()=>{
    const identity=await ownIdentity();const {scan_data:scanned}=await chrome.storage.local.get('scan_data');
-   if(scanned?.user_id===identity.user_id&&sameScope(scanned.scope,options))return;
-   status('There is no scan of this scope for this account yet, so it scans first. Scanning reads your job list and downloads no images.');await scanScope(options,identity);
+   if(scanned?.user_id!==identity.user_id||!sameScope(scanned.scope,options)){status('There is no scan of this scope for this account yet, so it scans first. Scanning reads your job list and downloads no images.');await scanScope(options,identity);}
+   status('Choose what to export in the window over this page.');
+   choosing=true;try{return await chooser.open();}finally{choosing=false;}
   });
-  status('Choose what to export in the window over this page.');
-  const selection=await chooser.open();
   if(!selection){status('Closed without saving. Nothing changed.');return;}
   const stored=await chrome.storage.local.get(['selection','run']);const saved=stored.run;
   status(`Saved. ${summaryText(choiceCounts(selection))}. `+(saved?'Use New export to export with this choice.':'Export uses this choice.'));
@@ -98,7 +99,7 @@
   status(JSON.stringify({...metadata,folder:run.folder,local_folder:run.local_folder},null,2));
  }
  async function start(options,newRun=false){
-  if(active)throw new Error('A run is already active in this tab');validateOptions(options);active=true;try{await worker({type:'acquire'});}catch(error){active=false;throw error;}paused=false;scheduler=new ReadScheduler();let writable=false;
+  if(active)throw new Error(choosing?finishChoosing:'A run is already active in this tab');validateOptions(options);active=true;try{await worker({type:'acquire'});}catch(error){active=false;throw error;}paused=false;scheduler=new ReadScheduler();let writable=false;
   try{
    const stored=await chrome.storage.local.get(['run','selection']);
    run=newRun?null:stored.run||null;let selection=null;const before=run&&JSON.stringify(run);
@@ -153,8 +154,9 @@
   if(name==='export'||name==='new')return start(options,name==='new');
  }
  chrome.runtime.onMessage.addListener((m,sender,respond)=>{
-  if(m.type==='run-state'){respond({active});return;}
+  if(m.type==='run-state'){respond({active,choosing});return;}
   if(m.type==='command'){
+   if(choosing){respond({error:finishChoosing});return;}
    if(active&&!['pause','folder','clear'].includes(m.command)){respond({error:'Run already active'});return;}
    command(m.command,m.options||opts()).catch(e=>status(e.message));respond({ok:true});
   }

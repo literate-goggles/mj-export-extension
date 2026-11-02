@@ -20,7 +20,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond)=>{
  const extension=sender.id===chrome.runtime.id&&sender.url?.startsWith(`chrome-extension://${chrome.runtime.id}/`);
  if(!ownTab&&!extension)return;
  (async()=>{
-  if(message.type==='acquire')return serialized(async()=>{const {lease}=await chrome.storage.session.get('lease');if(lease&&lease!==sender.tab.id){try{const s=await chrome.tabs.sendMessage(lease,{type:'run-state'});if(s.active)throw new Error('Another MJ Export tab is already running');}catch(e){if(e.message.includes('already running'))throw e;}}await chrome.storage.session.set({lease:sender.tab.id});return {ok:true};});
+  if(message.type==='acquire')return serialized(async()=>{const {lease}=await chrome.storage.session.get('lease');if(lease&&lease!==sender.tab.id){const s=await chrome.tabs.sendMessage(lease,{type:'run-state'}).catch(()=>null);if(s?.choosing)throw new Error('Finish choosing first: Save or Cancel the open choice in your other Midjourney tab.');if(s?.active)throw new Error('Another MJ Export tab is already running');}await chrome.storage.session.set({lease:sender.tab.id});return {ok:true};});
   if(message.type==='release'){const {lease}=await chrome.storage.session.get('lease');if(lease===sender.tab.id)await chrome.storage.session.remove('lease');return {ok:true};}
   if(message.type==='schema')return serialized(async()=>{const {schemas={}}=await chrome.storage.local.get('schemas');schemas[message.record.path]=message.record;await chrome.storage.local.set({schemas});return {ok:true};});
   if(message.type==='text-file'){
