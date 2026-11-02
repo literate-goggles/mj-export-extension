@@ -63,6 +63,7 @@ class CheckTests(unittest.TestCase):
             'chosen_at': '2026-03-19T09:00:00.000Z', 'moodboards': {'available': 4, 'exported': 2, 'left_out': 2},
             'jobs': {'available': 25, 'exported': 10, 'left_out': 13, 'not_reviewed': 2}, 'text': sentence})
         self.assertNotIn('board-left', out)  # numbers only: the report names no moodboard
+        self.assertEqual((root['extension_version'], root['version_support']), ('0.4.0', 'supported'))
         self.assertEqual((root['errors'], root['warnings']), ([], []))
         self.assertEqual(root['counts']['jobs'], 10)
         status, out, _ = run('--check', path)

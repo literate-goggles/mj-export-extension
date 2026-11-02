@@ -66,7 +66,7 @@ listed at the end, after the [`--check`](#command-line-check) command.
 | `source` | `{type: 'zip'|'folder'|'upload', name, path}`. For an upload, `name` is the sanitized `X-Filename` and `path` is the cached copy. |
 | `root` | Path of the export root inside the ZIP or folder (`''` at the top). |
 | `extension_version` | From `export_meta.json`, or null. |
-| `version_support` | `supported` for 0.3.0 and 0.3.1 (one writer, checked against `lib/normalize.js` and `src/content.js`), `unknown` for any other version (0.2.x included; read with best effort), or `missing`. |
+| `version_support` | `supported` for 0.3.0 and 0.3.1 (one writer, checked against `lib/normalize.js` and `src/content.js`) and for 0.4.0 (the same files plus the designer's selection), `unknown` for any other version (0.2.x included; read with best effort), or `missing`. |
 | `export_time` | Normalized ISO 8601 UTC string (`YYYY-MM-DDTHH:MM:SS.mmmZ`), or null. |
 | `username`, `status` | As exported, or null. |
 | `counts` | `{jobs, moodboards, profiles, likes, images_expected, images_present}`, observed in the files and not copied from the metadata. |

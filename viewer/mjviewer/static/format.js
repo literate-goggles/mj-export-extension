@@ -158,7 +158,7 @@ export function statusInfo(status) {
 }
 
 const SUPPORT = {
-  supported: {label: 'Supported', tone: 'ok', help: 'The viewer was checked against exports of this exporter version (0.3.0 and 0.3.1 share one writer).'},
+  supported: {label: 'Supported', tone: 'ok', help: 'The viewer was checked against exports of this exporter version (0.3.0 and 0.3.1 share one writer; 0.4.0 adds the designer’s selection).'},
   unknown: {label: 'Untested version', tone: 'warn', help: 'The viewer was not checked against this exporter version; data is shown on a best-effort basis.'},
   missing: {label: 'No version', tone: 'warn', help: 'export_meta.json does not record an extension version; data is shown on a best-effort basis.'},
 };

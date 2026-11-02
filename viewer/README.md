@@ -179,8 +179,9 @@ Other things the viewer shows as recorded rather than guessing:
 
 ## Compatibility and odd data
 
-Exports from extension 0.3.0 and 0.3.1 (one writer) are marked supported.
-Anything else, older versions included, is read with best effort and a warning.
+Exports from extension 0.3.0 and 0.3.1 (one writer) and 0.4.0 (the same files
+plus the designer's selection) are marked supported. Anything else, older
+versions included, is read with best effort and a warning.
 The viewer copes with:
 
 - a ZIP with or without a top folder, several export roots in one ZIP, and

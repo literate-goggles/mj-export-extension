@@ -44,8 +44,9 @@ PROFILES = 'profiles.jsonl'
 LIKES = 'likes.jsonl'
 JSONL_FILES = (JOBS, BOARDS, PROFILES, LIKES)
 # Writers this viewer was checked against: 0.3.0 and 0.3.1 share one writer (lib/normalize.js,
-# src/content.js). Anything else, including 0.2.x, is read with best effort.
-SUPPORTED_VERSIONS = ('0.3.0', '0.3.1')
+# src/content.js), and 0.4.0 writes the same files plus the designer's selection (export_meta.selection,
+# board generated_left_out, parent_gaps left_out). Anything else, including 0.2.x, is read with best effort.
+SUPPORTED_VERSIONS = ('0.3.0', '0.3.1', '0.4.0')
 LEVEL_ORDER = {'error': 0, 'warning': 1, 'info': 2, 'ok': 3}
 MAX_CHECK_ITEMS = 500
 MAX_LIMIT = 500
@@ -177,6 +178,11 @@ def _capped(items: list, limit: int = MAX_CHECK_ITEMS) -> Tuple[list, str]:
 def _things(n: int, one: str) -> str:
     """'1 moodboard', '1,203 generations'."""
     return '{:,} {}'.format(n, one if n == 1 else one + 's')
+
+
+def _and_list(items: List[str]) -> str:
+    """'a', 'a and b', 'a, b and c'."""
+    return items[0] if len(items) == 1 else '%s and %s' % (', '.join(items[:-1]), items[-1])
 
 
 # -------------------------------------------------------------------- dates
@@ -1306,7 +1312,7 @@ class ExportIndex:
             self.version_support = 'unknown'
             self._check('extension_version', 'warning', 'Unknown extension version',
                         'This viewer was checked against exports from versions %s; %s was read with best effort.'
-                        % (' and '.join(SUPPORTED_VERSIONS), display_name(str(version), 40)))
+                        % (_and_list(list(SUPPORTED_VERSIONS)), display_name(str(version), 40)))
         else:
             self.version_support = 'missing'
             self._check('extension_version', 'warning', 'Extension version is missing',

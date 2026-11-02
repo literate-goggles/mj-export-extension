@@ -370,7 +370,9 @@ class SelectionTests(unittest.TestCase):
             'chosen_at': '2026-03-19T09:00:00.000Z', 'moodboards': {'available': 4, 'exported': 2, 'left_out': 2},
             'jobs': {'available': 25, 'exported': 10, 'left_out': 13, 'not_reviewed': 2},
             'left_out_moodboard_ids': ['board-left']})
-        # What the designer left out is reported, never as a warning or an error.
+        # What the designer left out is reported, never as a warning or an error, under the version that writes it.
+        self.assertEqual((self.index.summary['extension_version'], self.index.summary['version_support']),
+                         ('0.4.0', 'supported'))
         self.assertEqual(checks(self.index), {
             'extension_version': 'ok', 'status': 'ok', 'failures': 'ok', 'counts': 'ok', 'generated_job_ids': 'ok',
             'scope': 'info', 'selection': 'info', 'unresolved_references': 'info', 'references_left_out': 'info',
@@ -592,6 +594,9 @@ class RobustnessTests(unittest.TestCase):
         index = build(export, self.tmp)
         self.assertEqual(index.summary['version_support'], 'unknown')
         self.assertEqual(checks(index)['extension_version'], 'warning')
+        self.assertEqual([c['detail'] for c in index.checks if c['id'] == 'extension_version'],
+                         ['This viewer was checked against exports from versions 0.3.0, 0.3.1 and 0.4.0; '
+                          '9.9.0 was read with best effort.'])
         self.assertEqual(index.summary['counts']['jobs'], 9)
         del export.meta['extension_version']
         index = build(export, tempfile.mkdtemp(dir=self.tmp))
@@ -619,7 +624,7 @@ class RobustnessTests(unittest.TestCase):
 
     def test_supported_versions(self):
         for version, support in (('0.3.0', 'supported'), ('0.3.1', 'supported'), ('0.3.2', 'unknown'),
-                                 ('0.2.0', 'unknown'), ('1.0.0', 'unknown')):
+                                 ('0.4.0', 'supported'), ('0.4.1', 'unknown'), ('0.2.0', 'unknown'), ('1.0.0', 'unknown')):
             export = fx.standard_export()
             export.meta['extension_version'] = version
             index = build(export, tempfile.mkdtemp(dir=self.tmp))

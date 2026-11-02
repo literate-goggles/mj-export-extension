@@ -106,8 +106,10 @@ class SelectionBrowserTests(unittest.TestCase):
         self.assertIn('1 personalization reference(s) point to moodboards the designer left out', titles)
         self.assertIn('1 job(s) have a parent the designer left out', titles)
         self.assertEqual(self.page.locator('.check--warning, .check--error').count(), 0)
+        self.assertEqual(self.page.locator('.callout--warn').count(), 0)  # no version notice: 0.4.0 is supported
         details = self.page.locator('.overview__side .kv').inner_text()
         self.assertIn('Chosen by the designer', details)
+        self.assertIn('0.4.0', details)
         table = self.page.locator('section', has_text='What the designer chose to export').locator('tbody tr')
         self.assertEqual([' '.join(r.split()) for r in table.all_inner_texts()],
                          ['Moodboards 4 2 2 —', 'Generations 25 10 13 2'])

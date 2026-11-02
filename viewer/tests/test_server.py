@@ -365,6 +365,7 @@ class SelectionApiTests(ServerTestCase):
         levels = {c['id']: c['level'] for c in overview['checks']}
         self.assertEqual([levels[k] for k in ('selection', 'references_left_out', 'parent_gaps_left_out')], ['info'] * 3)
         self.assertEqual((overview['summary']['warnings'], overview['summary']['errors']), (0, 0))
+        self.assertEqual(overview['summary']['version_support'], 'supported')  # 0.4.0 writes the selection
         self.assertEqual([g['job_id'] for g in overview['unresolved']['parent_gaps']], ['job-gap'])
         self.assertEqual([g.get('left_out') for g in overview['parent_gaps']], [None, True])  # as the exporter wrote them
 

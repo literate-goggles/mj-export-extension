@@ -268,6 +268,7 @@ def selection_export() -> Export:
     more generations of board-1 were not exported. See test_model.SelectionTests for what the viewer shows.
     """
     export = standard_export()
+    export.meta['extension_version'] = '0.4.0'  # the first version that lets the designer choose
     niji = export.jobs[4]
     niji['personalization_codes'] = [ref('moodboard', 'board-left', 'mbcodeL')]
     niji['flags']['profile'] = ['mbcodeL']
