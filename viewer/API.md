@@ -441,7 +441,7 @@ Starts making the entry ready in the background and answers at once: `202` with 
 | Error | When |
 |---|---|
 | `400 bad_request` | No body, a body that is not a JSON object, or `confirm` missing or not exactly the id. |
-| `413 too_large` | A body over 4 KiB. |
+| `413 too_large` | A body over 4 KiB, or a `Content-Length` that is not a plain number of at most 12 ASCII digits. |
 | `403 delete_disabled` | `MJV_CATALOG_WRITE_URL` is not set. |
 | `403 not_owner` | The signed-in user is neither the owner recorded in `catalog.json` nor an administrator. An export without an owner can be deleted by administrators only. |
 | `404 unknown_catalog_entry` | `catalog.json` does not list the id (any more). |

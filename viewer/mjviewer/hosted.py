@@ -845,7 +845,8 @@ class HostedHandler(Handler):
         if not length or length == '0':
             return self._error(400, 'bad_request', 'body must be a JSON object such as %s' % example) \
                 if required else {}
-        if not length.isascii() or not length.isdigit() or int(length) > MAX_POST_BODY:
+        # Digits only, and few enough for int(): Python refuses to convert more than 4300 of them.
+        if not (length.isascii() and length.isdigit()) or len(length) > 12 or int(length) > MAX_POST_BODY:
             return self._error(413, 'too_large', 'request body is too large', close=True)
         try:
             value = json.loads(self.rfile.read(int(length)).decode('utf-8'))

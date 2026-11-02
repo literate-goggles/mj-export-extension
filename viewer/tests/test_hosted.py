@@ -32,6 +32,18 @@ from tests.hosted_harness import DOMAIN, SECRET, Client, Hosted, free_port, host
 VIEWER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def raw_post(hosted, path: str, session, length: str, body: bytes):
+    """A POST sent as raw bytes with this Content-Length header, whatever it says: (status, error code)."""
+    head = ('POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nCookie: %s=%s\r\nX-MJV-Token: %s\r\nOrigin: %s\r\n'
+            'Content-Type: application/json\r\nContent-Length: %s\r\n\r\n'
+            % (path, hosted.port, SESSION_COOKIE, session.cookie, session.token, hosted.origin, length))
+    with socket.create_connection(('127.0.0.1', hosted.port), timeout=10) as sock:
+        sock.sendall(head.encode('utf-8') + body)
+        response = http.client.HTTPResponse(sock)
+        response.begin()
+        return response.status, json.loads(response.read())['error']['code']
+
+
 def smuggle(port: int, host: str, path: str, cookie: str = ''):
     """Send a GET whose Content-Length body holds a second request, in one write.
     Returns (number of responses, whether the server closed the connection)."""
@@ -897,6 +909,11 @@ class DeleteTests(unittest.TestCase):
                 self.assertEqual((answered, answer['error']['code']), (status, code))
                 self.assert_unchanged()
         self.assertEqual(self.hosted.get(path, self.sessions['alice'])[0], 405)
+        body = json.dumps({'confirm': self.mine['id']}).encode()
+        for length in ('9' * 5000, '0' * 20 + str(len(body)), '-1', '+%d' % len(body), '1e3', '0x10', '\u0663'):
+            with self.subTest(length=length[:12]):  # never a number Python cannot convert: 413, not a traceback
+                self.assertEqual(raw_post(self.hosted, path, self.sessions['alice'], length, body), (413, 'too_large'))
+        self.assertNotIn('Traceback', self.hosted.log.getvalue())
         for catalog_id in ('0123456789abcdef', 'not-an-id', self.mine['id'] + '-1'):
             with self.subTest(catalog_id=catalog_id):
                 status, _, answer = self.hosted.post('/api/catalog/%s/delete' % catalog_id, self.sessions['carol'],
