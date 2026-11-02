@@ -5,12 +5,22 @@ import vm from 'node:vm';
 import { randomUUID } from 'node:crypto';
 
 const settle = async () => { for (let i = 0; i < 10; i++) await new Promise(resolve => setTimeout(resolve, 0)); };
+// Timers inside the controller that fire only when a test says so.
+function fakeClock() {
+  const timers = new Map();
+  let next = 0;
+  return {
+    setTimeout(fn, ms) { timers.set(++next, { fn, ms }); return next; },
+    clearTimeout(id) { timers.delete(id); },
+    fire(ms) { for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn(); } },
+  };
+}
 
 // Simulated Chrome, page bridge and panel DOM: these tests never access Midjourney.
-function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, stored = {}, chooser = null } = {}) {
+function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, stored = {}, chooser = null, clock = null } = {}) {
   const options = { mode: 'max', max: 20, since: '', images: true, testSubset: true };
   const state = structuredClone({ ...stored, ...(savedRun ? { run: savedRun } : {}) });
-  const ops = [], downloads = [], files = {}, statuses = [], lines = [];
+  const ops = [], downloads = [], files = {}, statuses = [], lines = [], created = [];
   const data = {
     identity: { user_id: 'self', username_v2: 'synthetic' },
     jobs: { data: [], cursor: null, checkpoint: null },
@@ -74,9 +84,9 @@ function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, sto
   };
   const context = vm.createContext({
     window, chrome, crypto: { randomUUID }, URL, structuredClone, queueMicrotask,
-    setTimeout, clearTimeout,
+    setTimeout: clock?.setTimeout ?? setTimeout, clearTimeout: clock?.clearTimeout ?? clearTimeout,
     location: { origin: 'https://www.midjourney.com', pathname: '/organize' },
-    document: { readyState: 'complete', body: element('body'), createElement: () => element(''), addEventListener() {} },
+    document: { readyState: 'complete', body: element('body'), createElement() { const el = element(''); created.push(el); return el; }, addEventListener() {} },
   });
   if (chooser) context.mjExportChooser = chooser(chrome);
   vm.runInContext(fs.readFileSync(new URL('../src/generated/core.js', import.meta.url), 'utf8'), context);
@@ -86,6 +96,7 @@ function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, sto
   vm.runInContext(fs.readFileSync(new URL('../src/content.js', import.meta.url), 'utf8'), context);
   return {
     state, options, ops, downloads, files, statuses, lines,
+    button: label => created.find(el => el.textContent === label),
     // Sends a message as the popup does and returns the listener's immediate answer.
     message(message) { let answer; messageHandler(message, {}, value => { answer = structuredClone(value); }); return answer; },
     send(command, customOptions = options) { return this.message({ type: 'command', command, options: customOptions }); },
@@ -361,6 +372,28 @@ test('while the chooser is open, other commands are refused and nothing is expor
   assert.equal(app.statuses.at(-1), 'Closed without saving. Nothing changed.');
   await app.run('export', allJobs);
   assert.equal(app.output().meta.status, 'complete');
+});
+
+test('Clear selection on the panel asks first, and only a second click forgets the choice', async () => {
+  const clock = fakeClock();
+  const app = harness({ stored: { selection }, clock });
+  await settle();
+  const clear = app.button('Clear selection');
+  clear.onclick();
+  await settle();
+  assert.equal(clear.textContent, 'Forget my choice?');
+  assert.deepEqual(app.state.selection, selection);
+  // Unanswered, it turns back after a few seconds, and the next click asks again.
+  clock.fire(5000);
+  assert.equal(clear.textContent, 'Clear selection');
+  clear.onclick();
+  await settle();
+  assert.deepEqual(app.state.selection, selection);
+  clear.onclick();
+  await settle();
+  assert.equal(clear.textContent, 'Clear selection');
+  assert.equal(app.state.selection, undefined);
+  assert.equal(app.statuses.at(-1), 'Selection cleared. New exports include everything in the scope again.');
 });
 
 test('clearing the selection goes back to exporting everything', async () => {

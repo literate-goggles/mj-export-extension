@@ -161,13 +161,15 @@
    command(m.command,m.options||opts()).catch(e=>status(e.message));respond({ok:true});
   }
  });
+ // Clear asks on the button itself: the first click turns it into "Forget my choice?" for a few seconds, and a second click clears.
+ function askFirst(button,label,action){let timer=null;const reset=()=>{clearTimeout(timer);timer=null;button.textContent=label;button.style.background='#e2e8f0';};return()=>{if(!timer){button.textContent='Forget my choice?';button.style.background='#fca5a5';timer=setTimeout(reset,5000);return;}reset();action();};}
  async function render(){
   if(!allowedPage()||!document.body)return;
   if(!panel){
    panel=document.createElement('details');panel.id='mj-export-panel';
    panel.style.cssText='position:fixed;bottom:12px;right:12px;z-index:2147483647;width:440px;max-height:80vh;overflow:auto;background:#111827;color:#f8fafc;padding:14px;border:1px solid #64748b;border-radius:12px;font:13px system-ui;box-shadow:0 8px 30px #0008';
    panel.innerHTML='<summary style="cursor:pointer;font-weight:700">MJ Export · Local export</summary><p>Your own work only. Keep this tab open.</p><label>Scope <select name="mode"><option value="max">Max N jobs</option><option value="since">Since date</option><option value="all" selected>All jobs</option></select></label> <label>N <input name="max" type="number" min="1" value="20" style="width:70px"></label><br><label>Since <input type="date" name="since"></label><p><label><input type="checkbox" name="images" checked> Include images</label><br><label><input type="checkbox" name="testSubset"> Small test: one board and one profile</label></p><p data-selection style="color:#cbd5e1"></p><div data-actions></div><pre data-status style="white-space:pre-wrap;max-height:280px;overflow:auto">Ready. All jobs and images selected; export starts only when you click.</pre><details><summary>API field names</summary><pre data-schema style="white-space:pre-wrap"></pre></details>';
-   for(const [name,label]of [['scan','Scan'],['choose','Choose what to export'],['clear','Clear selection'],['export','Export / resume'],['pause','Pause'],['new','New export'],['folder','Open export folder']]){const b=document.createElement('button');b.type='button';b.textContent=label;b.style.cssText='padding:7px;margin:3px;color:#111;background:#e2e8f0;border-radius:5px;border:0';b.onclick=()=>command(name,opts()).catch(e=>status(e.message));panel.querySelector('[data-actions]').append(b);}
+   for(const [name,label]of [['scan','Scan'],['choose','Choose what to export'],['clear','Clear selection'],['export','Export / resume'],['pause','Pause'],['new','New export'],['folder','Open export folder']]){const b=document.createElement('button');b.type='button';b.textContent=label;b.style.cssText='padding:7px;margin:3px;color:#111;background:#e2e8f0;border-radius:5px;border:0';const go=()=>command(name,opts()).catch(e=>status(e.message));b.onclick=name==='clear'?askFirst(b,label,go):go;panel.querySelector('[data-actions]').append(b);}
    panel.addEventListener('toggle',()=>{if(panel.open)showSelection().catch(()=>{});});
    document.body.append(panel);
    const stored=await chrome.storage.local.get(['run','selection']);const saved=stored.run;showSelection(stored);
