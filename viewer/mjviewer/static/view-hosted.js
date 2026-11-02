@@ -1,13 +1,18 @@
 // Hosted start page: the exports published for this deployment. Opening one
 // downloads and checks it on the server (with progress), then shows its overview.
+// Its owner, or an administrator, can delete it from here after confirming.
 
 import {h, icon, fill} from './dom.js';
-import {hrefs} from './router.js';
-import {loadExports, prepareExport, onPrepare, isAbort} from './api.js';
-import {arr, str, obj, isNum, fmtInt, fmtBytes} from './format.js';
+import {hrefs, parseHash} from './router.js';
+import {loadExports, prepareExport, onPrepare, isAbort, deleteExport, fromCatalogItem} from './api.js';
+import {arr, str, obj, isNum, fmtInt, fmtBytes, plural} from './format.js';
 import {
   pageHead, section, statusBadge, supportBadge, badge, emptyState, errorState, loadingState, callout, timeEl, announce,
 } from './ui.js';
+import {confirmAction, closeConfirm} from './confirm.js';
+
+// The name of an export deleted while one of its views was open in this tab: the start page says it is gone.
+let deletedNotice = '';
 
 /** Display name of a catalog item: its label, else its file name without .zip. */
 export function itemLabel(item) {
@@ -58,23 +63,33 @@ export function renderHostedHome(root, route, ctx) {
     title: 'Exports',
     sub: h('p', null, 'Midjourney exports published for your team. They are read in place and never modified.'),
   });
+  const doneSlot = h('div', {class: 'slot'});
   const noteSlot = h('div', {class: 'slot'});
   const listSlot = h('div', {class: 'slot'}, loadingState('Loading exports…'));
   const list = section('Published exports', {cls: 'section--first'});
-  list.body.append(noteSlot, listSlot);
+  list.body.append(doneSlot, noteSlot, listSlot);
   root.append(h('div', {class: 'page'}, head.el, list.el));
 
   const cards = new Map();
   // With a single published export, the first visit opens it and goes to its overview.
   let autoOpen = ctx.isFirst;
+  if (deletedNotice) {
+    showDeleted(deletedNotice);
+    deletedNotice = '';
+    autoOpen = false;
+  }
 
   const stop = onPrepare((item) => {
     const card = cards.get(obj(item).id);
     if (card) card.update(item);
   });
 
-  async function load() {
-    fill(listSlot, loadingState('Loading exports…'));
+  function showDeleted(name) {
+    fill(doneSlot, callout('ok', h('p', null, `Deleted ${name}.`)));
+  }
+
+  async function load({quiet = false} = {}) {
+    if (!quiet) fill(listSlot, loadingState('Loading exports…'));
     try {
       const data = await loadExports({force: true, signal: ctx.signal});
       if (!ctx.isActive()) return;
@@ -109,7 +124,7 @@ export function renderHostedHome(root, route, ctx) {
       return;
     }
     fill(listSlot, h('ul', {class: 'xgrid', 'aria-label': 'Published exports'}, items.map((item) => {
-      const card = catalogCard(item, open);
+      const card = catalogCard(item, open, remove);
       cards.set(item.id, card);
       return h('li', null, card.el);
     })));
@@ -140,15 +155,73 @@ export function renderHostedHome(root, route, ctx) {
     }
   }
 
+  async function remove(item) {
+    const name = itemLabel(item);
+    const done = await confirmAction({
+      title: 'Delete this export?',
+      body: deleteSummary(item),
+      confirmLabel: 'Delete export',
+      busyLabel: 'Deleting…',
+      failure: 'Could not delete',
+      action: () => deleteExport(item.id),
+      returnFocus: () => {
+        const card = cards.get(item.id);
+        return card ? card.el.querySelector('.xcard__delete') : null;
+      },
+    });
+    if (!done) return;
+    announce(`Deleted ${name}`);
+    if (fromCatalogItem(parseHash(location.hash).exportId, item.id)) {
+      deletedNotice = name;  // one of its views is open in this tab: back to the start page, which says so
+      location.hash = hrefs.home();
+      return;
+    }
+    if (!ctx.isActive()) return;
+    const card = cards.get(item.id);
+    const row = card ? card.el.closest('li') : null;
+    if (row) row.remove();
+    cards.delete(item.id);
+    showDeleted(name);
+    head.heading.focus({preventScroll: true});
+    load({quiet: true});
+  }
+
   load();
-  return stop;
+  return () => {
+    stop();
+    closeConfirm();
+  };
+}
+
+/** What the delete dialog says: which export (name, file, contents, owner), then what deleting does. */
+function deleteSummary(item) {
+  const it = obj(item);
+  const summary = obj(it.summary);
+  const exports = arr(it.exports);
+  const counts = it.state === 'ready' && exports.length === 1 ? obj(obj(exports[0]).counts) : null;
+  const contents = [
+    ['job', counts ? counts.jobs : summary.jobs],
+    ['image', counts ? counts.images_present : summary.images],
+    ['moodboard', counts ? counts.moodboards : summary.moodboards],
+    ['profile', counts ? counts.profiles : summary.profiles],
+  ].filter(([, n]) => isNum(n)).map(([one, n]) => plural(n, one));
+  const fact = (label, value) => [h('dt', null, label), h('dd', null, value)];
+  return [
+    h('dl', {class: 'confirm__facts'},
+      fact('Export', itemLabel(it)),
+      fact('File', `${str(it.name) || '—'}${isNum(it.size) ? ` (${fmtBytes(it.size)})` : ''}`),
+      fact('Contents', contents.length ? contents.join(' · ') : 'Not recorded'),
+      fact('Owner', str(it.owner) || 'No owner recorded')),
+    h('p', null, 'It disappears from this viewer for everyone at once. You cannot undo this here.'),
+    h('p', null, 'The storage keeps a recoverable copy for 7 days; after that it is gone for good.'),
+  ];
 }
 
 function countItem(label, value) {
   return h('div', {class: 'xcard__count'}, h('dt', null, label), h('dd', null, value));
 }
 
-function catalogCard(initial, open) {
+function catalogCard(initial, open, remove) {
   const el = h('article', {class: 'xcard xcard--catalog'});
   let current = obj(initial);
 
@@ -182,13 +255,22 @@ function catalogCard(initial, open) {
         it.published_at
           ? h('span', null, 'Published ', timeEl(it.published_at, {dateOnly: true}), it.published_by ? ` by ${str(it.published_by)}` : '')
           : null),
+      h('p', {class: 'xcard__owner'}, icon('user', {size: 14}),
+        str(it.owner)
+          ? [h('span', null, 'Owner'), h('span', {class: 'xcard__owner-email', title: str(it.owner)}, str(it.owner))]
+          : h('span', null, 'No owner recorded')),
       h('dl', {class: 'xcard__counts'},
         countItem('Jobs', fmtInt(jobs)),
         countItem('Images', images),
         countItem('Boards', fmtInt(single ? counts.moodboards : summary.moodboards)),
         countItem('Profiles', fmtInt(single ? counts.profiles : summary.profiles))),
       stateRow(it, single, exports),
-      failedRoots(it));
+      failedRoots(it),
+      it.can_delete === true
+        ? h('div', {class: 'xcard__manage'},
+          h('button', {type: 'button', class: 'btn btn--sm btn--ghost xcard__delete', 'aria-label': `Delete ${title}`,
+            onclick: () => remove(current)}, 'Delete…'))
+        : null);
   }
 
   /** Export roots of the ZIP that could not be read while the others opened. */

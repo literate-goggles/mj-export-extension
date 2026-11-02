@@ -9,6 +9,10 @@ It prints the address to open. Signing in goes through tests/fake_google.py, whi
 approves the --email account at once (--chooser shows an account page first, like
 Google's). Everything listens on 127.0.0.1 only, and nothing is sent anywhere else.
 Ctrl+C stops it and deletes its temporary folder; a --store folder is only read.
+
+In the temporary container the --email account owns the exports it publishes (of
+the two invented ones, the first; the second has no owner) and can delete them;
+with --store deleting is off.
 """
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ from tests.fake_blob import FakeBlob
 from tests.fake_google import FakeGoogle
 
 
-def publish(blob: FakeBlob, path: str) -> dict:
+def publish(blob: FakeBlob, path: str, owner: str) -> dict:
     """Copy one ZIP into the fake container (streamed, not read into memory) and return its catalog entry."""
     digest = hashlib.sha256()
     with open(path, 'rb') as handle:
@@ -39,7 +43,7 @@ def publish(blob: FakeBlob, path: str) -> dict:
     os.makedirs(os.path.dirname(target), exist_ok=True)
     shutil.copyfile(path, target)
     return {'id': sha[:16], 'blob': 'exports/%s.zip' % sha, 'name': os.path.basename(path), 'sha256': sha,
-            'size': os.path.getsize(target), 'published_by': 'demo'}
+            'size': os.path.getsize(target), 'published_by': 'demo', 'owner': owner}
 
 
 def main(argv=None) -> int:
@@ -60,15 +64,17 @@ def main(argv=None) -> int:
         google.chooser = args.chooser
         if not args.store:
             if args.zips:
-                entries = [publish(blob, path) for path in args.zips]
+                entries = [publish(blob, path, args.email) for path in args.zips]
             else:
                 entries = [blob.put_export(fx.export_zip_bytes(fx.standard_export()), name='mj_export_demo_one.zip',
-                                           label='Invented export'),
+                                           label='Invented export', owner=args.email),
                            blob.put_export(fx.export_zip_bytes(fx.gallery_export(150)), name='mj_export_demo_two.zip')]
             blob.write_catalog(entries)
         env = {'MJV_PUBLIC_URL': 'http://127.0.0.1:%d' % args.port, 'MJV_AUTH_SECRET': secrets.token_urlsafe(32),
                'MJV_ALLOWED_DOMAIN': domain, 'MJV_CATALOG_URL': blob.url, 'MJV_CACHE_DIR': os.path.join(work, 'cache'),
                'MJV_CATALOG_TTL_S': '5'}
+        if not args.store:
+            env['MJV_CATALOG_WRITE_URL'] = blob.write_url
         env.update(google.env())
         app = HostedApp(load_config(env), log=sys.stderr)
         try:

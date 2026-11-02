@@ -60,6 +60,7 @@ export const paths = {
   likes: (x) => `/api/exports/${enc(x)}/likes`,
   catalogItem: (c) => `/api/catalog/${enc(c)}`,
   catalogOpen: (c) => `/api/catalog/${enc(c)}/open`,
+  catalogDelete: (c) => `/api/catalog/${enc(c)}/delete`,
 };
 
 function errorFrom(status, body) {
@@ -276,6 +277,23 @@ export function prepareExport(item, {signal, retry = false} = {}) {
   return untilAborted(run, signal);
 }
 
+/** True when an export id (the catalog id, or <catalog id>-<n> per root) belongs to this catalog entry. */
+export function fromCatalogItem(exportId, catalogId) {
+  const x = String(exportId || '');
+  return Boolean(catalogId) && (x === catalogId || x.startsWith(`${catalogId}-`));
+}
+
+/**
+ * Delete a published export (its owner or an administrator only). The id is
+ * sent again as confirmation. Never repeated on its own, and what this page
+ * knew about the export is forgotten once it is gone.
+ */
+export async function deleteExport(id) {
+  const result = await postJSON(paths.catalogDelete(id), {confirm: id});
+  forgetCatalogItem(id);
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // Small in-memory caches. Exports are read-only, so summaries and overviews
 // stay valid for the page session; opening or uploading refreshes them.
@@ -334,6 +352,18 @@ export function knownSummary(id) {
   const summary = item.summary && typeof item.summary === 'object' ? item.summary : {};
   return {id, label: item.label || String(item.name || '').replace(/\.zip$/i, '') || id,
     counts: {jobs: summary.jobs, moodboards: summary.moodboards, profiles: summary.profiles}};
+}
+
+/** Drop a deleted catalog entry and the exports opened from it from the caches. */
+function forgetCatalogItem(id) {
+  for (const key of [...overviews.keys()]) if (fromCatalogItem(key, id)) overviews.delete(key);
+  if (!exportsState) return;
+  exportsState.exports = exportsState.exports.filter((e) => !fromCatalogItem(e.id, id));
+  const catalog = exportsState.catalog;
+  if (catalog && Array.isArray(catalog.items)) {
+    exportsState.catalog = {...catalog, items: catalog.items.filter((i) => !(i && i.id === id))};
+  }
+  notify();
 }
 
 /** Merge summaries returned by open/upload/overview into the cache. */

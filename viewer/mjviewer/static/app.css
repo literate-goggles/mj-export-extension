@@ -4022,3 +4022,117 @@ a.stat:hover .stat__label {
     border: 1px solid CanvasText;
   }
 }
+
+/* -------------------------------------------- hosted: owners and deleting */
+
+.xcard__owner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+
+.xcard__owner .icon {
+  flex: none;
+}
+
+.xcard__owner-email {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2);
+}
+
+.xcard__manage {
+  position: relative; /* above the link that covers a ready card */
+  z-index: 1;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.xcard__delete:hover {
+  color: var(--err);
+}
+
+.btn--danger {
+  background: var(--err);
+  border-color: var(--err);
+  color: var(--surface);
+}
+
+.btn--danger:hover {
+  background: var(--err);
+  border-color: var(--err);
+  filter: brightness(0.92);
+}
+
+.confirm {
+  width: min(calc(100% - 32px), 480px);
+  max-height: calc(100% - 32px);
+  padding: 22px 22px 18px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow-2);
+}
+
+.confirm::backdrop {
+  background: var(--overlay);
+}
+
+.confirm__title {
+  font-size: var(--fs-lg);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.confirm__body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+  color: var(--ink-2);
+}
+
+.confirm__facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.confirm__facts dt {
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+}
+
+.confirm__facts dd {
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.confirm__error {
+  margin-top: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--err-line);
+  border-radius: var(--radius);
+  background: var(--err-soft);
+  color: var(--err);
+  overflow-wrap: anywhere;
+}
+
+.confirm__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
