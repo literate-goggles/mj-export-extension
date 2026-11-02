@@ -35,6 +35,7 @@ import email.utils
 import hashlib
 import http.client
 import json
+import math
 import os
 import random
 import re
@@ -58,6 +59,7 @@ from .sources import CHUNK_SIZE, SourceError
 
 CATALOG_NAME = 'catalog.json'
 MAX_CATALOG_BYTES = 16 * 1024 * 1024
+MAX_JSON_DEPTH = 64  # catalog.json nested deeper than this is refused: it could be read but not written back
 MAX_ENTRIES = 10_000
 MAX_EXPORT_BYTES = 256 * 1024 ** 3
 MIN_ZIP_BYTES = 22  # an empty ZIP is just its end record
@@ -382,12 +384,40 @@ def _reject_constant(name: str):
     raise ValueError('%s is not valid JSON' % name)
 
 
+class _TooLarge(ValueError):
+    """A number that JSON can hold but that does not fit a float (1e400): it could not be written back."""
+
+
+def _finite(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise _TooLarge(text)
+    return value
+
+
+def _nested_within(value, limit: int) -> bool:
+    """Whether no object or list in value is nested more than limit levels deep (the outermost is level 1)."""
+    stack = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if depth > limit:
+            return False
+        children = item.values() if isinstance(item, dict) else item
+        stack.extend((child, depth + 1) for child in children if isinstance(child, (dict, list)))
+    return True
+
+
 def _load(raw: bytes) -> dict:
-    """catalog.json as its whole JSON object (every field kept), checked to be a version 1 catalog."""
+    """catalog.json as its whole JSON object (every field kept), checked to be a version 1 catalog. It must also
+    be one that dump_catalog can write back: no number too large for a float, no nesting past MAX_JSON_DEPTH."""
     try:
-        data = json.loads(raw.decode('utf-8'), parse_constant=_reject_constant)
+        data = json.loads(raw.decode('utf-8'), parse_constant=_reject_constant, parse_float=_finite)
+    except _TooLarge:
+        raise CatalogError('bad_catalog', 'catalog.json holds a number too large to be written back') from None
     except (UnicodeDecodeError, ValueError, RecursionError):
         raise CatalogError('bad_catalog', 'catalog.json is not valid JSON') from None
+    if isinstance(data, (dict, list)) and not _nested_within(data, MAX_JSON_DEPTH):
+        raise CatalogError('bad_catalog', 'catalog.json is nested more than %d levels deep' % MAX_JSON_DEPTH)
     version = data.get('version') if isinstance(data, dict) else None
     if type(version) is not int or version != 1:
         raise CatalogError('bad_catalog', 'catalog.json is not a version 1 catalog')
@@ -397,11 +427,24 @@ def _load(raw: bytes) -> dict:
 
 
 def dump_catalog(data: dict) -> bytes:
-    """catalog.json as indented UTF-8 JSON with a final newline."""
+    """catalog.json as indented UTF-8 JSON with a final newline. ValueError for a number JSON cannot hold."""
     try:
-        return (json.dumps(data, indent=1, ensure_ascii=False) + '\n').encode('utf-8')
+        return (json.dumps(data, indent=1, ensure_ascii=False, allow_nan=False) + '\n').encode('utf-8')
     except UnicodeEncodeError:  # a lone surrogate somewhere in the catalog: escape everything
-        return (json.dumps(data, indent=1, ensure_ascii=True) + '\n').encode('ascii')
+        return (json.dumps(data, indent=1, ensure_ascii=True, allow_nan=False) + '\n').encode('ascii')
+
+
+def _encode(data: dict) -> bytes:
+    """data as the catalog.json to write, read back first as every instance will read it (this one included).
+    CatalogError storage_error when it cannot be written or read back: then nothing is written."""
+    try:
+        body = dump_catalog(data)
+        parse_catalog(body)
+    except Exception as exc:  # whatever the reason, a catalog no instance could read is never written
+        reason = exc.message if isinstance(exc, CatalogError) else type(exc).__name__
+        raise CatalogError('storage_error', 'catalog.json could not be written back (%s); nothing was deleted'
+                           % reason) from None
+    return body
 
 
 def parse_catalog(raw: bytes, deleted: Optional[List[dict]] = None) -> Tuple[List[dict], List[dict], Optional[str]]:
@@ -544,6 +587,11 @@ class Catalog:
         with self._lock:
             self._version += 1
             self._install(entries, skipped, updated, deleted, etag)
+
+    def expire(self) -> None:
+        """Read catalog.json again at the next use, whatever MJV_CATALOG_TTL_S says."""
+        with self._lock:
+            self._checked = None
 
     def snapshot(self) -> Tuple[List[dict], List[dict]]:
         """The entries and tombstones in use, without refreshing."""
@@ -1217,7 +1265,7 @@ class Published:
             data['deleted'] = stones + [{'id': catalog_id, 'sha256': sha, 'size': entry['size'], 'owner': owner,
                                          'deleted_at': now, 'deleted_by': user}]
             data['updated_at'] = now
-            body = dump_catalog(data)
+            body = _encode(data)
             try:
                 tag = self.store.put(CATALOG_NAME, body, 'catalog.json', if_match=etag)
             except CatalogError as exc:
@@ -1226,13 +1274,28 @@ class Published:
                 if attempt < WRITE_ATTEMPTS:
                     time.sleep(random.uniform(0.05, 0.25) * attempt)
                 continue
-            self.catalog.adopt(body, tag)
-            self._log('deleted %s by %s' % (catalog_id, user))
-            self._delete_blob(catalog_id, sha)
-            self._purge({catalog_id: sha}, wait_s=CLOSE_WAIT_S, quiet=True)
+            self._finish(catalog_id, sha, user, body, tag)
             return entry
         raise CatalogError('catalog_busy', 'the list of exports kept changing while it was being updated; '
                                            'nothing was deleted, try again')
+
+    def _finish(self, catalog_id: str, sha: str, user: str, body: bytes, tag: Optional[str]) -> None:
+        """What follows a catalog.json that no longer lists the export: serve it here at once, delete the ZIP from
+        storage, close the export here. The export is deleted by then, so a step that fails is logged, never
+        answered, and the steps after it still run."""
+        self._log('deleted %s by %s' % (catalog_id, user))
+        steps = (('serving the new catalog.json', lambda: self.catalog.adopt(body, tag)),
+                 ('deleting its ZIP from storage', lambda: self._delete_blob(catalog_id, sha)),
+                 ('closing it on this instance', lambda: self._purge({catalog_id: sha}, wait_s=CLOSE_WAIT_S,
+                                                                     quiet=True)))
+        for n, (what, step) in enumerate(steps):
+            try:
+                step()
+            except Exception as exc:
+                self._log('catalog: after deleting %s, %s failed (%s)' % (catalog_id, what, type(exc).__name__))
+                self._log(self.store.scrub(traceback.format_exc(limit=5)).rstrip())
+                if n == 0:
+                    self.catalog.expire()  # the copy in use still lists it: read the new one at the next request
 
     def _fresh_catalog(self) -> Tuple[dict, str]:
         """catalog.json as storage holds it right now (never the copy in use), with its ETag."""

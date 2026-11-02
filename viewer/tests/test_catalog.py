@@ -55,6 +55,14 @@ def catalog_bytes(entries, **top) -> bytes:
     return json.dumps(data).encode()
 
 
+def nested(levels: int):
+    """A text inside that many lists."""
+    value = 'x'
+    for _ in range(levels):
+        value = [value]
+    return value
+
+
 class ParseCatalogTests(unittest.TestCase):
     def test_valid_entry_is_normalized(self):
         entries, skipped, updated = parse_catalog(catalog_bytes([good_entry(label='Team export', unknown='kept out')]))
@@ -120,6 +128,24 @@ class ParseCatalogTests(unittest.TestCase):
                 with self.assertRaises(CatalogError) as caught:
                     parse_catalog(raw)
                 self.assertEqual(caught.exception.code, 'bad_catalog')
+
+    def test_only_catalogs_that_can_be_written_back_are_read(self):
+        """A number too large for a float would be written back as Infinity, and nesting past the limit cannot be
+        written with indentation: such a catalog is refused like invalid JSON, wherever the value is."""
+        huge = catalog_bytes([good_entry()], x_scale='HUGE')
+        for raw, says in ((huge.replace(b'"HUGE"', b'1e400'), 'holds a number too large to be written back'),
+                          (huge.replace(b'"HUGE"', b'-2.5E999'), 'holds a number too large to be written back'),
+                          (catalog_bytes([good_entry()], x_deep=nested(64)), 'is nested more than 64 levels deep'),
+                          (catalog_bytes([good_entry(x_deep=nested(62))]), 'is nested more than 64 levels deep')):
+            with self.subTest(says=says, size=len(raw)):
+                with self.assertRaises(CatalogError) as caught:
+                    parse_catalog(raw)
+                self.assertEqual((caught.exception.code, caught.exception.message),
+                                 ('bad_catalog', 'catalog.json %s' % says))
+        for raw in (huge.replace(b'"HUGE"', b'1e308'), catalog_bytes([good_entry()], x_deep=nested(63)),
+                    catalog_bytes([good_entry(x_deep=nested(61))])):  # up to the limit: read, and written back alike
+            with self.subTest(size=len(raw)):
+                self.assertEqual(json.loads(catalog_module.dump_catalog(catalog_module._load(raw))), json.loads(raw))
 
     def test_entry_limit(self):
         old = catalog_module.MAX_ENTRIES
@@ -1177,19 +1203,68 @@ class DeleteFlowTests(FlowTestCase):
                 self.assert_no_secret(answer)
                 self.assertEqual(self.stored(), before)
                 self.assertIsNotNone(self.blob.file(mine['blob']))
+        huge = json.dumps({'version': 1, 'exports': [mine], 'x_publisher': {'scale': 'HUGE'}}).encode()
         for raw, text in ((b'{not json', 'not valid JSON'),
                           (json.dumps({'version': 1, 'exports': [mine], 'deleted': {'not': 'a list'}}).encode(),
-                           'deleted field that is not a list')):
+                           'deleted field that is not a list'),
+                          (huge.replace(b'"HUGE"', b'1e400'), 'number too large to be written back'),
+                          (json.dumps({'version': 1, 'exports': [mine], 'x_deep': nested(80)}).encode(),
+                           'nested more than 64 levels deep')):
             with self.subTest(text=text):
                 self.blob.put('catalog.json', raw)
                 status, answer = self.delete(hosted, session, mine)
                 self.assertEqual((status, answer['error']['code']), (502, 'storage_error'))
                 self.assertIn(text, answer['error']['message'])
+                self.assertIn('nothing was deleted', answer['error']['message'])
                 with open(self.blob.file('catalog.json'), 'rb') as handle:
                     self.assertEqual(handle.read(), raw)
         self.assertEqual(self.blob.count(REDIRECT_TARGET), 0)
         self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 0)
         self.assert_no_secret(hosted.log.getvalue())
+
+    def test_a_catalog_that_would_not_read_back_is_never_written(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        for patch, says in ((mock.patch.object(catalog_module, 'dump_catalog', side_effect=ValueError('Out of range')),
+                             '(ValueError)'),
+                            (mock.patch.object(catalog_module, 'dump_catalog',
+                                               return_value=b'{"version": 1, "exports": [], "x": NaN}\n'),
+                             '(catalog.json is not valid JSON)')):
+            with self.subTest(says=says), patch:
+                status, answer = self.delete(hosted, session, mine)
+                self.assertEqual((status, answer['error']['code']), (502, 'storage_error'))
+                self.assertEqual(answer['error']['message'],
+                                 'catalog.json could not be written back %s; nothing was deleted' % says)
+        self.assertEqual(self.blob.count('catalog.json', method='PUT'), 0)
+        self.assertEqual([e['id'] for e in self.stored()['exports']], [mine['id']])
+        self.assertIsNotNone(self.blob.file(mine['blob']))
+
+    def test_a_step_after_the_write_that_fails_is_logged_and_the_deletion_stands(self):
+        """Once catalog.json no longer lists the export it is deleted: serving the new catalog here, deleting the
+        ZIP from storage and closing the export here each only log a failure, and the next steps still run."""
+        for n, (where, step) in enumerate((('catalog', 'adopt'), ('published', '_delete_blob'),
+                                           ('published', '_purge'))):
+            with self.subTest(step=step):
+                mine = self.publish(fx.gallery_export(4 + n), name='%d.zip' % n)
+                self.blob.write_catalog([mine])
+                cache = 'cache-%d' % n
+                hosted, session = self.start(cache=cache, MJV_CATALOG_TTL_S='600')
+                self.view(hosted, session, mine)
+                with mock.patch.object(getattr(hosted.app, where), step, side_effect=RuntimeError('invented')):
+                    self.assertEqual(self.delete(hosted, session, mine), (200, {'deleted': mine['id']}))
+                log = hosted.log.getvalue()
+                self.assertIn('deleted %s by alice@example.com' % mine['id'], log)
+                self.assertEqual(log.count('catalog: after deleting %s, ' % mine['id']), 1)
+                self.assertIn('(RuntimeError)', log)
+                self.assertEqual(self.stored()['exports'], [])
+                listing = json.loads(hosted.get('/api/exports', session)[2])  # the copy that failed is read again
+                self.assertEqual(listing['catalog']['items'], [])
+                hosted.app.maintain()  # what failed, the next maintenance pass does
+                self.assertIsNone(self.blob.file(mine['blob']))
+                self.assertIsNone(hosted.app.registry.get(mine['id']))
+                self.assertEqual(self.zips(cache), [])
+                self.assert_no_secret(log)
 
     def test_the_deleting_instance_closes_the_export_and_deletes_its_files_at_once(self):
         mine, keep = self.publish(fx.gallery_export(12), name='mine.zip'), self.publish(name='keep.zip')
