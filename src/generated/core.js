@@ -135,6 +135,11 @@ function scopeLabel(scope) {
  const base = scope.mode === 'max' ? `Max ${scope.max} jobs` : scope.mode === 'since' ? `Jobs since ${scope.since}` : 'All jobs';
  return scope.testSubset ? `${base} · small test` : base;
 }
+// Choose shows a scan of the same account and scope only while it is under ten minutes old; after that it scans again.
+function reusableScan(scan, userId, options, now = Date.now()) {
+ const age = now - Date.parse(scan?.scanned_at);
+ return !!scan && scan.user_id === userId && sameScope(scan.scope, options) && age >= 0 && age < 10 * 60 * 1000;
+}
 // What the chooser needs, kept by Scan: no images, and every own board even with Small test on.
 function compactScan(identity, options, jobs, moodboards, scannedAt = new Date().toISOString()) {
  const boards = normalizeBoards(moodboards, jobs);

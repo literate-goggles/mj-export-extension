@@ -82,7 +82,9 @@ input[type=checkbox]:disabled{cursor:default}
   el.append(...children.flat(Infinity).filter(child=>child!==undefined&&child!==null&&child!==false));
   return el;
  }
- const when=(value,time)=>{if(!value)return '';const d=new Date(value);return Number.isNaN(d.getTime())?'':d.toLocaleString(undefined,time?{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}:{day:'numeric',month:'short',year:'numeric'});};
+ const when=value=>{if(!value)return '';const d=new Date(value);return Number.isNaN(d.getTime())?'':d.toLocaleString(undefined,{day:'numeric',month:'short',year:'numeric'});};
+ // When the list was read: the time today, with the date on another day.
+ const asOf=value=>{const d=new Date(value);if(Number.isNaN(d.getTime()))return 'an unknown time';const time=d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});return d.toDateString()===new Date().toDateString()?time:`${when(value)}, ${time}`;};
  const shorten=text=>text.length>140?`${text.slice(0,139).trimEnd()}…`:text;
  const placeholder=text=>h('span',{class:'ph'},text);
  // The 384 px WebP name is the site's own thumbnail as far as observed; the originals are fallbacks.
@@ -136,7 +138,7 @@ input[type=checkbox]:disabled{cursor:default}
   const boardRows=rows.filter(row=>row.group.board!==null);
   const backdrop=h('div',{class:'backdrop'},h('div',{class:'dialog',role:'dialog','aria-modal':'true','aria-labelledby':'mjx-title'},
    h('header',{class:'top'},
-    h('div',{class:'heading'},h('h2',{id:'mjx-title'},'Choose what to export'),h('p',{class:'muted'},`${scopeLabel(scan.scope)} · scanned ${when(scan.scanned_at,true)}. Work made after this scan is not exported until you choose again.`)),
+    h('div',{class:'heading'},h('h2',{id:'mjx-title'},'Choose what to export'),h('p',{class:'muted'},`Your work as of ${asOf(scan.scanned_at)} · ${scopeLabel(scan.scope)}. Work you make later is not exported until you choose again.`)),
     h('div',{class:'bar'},
      h('button',{type:'button','aria-label':'Select all moodboards and generations',onclick:()=>change(()=>setEverything(choice,true))},'Select all'),
      h('button',{type:'button','aria-label':'Select no moodboards and no generations',onclick:()=>change(()=>setEverything(choice,false))},'Select none'))),

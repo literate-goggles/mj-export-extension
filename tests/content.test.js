@@ -307,6 +307,13 @@ test('choosing scans first when there is no scan for the account and scope, and 
   await again.run('choose', allJobs);
   assert.deepEqual(again.ops, ['identity']);
   assert.equal(again.statuses.at(-1), 'Saved. Exporting 3 of 3 moodboards · 5 of 6 generations. Export uses this choice.');
+  // A scan of this account and scope that is 10 minutes old is read again.
+  const stale = { ...app.state.scan_data, scanned_at: new Date(Date.now() - 10 * 60 * 1000).toISOString() };
+  const old = harness({ feed: boardFeed, stored: { scan_data: stale }, chooser });
+  await old.run('choose', allJobs);
+  assert.deepEqual(old.ops, ['identity', 'jobs', 'moodboards', 'profiles']);
+  assert(old.statuses.includes('Your last scan is more than 10 minutes old, so it scans again to show your latest work. Scanning reads your job list and downloads no images.'));
+  assert(Date.parse(old.state.scan_data.scanned_at) > Date.parse(stale.scanned_at));
   // A scan of another scope does not count.
   const otherScope = harness({ feed: boardFeed, stored: { scan_data: app.state.scan_data }, chooser });
   await otherScope.run('choose', { ...allJobs, testSubset: true });

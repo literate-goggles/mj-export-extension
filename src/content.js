@@ -51,8 +51,8 @@
   try{return await task();}finally{active=false;run=savedRun;await worker({type:'release'});}
  }
  async function scanScope(options,identity){
-  const data=await getData(options,identity);const all=applySelection(data,null);const available={moodboards:all.boards.length,profiles:all.profiles.length};if(options.testSubset){all.boards=all.boards.slice(0,1);all.profiles=all.profiles.slice(0,1);}const images=data.jobs.reduce((n,j)=>n+j.image_urls.length,0)+all.boards.reduce((n,b)=>n+b.images.length,0);const summary={scope:options,available,jobs:data.jobs.length,moodboards:all.boards.length,profiles:all.profiles.length,feed_exhausted:data.exhausted,estimated_bytes:images*1024*1024,estimate_basis:'Rough estimate: 1 MiB per image, not measured; no images fetched'};
-  const scanData=compactScan(data.identity,options,data.jobs,data.moodboards);await chrome.storage.local.set({scan:summary,scan_data:scanData});status(JSON.stringify(summary,null,2));return scanData;
+  const started=new Date().toISOString();const data=await getData(options,identity);const all=applySelection(data,null);const available={moodboards:all.boards.length,profiles:all.profiles.length};if(options.testSubset){all.boards=all.boards.slice(0,1);all.profiles=all.profiles.slice(0,1);}const images=data.jobs.reduce((n,j)=>n+j.image_urls.length,0)+all.boards.reduce((n,b)=>n+b.images.length,0);const summary={scope:options,available,jobs:data.jobs.length,moodboards:all.boards.length,profiles:all.profiles.length,feed_exhausted:data.exhausted,estimated_bytes:images*1024*1024,estimate_basis:'Rough estimate: 1 MiB per image, not measured; no images fetched'};
+  const scanData=compactScan(data.identity,options,data.jobs,data.moodboards,started);await chrome.storage.local.set({scan:summary,scan_data:scanData});status(JSON.stringify(summary,null,2));return scanData;
  }
  const scan=options=>exclusive(options,()=>scanScope(options));
  async function showSelection(stored){if(!panel)return;const {selection,run:saved}=stored||await chrome.storage.local.get(['selection','run']);panel.querySelector('[data-selection]').textContent=selectionLine(selection,saved);}
@@ -62,7 +62,7 @@
   // The open window keeps the run lease, so nothing can scan or export until it is saved or cancelled.
   const selection=await exclusive(options,async()=>{
    const identity=await ownIdentity();const {scan_data:scanned}=await chrome.storage.local.get('scan_data');
-   if(scanned?.user_id!==identity.user_id||!sameScope(scanned.scope,options)){status('There is no scan of this scope for this account yet, so it scans first. Scanning reads your job list and downloads no images.');await scanScope(options,identity);}
+   if(!reusableScan(scanned,identity.user_id,options)){status((scanned?.user_id===identity.user_id&&sameScope(scanned.scope,options)?'Your last scan is more than 10 minutes old, so it scans again to show your latest work.':'There is no scan of this scope for this account yet, so it scans first.')+' Scanning reads your job list and downloads no images.');await scanScope(options,identity);}
    status('Choose what to export in the window over this page.');
    choosing=true;try{return await chooser.open();}finally{choosing=false;}
   });

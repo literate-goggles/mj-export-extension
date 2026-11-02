@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {normalizeJob, normalizeBoards, normalizeProfiles, parentGaps} from '../lib/normalize.js';
 import {
   applySelection, chooserGroups, choiceCounts, compactScan, groupState, initialChoice, makeSelection, resumeProblem,
-  sameScope, scopeLabel, selectionLine, selectionProblem, setEverything, setGroup, setJobs, summaryText, toggleGroup,
+  reusableScan, sameScope, scopeLabel, selectionLine, selectionProblem, setEverything, setGroup, setJobs, summaryText, toggleGroup,
 } from '../lib/selection.js';
 
 // Synthetic data only: made-up ids, prompts, codes and URLs.
@@ -153,6 +153,21 @@ test('scan data groups jobs by every own board they reference', () => {
   ]);
   // Small test still shows every board: it trims the export, not the choice.
   assert.equal(compactScan(identity, {...options, testSubset: true}, data.jobs, data.moodboards).boards.length, 4);
+});
+
+test('Choose reuses a scan of the same account and scope only while it is under ten minutes old', () => {
+  const data = feed();
+  const scan = compactScan(identity, options, data.jobs, data.moodboards, '2026-02-01T10:00:00.000Z');
+  const at = time => Date.parse(`2026-02-01T${time}.000Z`);
+  assert.equal(reusableScan(scan, 'self', options, at('10:00:00')), true);
+  assert.equal(reusableScan(scan, 'self', options, at('10:09:59')), true);
+  assert.equal(reusableScan(scan, 'self', options, at('10:10:00')), false);
+  // A scan time in the future, or none, is not trusted.
+  assert.equal(reusableScan(scan, 'self', options, at('09:59:59')), false);
+  assert.equal(reusableScan({...scan, scanned_at: undefined}, 'self', options, at('10:00:01')), false);
+  assert.equal(reusableScan(scan, 'someone-else', options, at('10:00:01')), false);
+  assert.equal(reusableScan(scan, 'self', {...options, mode: 'max'}, at('10:00:01')), false);
+  assert.equal(reusableScan(undefined, 'self', options, at('10:00:01')), false);
 });
 
 test('whole-board, single-generation and select-all changes', () => {
