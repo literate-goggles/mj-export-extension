@@ -402,10 +402,13 @@ write the same way.
 ### Health and start probe
 
 - `GET /healthz` answers without sign-in and for any `Host`:
-  `{"ok": true, "mode": "hosted", "commit": "...", "catalog": {"exports": 2, "ok": true, "age_s": 12.5, "delete_enabled": false}, "cache": {"ok": true}}`.
+  `{"ok": true, "mode": "hosted", "commit": "...", "catalog": {"exports": 2, "ok": true, "age_s": 12.5, "delete_enabled": false, "zip_deletes_pending": 0}, "cache": {"ok": true}}`.
   It names no export, user, path or secret. `catalog.ok` is false while the
   catalog cannot be read; `age_s` is the age of the copy in use;
-  `delete_enabled` says whether `MJV_CATALOG_WRITE_URL` is set. `cache.ok` is
+  `delete_enabled` says whether `MJV_CATALOG_WRITE_URL` is set;
+  `zip_deletes_pending` counts the ZIPs of deleted exports that the instance
+  still has to delete from storage (it keeps trying every minute; alert when
+  it stays above 0). `cache.ok` is
   false while the cache folder does not accept writes (nothing can be opened
   then); the answer stays `200`, so check it after a deploy.
 - `GET /robots933456.txt` answers `200` with plain text. Some platforms (App

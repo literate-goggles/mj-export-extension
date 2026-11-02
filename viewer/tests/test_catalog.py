@@ -391,9 +391,10 @@ class BlobWriteTests(BlobTestCase):
     def test_write_faults_and_redirects(self):
         store = BlobStore(self.blob.url, write_url=self.blob.write_url)
         self.blob.write_catalog([])
+        # A 412 to a DELETE that sent no condition is no sign of a new upload (storage also answers 412 for a lease).
         for fault, put_code, delete_code in (('302', 'redirected', 'redirected'), ('500', 'storage_error', 'storage_error'),
                                              ('403', 'forbidden', 'forbidden'), ('409', 'changed', 'storage_error'),
-                                             ('412', 'changed', 'changed')):
+                                             ('412', 'changed', 'storage_error'), ('lease', 'changed', 'storage_error')):
             with self.subTest(fault=fault):
                 self.blob.write_faults['catalog.json'] = fault
                 for call, code in ((lambda: store.put('catalog.json', b'{}', 'catalog.json', if_match='"x"'), put_code),
@@ -402,6 +403,15 @@ class BlobWriteTests(BlobTestCase):
                         call()
                     self.assertEqual(caught.exception.code, code)
                     self.assert_no_secret(caught.exception.message, repr(caught.exception))
+        # With If-Unmodified-Since, a 412 means written since, unless storage names another reason.
+        for fault, code, says in (('412', 'changed', 'catalog.json was written again since'),
+                                  ('lease', 'storage_error', 'catalog.json: storage answered HTTP 412 (LeaseIdMissing)')):
+            with self.subTest(fault=fault, condition=True):
+                self.blob.write_faults['catalog.json'] = fault
+                with self.assertRaises(CatalogError) as caught:
+                    store.delete('catalog.json', 'catalog.json', unmodified_since=time.time())
+                self.assertEqual((caught.exception.code, caught.exception.message), (code, says))
+        self.blob.write_faults.clear()
         self.assertEqual(self.blob.count(REDIRECT_TARGET), 0)
         self.assertIsNotNone(self.blob.file('catalog.json'))
         unreachable = BlobStore('http://127.0.0.1:9/c?sp=rl&sig=' + 'R' * 30, timeout=2,
@@ -1390,6 +1400,7 @@ class DeleteFlowTests(FlowTestCase):
         self.assertEqual(self.delete(hosted, session, mine)[0], 200)  # gone from the viewer; the ZIP follows
         self.assertEqual(self.stored()['exports'], [])
         self.assertIsNotNone(self.blob.file(mine['blob']))
+        self.assertEqual(hosted.app.published.zip_deletes_pending(), 1)
         hosted.app.maintain()  # less than a minute later: not yet
         self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 1)
         clock[0] += catalog_module.BLOB_RETRY_S
@@ -1404,10 +1415,43 @@ class DeleteFlowTests(FlowTestCase):
         self.assertEqual((retry['status'], retry['delete_snapshots']), (202, 'include'))
         self.assertTrue(retry['if_unmodified_since'])  # never a ZIP uploaded again after the deletion
         self.assertIn('deleted the ZIP of %s from storage' % mine['id'], hosted.log.getvalue())
+        self.assertEqual(hosted.app.published.zip_deletes_pending(), 0)
         clock[0] += 3600
         hosted.app.maintain()  # once gone, never again
         self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 3)
         self.assert_no_secret(hosted.log.getvalue())
+
+    def test_a_zip_storage_refuses_to_delete_is_tried_again_until_it_goes(self):
+        """A 412 is a ZIP uploaded again only for the DELETE that asks If-Unmodified-Since, and only when storage
+        does not name another reason: here a condition nobody sent, then a lease. /healthz counts the ZIP as
+        waiting until it is gone."""
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        clock = [1000.0]
+        hosted.app.published._clock = lambda: clock[0]
+        pending = lambda: json.loads(hosted.get('/healthz')[2])['catalog']['zip_deletes_pending']
+        self.assertEqual(pending(), 0)
+        self.blob.write_faults[mine['blob']] = '412'
+        self.assertEqual(self.delete(hosted, session, mine)[0], 200)
+        self.assertEqual(pending(), 1)
+        self.blob.write_faults[mine['blob']] = 'lease'
+        clock[0] += catalog_module.BLOB_RETRY_S
+        hosted.app.maintain()
+        deletes = [r for r in self.blob.requests if r['method'] == 'DELETE']
+        self.assertEqual([(r['status'], bool(r['if_unmodified_since'])) for r in deletes], [(412, False), (412, True)])
+        self.assertEqual(pending(), 1)
+        self.blob.write_faults.clear()  # the lease is gone
+        clock[0] += catalog_module.BLOB_RETRY_S
+        hosted.app.maintain()
+        self.assertIsNone(self.blob.file(mine['blob']))
+        self.assertEqual(pending(), 0)
+        log = hosted.log.getvalue()
+        for reason in ('ConditionNotMet', 'LeaseIdMissing'):
+            self.assertEqual(log.count('the ZIP of %s is still in storage (the published ZIP: storage answered HTTP 412 '
+                                       '(%s)); trying again every minute' % (mine['id'], reason)), 1)
+        self.assertNotIn('kept the ZIP', log)
+        self.assertIn('deleted the ZIP of %s from storage' % mine['id'], log)
 
     def test_an_export_published_again_is_left_alone(self):
         mine = self.publish()
@@ -1428,6 +1472,7 @@ class DeleteFlowTests(FlowTestCase):
         self.assertEqual(self.blob.count(mine['blob'], status=412, method='DELETE'), 1)
         self.assertIsNotNone(self.blob.file(mine['blob']))
         self.assertIn('kept the ZIP of %s' % mine['id'], hosted.log.getvalue())
+        self.assertEqual(hosted.app.published.zip_deletes_pending(), 0)  # kept: nothing left to delete
         # Listed again, tombstone and all: it opens, and nothing deletes it or its copy.
         self.blob.write_catalog([mine], deleted=stones)
         self.open(hosted, session, mine['id'])
@@ -1456,8 +1501,9 @@ class DeleteFlowTests(FlowTestCase):
         self.assertEqual(self.blob.count(old['blob'], method='DELETE'), 0)
         self.assertIsNone(self.blob.file(recent['blob']))
         hosted_without_write, _ = self.start(cache='other-cache', MJV_CATALOG_WRITE_URL='')
-        hosted_without_write.app.maintain()  # deleting is off there: it never tries
+        hosted_without_write.app.maintain()  # deleting is off there: it never tries, and has nothing waiting
         self.assertEqual([self.blob.count(e['blob'], method='DELETE') for e in (old, recent)], [0, 1])
+        self.assertEqual([h.app.published.zip_deletes_pending() for h in (hosted, hosted_without_write)], [0, 0])
 
     def test_the_write_query_string_never_leaks(self):
         mine = self.publish()

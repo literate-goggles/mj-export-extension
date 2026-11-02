@@ -87,6 +87,7 @@ SUMMARY_TEXT = ('extension_version', 'status')
 EMAIL_RE = re.compile(r"[a-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
                       r"[a-z][a-z0-9-]{0,61}[a-z0-9]")
 NOT_LISTED = 'this export is not published any more; it may have been deleted already'
+STORAGE_CODE_RE = re.compile(r'[A-Za-z]{1,64}')  # storage's own name for an error (x-ms-error-code)
 _CONTROL = re.compile('[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]')
 
 
@@ -139,7 +140,13 @@ def describe(exc: BaseException) -> str:
     return type(reason).__name__
 
 
-def _http_problem(what: str, status: int, access: str = 'read-only') -> CatalogError:
+def _storage_code(exc: urllib.error.HTTPError) -> Optional[str]:
+    """Storage's own name for the error of a refused request (the x-ms-error-code header), when it is one word."""
+    value = exc.headers.get('x-ms-error-code') if exc.headers is not None else None
+    return value if isinstance(value, str) and STORAGE_CODE_RE.fullmatch(value) else None
+
+
+def _http_problem(what: str, status: int, access: str = 'read-only', reason: Optional[str] = None) -> CatalogError:
     if status == 403:
         return CatalogError('forbidden', '%s: storage refused the request (HTTP 403); '
                                          'the %s access may have expired' % (what, access), status)
@@ -148,7 +155,8 @@ def _http_problem(what: str, status: int, access: str = 'read-only') -> CatalogE
     if 300 <= status < 400:
         return CatalogError('redirected', '%s: storage answered with a redirect (HTTP %d), '
                                           'which is not followed' % (what, status), status)
-    return CatalogError('storage_error', '%s: storage answered HTTP %d' % (what, status), status)
+    return CatalogError('storage_error', '%s: storage answered HTTP %d%s' % (what, status, ' (%s)' % reason
+                                                                           if reason else ''), status)
 
 
 def _secret_parts(*queries: str) -> List[str]:
@@ -264,7 +272,8 @@ class BlobStore:
 
     def delete(self, name: str, what: str, unmodified_since: Optional[float] = None) -> bool:
         """Delete an object and its snapshots; False when it was already gone. With unmodified_since (epoch
-        seconds) only when it was not written after that: CatalogError 'changed' otherwise."""
+        seconds) only when it was not written after that: CatalogError 'changed' otherwise. A 412 means that
+        only when the condition was sent and storage does not name another reason (a lease, say)."""
         headers = {'x-ms-delete-snapshots': 'include'}
         if unmodified_since is not None:
             headers['If-Unmodified-Since'] = email.utils.formatdate(unmodified_since, usegmt=True)
@@ -273,12 +282,13 @@ class BlobStore:
         except CatalogError:
             raise
         except urllib.error.HTTPError as exc:
+            reason = _storage_code(exc)
             exc.close()
             if exc.code == 404:
                 return False
-            if exc.code == 412:
-                raise CatalogError('changed', '%s was written again since' % what) from None
-            raise _http_problem(what, exc.code, 'write') from None
+            if exc.code == 412 and unmodified_since is not None and reason in (None, 'ConditionNotMet'):
+                raise CatalogError('changed', '%s was written again since' % what, 412) from None
+            raise _http_problem(what, exc.code, 'write', reason) from None
         except Exception as exc:
             raise CatalogError('unreachable', '%s: storage unreachable (%s)' % (what, describe(exc))) from None
         return True
@@ -1401,13 +1411,12 @@ class Published:
         listed = {entry['id'] for entry in entries}
         self._purge({stone['id']: stone['sha256'] for stone in stones if stone['id'] not in listed})
 
-    def _retry_blob_deletes(self) -> None:
-        """Delete the ZIPs of exports deleted in the last TOMBSTONE_RETRY_S that storage may still hold (an
-        earlier DELETE failed, or another instance wrote the tombstone), each at most every BLOB_RETRY_S and
-        once confirmed gone never again; never the ZIP of an export that is listed again, nor one uploaded
-        again after its latest tombstone."""
+    def _waiting_blobs(self) -> List[dict]:
+        """The newest tombstone of each ZIP that storage may still hold and that this instance deletes (with
+        MJV_CATALOG_WRITE_URL): deleted in the last TOMBSTONE_RETRY_S, not listed again, and not yet confirmed
+        gone (or kept, as uploaded again after the deletion)."""
         if not self.store.writable:
-            return
+            return []
         entries, stones = self.catalog.snapshot()
         listed = {entry['sha256'] for entry in entries}
         latest: Dict[str, dict] = {}
@@ -1415,12 +1424,25 @@ class Published:
             known = latest.get(stone['sha256'])
             if known is None or stone['deleted_ts'] > known['deleted_ts']:
                 latest[stone['sha256']] = stone
-        now, wall = self._clock(), self._wall()
+        wall = self._wall()
         with self._lock:
-            due = [stone for sha, stone in latest.items()
-                   if sha not in listed and sha not in self._blobs_done
-                   and wall - stone['deleted_ts'] <= TOMBSTONE_RETRY_S
-                   and (sha not in self._blob_tries or now - self._blob_tries[sha] >= BLOB_RETRY_S)]
+            return [stone for sha, stone in latest.items() if sha not in listed and sha not in self._blobs_done
+                    and wall - stone['deleted_ts'] <= TOMBSTONE_RETRY_S]
+
+    def zip_deletes_pending(self) -> int:
+        """How many ZIPs of deleted exports this instance still has to delete from storage (/healthz)."""
+        return len(self._waiting_blobs())
+
+    def _retry_blob_deletes(self) -> None:
+        """Delete the ZIPs of exports deleted in the last TOMBSTONE_RETRY_S that storage may still hold (an
+        earlier DELETE failed, or another instance wrote the tombstone), each at most every BLOB_RETRY_S and
+        once confirmed gone never again; never the ZIP of an export that is listed again, nor one uploaded
+        again after its latest tombstone."""
+        now = self._clock()
+        waiting = self._waiting_blobs()
+        with self._lock:
+            due = [stone for stone in waiting if stone['sha256'] not in self._blob_tries
+                   or now - self._blob_tries[stone['sha256']] >= BLOB_RETRY_S]
         for stone in due:
             self._delete_blob(stone['id'], stone['sha256'], since=stone['deleted_ts'])
 

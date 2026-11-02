@@ -671,7 +671,8 @@ class HostedHandler(Handler):
 
     def _probe(self, path: str) -> None:
         if path == '/healthz':
-            catalog = dict(self.app.catalog.health(), delete_enabled=self.app.delete_enabled)
+            catalog = dict(self.app.catalog.health(), delete_enabled=self.app.delete_enabled,
+                           zip_deletes_pending=self.app.published.zip_deletes_pending())
             return self._send(200, dump_json({'ok': True, 'mode': 'hosted', 'commit': self.config.commit,
                                               'catalog': catalog, 'cache': {'ok': self.app.cache_ok}}),
                               'application/json; charset=utf-8')

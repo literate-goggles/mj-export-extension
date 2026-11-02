@@ -371,9 +371,10 @@ class ProbeAndHeaderTests(HostedTestCase):
             data = self.json_of(body)
             self.assertEqual(set(data), {'ok', 'mode', 'commit', 'catalog', 'cache'})
             self.assertEqual((data['ok'], data['mode'], data['cache']), (True, 'hosted', {'ok': True}))
-            self.assertEqual(set(data['catalog']), {'exports', 'ok', 'age_s', 'delete_enabled'})
+            self.assertEqual(set(data['catalog']), {'exports', 'ok', 'age_s', 'delete_enabled', 'zip_deletes_pending'})
             self.assertEqual((data['catalog']['exports'], data['catalog']['ok']), (1, catalog_ok))
             self.assertIs(data['catalog']['delete_enabled'], False)
+            self.assertEqual(data['catalog']['zip_deletes_pending'], 0)
             for leak in (self.entry['id'], self.entry['sha256'], self.entry['name'], self.entry['label'], 'Synthetic',
                          self.entry['published_by'], 'publisher', self.hosted.config.cache_dir, 'alice', '@',
                          self.blob.secret, '127.0.0.1', 'HTTP 403', 'storage'):
@@ -1008,7 +1009,8 @@ class RunTests(unittest.TestCase):
                     time.sleep(0.05)
                 self.assertEqual((health['catalog'], health['cache']), ({'exports': 1, 'ok': True,
                                                                         'age_s': health['catalog']['age_s'],
-                                                                        'delete_enabled': False},
+                                                                        'delete_enabled': False,
+                                                                        'zip_deletes_pending': 0},
                                                                        {'ok': True}))
                 self.assertEqual(self.blob.count('catalog.json'), 1)
                 self.assertEqual(listdir(zips), [])  # abandoned downloads removed at start

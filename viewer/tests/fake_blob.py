@@ -18,8 +18,10 @@ the way a blob container answers requests signed with a SAS:
   follows it), a truncated body (the full Content-Length, then the connection
   closes half way), a slow body (a pause before each chunk) and a body without
   Content-Length (it ends when the connection closes); for PUT and DELETE
-  (write_faults) 403, 404, 409, 412, 500, a redirect, and 'drop': the write is
-  done, then the connection closes without an answer. before_write(name,
+  (write_faults) 403, 404, 409, 412, 500, a redirect, 'lease' (412 with the
+  error code storage gives a leased object) and 'drop': the write is done, then
+  the connection closes without an answer. Refusals carry storage's error code
+  in x-ms-error-code, as the real storage does. before_write(name,
   method), when set, runs before each PUT or DELETE is checked, to stand in for
   another writer that gets there first.
 
@@ -44,7 +46,8 @@ DEFAULT_WRITE_QUERY = ('sv=2099-01-01&ss=b&srt=co&sp=rwdl&se=2099-12-31T00%3A00%
                        '&sig=TESTONLYwriteSig9876543210fedcbaSECRET%3D')
 FAULTS = ('403', '404', '500', '302', 'truncate', 'slow', 'nolength')
 WRITE_FAULTS = {'403': (403, 'AuthorizationPermissionMismatch'), '404': (404, 'BlobNotFound'),
-                '409': (409, 'LeaseIdMissing'), '412': (412, 'ConditionNotMet'), '500': (500, 'InternalError')}
+                '409': (409, 'LeaseIdMissing'), '412': (412, 'ConditionNotMet'), '500': (500, 'InternalError'),
+                'lease': (412, 'LeaseIdMissing')}
 DROP = 'drop'  # a write fault: the write is done, but its answer never arrives
 REDIRECT_TARGET = 'redirected-here.zip'
 
@@ -72,7 +75,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _refuse(self, status: int, code: str) -> None:
-        self._plain(status, ('<?xml version="1.0" encoding="utf-8"?><Error><Code>%s</Code></Error>' % code).encode())
+        self._plain(status, ('<?xml version="1.0" encoding="utf-8"?><Error><Code>%s</Code></Error>' % code).encode(),
+                    {'x-ms-error-code': code})
 
     def _target(self):
         path, _, query = self.path.partition('?')
