@@ -1,6 +1,6 @@
 # What an MJ Export export contains
 
-This page describes the files the MJ Export extension writes, the Midjourney web endpoints they come from, and how their parts relate. It is derived only from this repository's code and docs at extension version 0.3.1, except [The designer's selection](#the-designers-selection), which describes what a later version adds when the designer chooses what to export. Citations are `path:line` from the repository root. Raw endpoint observations are in [docs/ENDPOINTS.md](../docs/ENDPOINTS.md) and are not repeated here. The statuses verified, inferred and unsupported are defined in [section 4](#4-verified-inferred-unsupported).
+This page describes the files the MJ Export extension writes, the Midjourney web endpoints they come from, and how their parts relate. It is derived only from this repository's code and docs at extension version 0.3.1. Version 0.4.0 adds a way for the designer to choose what to export, and two kinds of text describe 0.4.0 instead: the section [The designer's selection](#the-designers-selection), and every row, paragraph or sentence elsewhere that begins "With a selection". Citations are `path:line` from the repository root. Raw endpoint observations are in [docs/ENDPOINTS.md](../docs/ENDPOINTS.md) and are not repeated here. The statuses verified, inferred and unsupported are defined in [section 4](#4-verified-inferred-unsupported).
 
 Versions 0.3.0 and 0.3.1 write the same format: 0.3.1 (commit `83b3540`) changed no writer code, only the UI defaults (All jobs, images on, Small test off) and when saved settings are restored. No 0.2.0 code is in Git; that version is known only from `docs/TESTING.md:3-11`.
 
@@ -80,8 +80,8 @@ Evidence: `src/content.js:12,16,55,73,86,90,99,102,114,116`; `lib/normalize.js:4
 | `failures` | `[{kind, id, reason}]` from the latest attempt only. `image`: the id is the requested `images/...jpeg` path. `job`: a video job. `run`: id `export`, with the error that stopped or paused the run. |
 | `parent_gaps` | `[{job_id, parent_id, reason}]` for every job whose `parent_id` is not an exported `job_id`, recomputed at each write, with one fixed reason. With a selection, a parent that was in scope but not exported because of it also has `left_out: true`, and its reason reads "The designer left the parent out of this export". |
 | `feed_exhausted` | True when the last page read had no cursor. |
-| `limitations` | Three fixed sentences, plus "Items the designer left out are not in this export." with a selection. |
-| `selection` | Absent from older exports, null when the designer did not choose, otherwise what they chose: see [The designer's selection](#the-designers-selection). |
+| `limitations` | Three fixed sentences. With a selection, a fourth: "Items the designer left out are not in this export." |
+| `selection` | Absent from 0.3.x exports. With a selection, what the designer chose (see [The designer's selection](#the-designers-selection)); without one, 0.4.0 writes null. |
 
 ### jobs.jsonl
 
@@ -120,7 +120,7 @@ Evidence: `lib/normalize.js:12-34`; `src/content.js:110-113`; `docs/ENDPOINTS.md
 | `version` | `version`, or null. Never observed. |
 | `created_at` | `created`, or null. Observed as `YYYY-MM-DD HH:MM:SS.ffffff` with no time zone. |
 | `generated_job_ids` | The exported jobs that have a reference whose `id` equals the board id, in feed order. |
-| `generated_left_out` | Only with a selection: how many of the board's generations in scope were not exported because of it (left out, or appeared after choosing). Written as 0 too. |
+| `generated_left_out` | With a selection, how many of the board's generations in scope were not exported because of it (left out, or made after choosing), 0 included; absent without one. |
 | `images` | The board's current reference images in API order, as `{source_url, file, width, height}`. `file` is set only after a successful download. |
 
 ### profiles.jsonl
@@ -148,7 +148,7 @@ Evidence: `lib/normalize.js:12-34`; `src/content.js:110-113`; `docs/ENDPOINTS.md
 
 ### The designer's selection
 
-A later extension version lets the designer choose what to export: whole moodboards in or out, and single generations in or out. The choice is saved once and used for the whole run, so a generation that appears in scope after it was made is not exported either; it counts as "not reviewed". What was not exported is absent from the files:
+Version 0.4.0 lets the designer choose what to export: whole moodboards in or out, and single generations in or out. The choice is saved once and used for the whole run, so a generation that appears in scope after it was made is not exported either; it counts as "not reviewed". What was not exported is absent from the files:
 
 - A left-out or not-reviewed job has no `jobs.jsonl` or `likes.jsonl` row and no downloaded image, and no board's `generated_job_ids` lists it.
 - A left-out board has no `moodboards.jsonl` row and no downloaded reference image.
@@ -176,7 +176,7 @@ likes.jsonl job_id --------------> job.job_id
 image_files[], images[].file ----> files in images/
 ```
 
-- **Lineage.** `parent_id` is the only lineage link; the feed's selection and shown flags are never used (`README.md:82`). `parent_index` names the parent's image slot, 0-based, which is inferred from the field names and one observed variation with `parent_grid: 0` (`docs/ENDPOINTS.md:25,59`). `parent_grid` is kept raw, and when neither field is an integer, `parent_index` is null. No child list is written, so children are found by reverse lookup. A parent outside the export is listed in `parent_gaps` and is never fetched; "outside the scope" and "unavailable" share one reason (`lib/normalize.js:46`; `README.md:81`), and only a parent the designer left out is told apart, by `left_out: true`. Max and Since scopes can cut chains, and so can a selection. Chains longer than one step, and cycles, have not been observed.
+- **Lineage.** `parent_id` is the only lineage link; the feed's selection and shown flags are never used (`README.md:82`). `parent_index` names the parent's image slot, 0-based, which is inferred from the field names and one observed variation with `parent_grid: 0` (`docs/ENDPOINTS.md:25,59`). `parent_grid` is kept raw, and when neither field is an integer, `parent_index` is null. No child list is written, so children are found by reverse lookup. A parent outside the export is listed in `parent_gaps` and is never fetched; "outside the scope" and "unavailable" share one reason (`lib/normalize.js:46`; `README.md:81`). Max and Since scopes can cut chains. With a selection, so can the designer's choice, and `left_out: true` tells apart a parent the designer left out. Chains longer than one step, and cycles, have not been observed.
 - **Kind.** The lower-cased `job_type + ' ' + event_type` is matched against `zoom`, `pan`, `remix`, `upscale|upsample` and `variation|vary`, and the first match wins. Otherwise a parentless job with `batch_size` > 1 is `grid`, and anything else is `other` (`lib/normalize.js:4-7`). These are substring heuristics: `pan` also matches `expand`. Only `grid` and `variation` have been observed, and the observed variation was itself a four-image job (`docs/TESTING.md:5` counts 18 jobs and 72 job images, at most 4 per job by `lib/normalize.js:9`). `batch_size` is not exported, so the grid rule can only be re-checked through the number of `image_urls`.
 - **Personalization references.** Each entry of `personalization_codes` has `code`, `id`, `type` and `user_id` (`docs/ENDPOINTS.md:25`). The types observed in a sample export are `moodboard`, `profile` and `user`, and the `user` entries had no `id`. The repository does not say what the types mean. The exporter links by `id` alone, for any type, and skips entries without one (`lib/normalize.js:16,24,37`).
 - **Moodboards.** `images` and `generated_job_ids` are separate datasets: the board's current pictures, and the exported jobs that reference it (`docs/ARCHITECTURE.md:15`). The rows and the links come from one job set, so in an unmodified 0.3.x export every listed id is an exported job, and every exported job that references the board is listed. An empty list means no exported job references the board, not that it was never used (`README.md:13`). With a selection, `generated_left_out` counts the board's generations that were not exported because of it. The current pictures may differ from the ones a job was made with.
@@ -243,7 +243,7 @@ What the exporter cannot export:
 - Earlier versions of a board, deleted boards, a board's use beyond the exported jobs, and each board image's `created` time, which is fetched and dropped (`README.md:12-13`; `lib/normalize.js:30-32`).
 - Personalization weights and individual ratings; `counts.profileCounts`, fetched but never written; the `*Btrees*` counts, never fetched; and any global profile other than V6, V7, Niji V6 and Niji V7, since only those four count keys are read (`README.md:14`; `src/page-bridge.js:29`; `lib/normalize.js:39`; `docs/ENDPOINTS.md:35`).
 - Likes of other creators' work (`README.md:85`).
-- What the designer left out, by choice. Only its numbers, and the ids of left-out boards that exported jobs use, are recorded (`export_meta.selection`).
+- With a selection, what the designer left out. Only its numbers, and the ids of left-out boards that exported jobs use, are recorded (`export_meta.selection`).
 - Fields the site returns but the exporter drops: on jobs `batch_size`, `rating`, `published`, `shown`, `user_hidden`, `template` and `image_hides`, and on boards `personalize` (`src/page-bridge.js:7,26`; `docs/ENDPOINTS.md:23,29`).
 - The account id in `export_meta.json`. It appears only as the references' `user_id` and inside global profile ids.
 
