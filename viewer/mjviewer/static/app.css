@@ -1265,6 +1265,12 @@ code, kbd, pre, .mono {
   color: var(--warn);
 }
 
+.link-chip--left-out {
+  background: var(--surface-3);
+  border-color: var(--line-2);
+  color: var(--ink-2);
+}
+
 .chip {
   display: inline-flex;
   align-items: center;
@@ -1470,7 +1476,8 @@ a.hint:hover {
   background: var(--surface-2);
 }
 
-.table--counts td:first-child {
+.table--counts td:first-child,
+.table--selection td:first-child {
   font-weight: 550;
 }
 
@@ -2011,6 +2018,14 @@ a.mini:hover .mini__title {
   display: grid;
   place-items: center;
   color: var(--warn);
+}
+
+.mini--left-out {
+  border-color: var(--line-2);
+}
+
+.mini--left-out .mini__thumb {
+  color: var(--muted);
 }
 
 .mini__thumb {
@@ -2574,6 +2589,14 @@ a.stat:hover .stat__label {
 
 .checks-ok > .checks {
   margin-top: 8px;
+}
+
+.selection-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  color: var(--ink-2);
 }
 
 /* ------------------------------------------------------------ gallery */

@@ -198,6 +198,12 @@ export const LINKS = {
     style: 'warn',
     help: 'This reference matches nothing in the export.',
   },
+  left_out: {
+    label: 'Left out by the designer',
+    short: 'left out',
+    style: 'left-out',
+    help: 'The designer chose not to export this moodboard, so it is not in the export.',
+  },
 };
 
 export function linkInfo(link) {

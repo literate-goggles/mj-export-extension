@@ -6,7 +6,7 @@ import {loadOverview, isAbort} from './api.js';
 import {arr, str, obj, isNum, fmtInt, fmtBytes, kindLabel, plural, shortId} from './format.js';
 import {
   pageHead, section, statusBadge, supportBadge, badge, errorState, loadingState, callout, timeEl, kvList, dataTable,
-  rawBlock, renderValue, jobLink, emptyState,
+  rawBlock, renderValue, jobLink, emptyState, linkChip,
 } from './ui.js';
 
 const EXPORT_TIME_HELP = 'export_time: when export_meta.json was last written, at the end or stop of the latest run.';
@@ -65,6 +65,7 @@ export function renderOverview(root, route, ctx) {
         h('div', {class: 'overview__main'}, checksSection(checks, exportId).el),
         h('div', {class: 'overview__side'}, detailsSection(d, summary).el)),
       countsSection(counts).el,
+      selectionSection(d.selection),
       failuresSection(d, exportId),
       gapsSection(d, exportId),
       filesSection(obj(d.files), exportId),
@@ -198,8 +199,46 @@ function detailsSection(d, summary) {
     ['Scope', scope ? scopeText(scope) : h('span', {class: 'muted'}, 'Not recorded')],
     ['Images', scope ? boolText(scope.images, 'Included', 'Metadata only (no image files)') : undefined],
     ['Small test', scope ? boolText(scope.testSubset, 'On: at most one moodboard and one profile', 'Off') : undefined, 'testSubset'],
+    selectionRow(d.selection, meta),
   ].filter(Boolean))));
   return sec;
+}
+
+// Exporters that let the designer choose write selection: null when they did not; older ones write no key.
+function selectionRow(selection, meta) {
+  if (selection && typeof selection === 'object') {
+    return ['Selection', h('span', {class: 'stack'}, 'Chosen by the designer',
+      selection.chosen_at ? h('span', {class: 'note'}, 'On ', timeEl(selection.chosen_at)) : null), 'selection'];
+  }
+  if (!meta || !('selection' in meta)) return undefined;
+  return ['Selection', meta.selection === null ? 'Not used: the designer did not leave anything out'
+    : h('span', {class: 'is-warn'}, 'Recorded, but not readable (see the checks)'), 'selection'];
+}
+
+function selectionSection(selection) {
+  if (!selection || typeof selection !== 'object') return null;
+  const boards = obj(selection.moodboards);
+  const jobs = obj(selection.jobs);
+  const sec = section('What the designer chose to export', {
+    iconName: 'sliders',
+    intro: 'The designer picked the moodboards and generations to export. What was left out is not in this export: no rows and no images. Generations that appeared after the choice were not exported either.',
+  });
+  const cell = (v) => (isNum(v) ? fmtInt(v) : h('span', {class: 'muted'}, '—'));
+  sec.body.append(dataTable([
+    {label: 'Item'}, {label: 'In scope', cls: 'num'}, {label: 'Exported', cls: 'num'}, {label: 'Left out', cls: 'num'},
+    {label: 'Appeared after choosing', cls: 'num'},
+  ], [
+    ['Moodboards', cell(boards.available), cell(boards.exported), cell(boards.left_out), h('span', {class: 'muted'}, '—')],
+    ['Generations', cell(jobs.available), cell(jobs.exported), cell(jobs.left_out), cell(jobs.not_reviewed)],
+  ], {caption: 'What the designer chose to export', cls: 'table--selection'}));
+  const used = arr(selection.left_out_moodboard_ids).length;
+  if (selection.chosen_at || used) {
+    sec.body.append(h('div', {class: 'selection-notes'},
+      selection.chosen_at ? h('p', null, 'Chosen ', timeEl(selection.chosen_at), '.') : null,
+      used ? h('p', null, `${plural(used, 'left-out moodboard was', 'left-out moodboards were')} used by exported generations. `,
+        'Job pages label those references ', linkChip('left_out'), '.') : null));
+  }
+  return sec.el;
 }
 
 const COUNT_ROWS = [
@@ -291,15 +330,21 @@ function failuresSection(d, exportId) {
 function gapsSection(d, exportId) {
   const gaps = arr(d.parent_gaps);
   if (!gaps.length) return null;
+  const leftOut = gaps.some((g) => obj(g).left_out === true);
   const sec = section('Parent gaps', {
     count: gaps.length,
     iconName: 'unlink',
-    intro: 'Jobs whose parent is not in this export, as reported in export_meta.json. A date or count limit usually explains them.',
+    intro: leftOut
+      ? 'Jobs whose parent is not in this export, as reported in export_meta.json. A date or count limit, or the designer’s choice, explains them.'
+      : 'Jobs whose parent is not in this export, as reported in export_meta.json. A date or count limit usually explains them.',
   });
   sec.body.append(dataTable([{label: 'Job'}, {label: 'Missing parent'}, {label: 'Reason'}],
     gaps.map((g) => {
       const x = obj(g);
-      return [jobLink(exportId, x.job_id, {short: true}), h('span', {class: 'mono break'}, str(x.parent_id) || '—'), str(x.reason) || '—'];
+      const parent = h('span', {class: 'mono break'}, str(x.parent_id) || '—');
+      return [jobLink(exportId, x.job_id, {short: true}),
+        x.left_out === true ? h('span', {class: 'stack'}, parent, badge('Left out by the designer', {iconName: 'unlink'})) : parent,
+        str(x.reason) || '—'];
     }), {caption: 'Parent gaps'}));
   return sec.el;
 }

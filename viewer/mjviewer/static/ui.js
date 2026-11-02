@@ -398,6 +398,9 @@ export function jobCard(job, {exportId, href = '', top = null, footer = null, cl
   } else if (j.parent_status === 'missing') {
     lineage.push(h('span', {class: 'hint hint--warn', title: 'The parent job is not part of this export'},
       icon('unlink', {size: 13}), 'Parent not exported'));
+  } else if (j.parent_status === 'left_out') {
+    lineage.push(h('span', {class: 'hint', title: 'The designer chose not to export the parent job'},
+      icon('unlink', {size: 13}), 'Parent left out'));
   }
   if (isNum(j.child_count) && j.child_count > 0) {
     lineage.push(h('span', {class: 'hint', title: 'Jobs in this export made from this one'},

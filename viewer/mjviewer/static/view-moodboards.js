@@ -89,7 +89,10 @@ function boardCard(exportId, board) {
             ? h('dd', {class: 'bcard__stat-note is-warn'}, `${fmtInt(refCount - present)} missing`) : null),
         h('div', {class: 'bcard__stat bcard__stat--gen'},
           h('dt', null, 'Generations'),
-          h('dd', null, fmtInt(totalGens)))),
+          h('dd', null, fmtInt(totalGens)),
+          isNum(b.generated_left_out) && b.generated_left_out > 0
+            ? h('dd', {class: 'bcard__stat-note muted', title: 'Generations made with this moodboard that the designer left out of the export'},
+              `${fmtInt(b.generated_left_out)} left out`) : null)),
       totalGens ? h('div', {class: 'tag-row'}, LINK_ORDER.filter((k) => gens[k]).map((k) => h('span', {class: ['link-chip', `link-chip--${linkInfo(k).style}`], title: linkInfo(k).help}, `${fmtInt(gens[k])} ${linkInfo(k).short}`)))
         : h('p', {class: 'muted small'}, 'No linked generations in this export'),
       b.created_at ? h('p', {class: 'bcard__meta'}, 'Created ', timeEl(recordedDate(b.created_at, b.created_at_raw), {dateOnly: true})) : null));
@@ -150,7 +153,7 @@ export function renderMoodboard(root, route, ctx) {
     fill(body,
       legend(references.length, generations.length),
       referencesSection(references, name),
-      generationsSection(generations),
+      generationsSection(generations, isNum(board.generated_left_out) ? board.generated_left_out : 0),
       unresolvedSection(unresolved),
       notesBlock(data.notes),
       unknownSection(arr(data.unknown_fields)),
@@ -207,13 +210,18 @@ export function renderMoodboard(root, route, ctx) {
     return sec.el;
   }
 
-  function generationsSection(generations) {
-    const sec = section('Generations made using this board', {count: generations.length, cls: 'section--gen', iconName: 'layers'});
+  function generationsSection(generations, leftOut) {
+    // The full sentence is the first of the notes below the section.
+    const sec = section('Generations made using this board', {count: generations.length, cls: 'section--gen', iconName: 'layers',
+      actions: leftOut && generations.length ? badge(`${fmtInt(leftOut)} more left out by the designer`,
+        {tone: 'muted', iconName: 'unlink', title: 'Generations made with this moodboard that the designer left out of the export'}) : null});
     if (!generations.length) {
       sec.body.append(emptyState({
         iconName: 'layers',
         title: 'No linked generations in this export',
-        body: h('p', null, 'No exported job references this board. That does not prove the board was never used: jobs outside the export scope are not included, and older jobs may not record the reference.'),
+        body: leftOut
+          ? h('p', null, `No exported job references this board. The designer left ${plural(leftOut, 'generation')} made with it out of the export.`)
+          : h('p', null, 'No exported job references this board. That does not prove the board was never used: jobs outside the export scope are not included, and older jobs may not record the reference.'),
       }));
       return sec.el;
     }

@@ -168,6 +168,7 @@ export function renderJob(root, route, ctx) {
     const parentStatus = parent.status || job.parent_status;
     let parentValue = null;
     if (parentId && parentStatus === 'in_export') parentValue = jobLink(exportId, parentId);
+    else if (parentId && parentStatus === 'left_out') parentValue = h('span', {class: 'stack'}, h('span', {class: 'mono break'}, parentId), badge('Left out by the designer', {iconName: 'unlink'}));
     else if (parentId) parentValue = h('span', {class: 'stack'}, h('span', {class: 'mono break'}, parentId), badge('Not in this export', {tone: 'warn', iconName: 'unlink'}));
     const parentIndex = isNum(parent.index) ? parent.index : isNum(job.parent_index) ? job.parent_index : null;
     const versionSource = v.source === 'job_type' ? 'parsed from job_type' : v.source === 'flag' ? 'from the command flags' : 'not recorded';
@@ -197,9 +198,10 @@ export function renderJob(root, route, ctx) {
     const boards = arr(data.moodboards).length ? arr(data.moodboards) : arr(job.moodboards);
     const profiles = arr(data.profiles).length ? arr(data.profiles) : arr(job.profiles);
     const unmatched = arr(job.codes).filter((c) => c && c.resolved === false);
+    const leftOut = new Map(arr(data.references).filter((r) => r && r.link === 'left_out' && r.id).map((r) => [str(r.id), r]));
     const panel = h('div', {class: 'panel panel--tight'},
       h('h2', {class: 'panel__title'}, icon('link', {size: 15}), 'Made with'));
-    if (!boards.length && !profiles.length && !unmatched.length) {
+    if (!boards.length && !profiles.length && !unmatched.length && !leftOut.size) {
       panel.append(h('p', {class: 'muted'}, 'Not linked to any exported moodboard or profile.'));
       return panel;
     }
@@ -219,6 +221,13 @@ export function renderJob(root, route, ctx) {
         h('a', {class: 'relation__name', href: hrefs.gallery(exportId, {profile: x.id}), title: 'Show jobs that used this profile'}, str(x.name) || str(x.id)),
         linkChip(x.link),
         x.evidence ? h('p', {class: 'relation__evidence'}, str(x.evidence)) : null));
+    }
+    for (const [id, r] of leftOut) {
+      list.append(h('li', {class: 'relation'},
+        h('span', {class: 'relation__kind'}, icon('board', {size: 14}), 'Moodboard'),
+        h('span', {class: 'relation__name mono break'}, id),
+        linkChip('left_out'),
+        h('p', {class: 'relation__evidence'}, `The designer left this moodboard out of the export, so only its id${r.code ? ' and code are' : ' is'} known.`)));
     }
     for (const c of unmatched) {
       list.append(h('li', {class: 'relation'},
@@ -245,10 +254,11 @@ export function renderJob(root, route, ctx) {
     }
     if (ancestors.length || parentStatus !== 'none') {
       const trail = h('ol', {class: 'trail', 'aria-label': 'Ancestors, root first'});
-      if (parentStatus === 'missing' && !ancestors.length) {
-        trail.append(h('li', {class: 'trail__item'}, h('span', {class: 'mini mini--gap'},
+      if ((parentStatus === 'missing' || parentStatus === 'left_out') && !ancestors.length) {
+        const leftOut = parentStatus === 'left_out';
+        trail.append(h('li', {class: 'trail__item'}, h('span', {class: ['mini', 'mini--gap', leftOut && 'mini--left-out']},
           h('span', {class: 'mini__thumb'}, icon('unlink', {size: 18})),
-          h('span', {class: 'mini__text'}, h('span', {class: 'mini__title'}, 'Parent not exported'),
+          h('span', {class: 'mini__text'}, h('span', {class: 'mini__title'}, leftOut ? 'Parent left out' : 'Parent not exported'),
             h('span', {class: 'mini__meta mono'}, parentId)))));
       }
       ancestors.forEach((a, i) => {
@@ -276,6 +286,9 @@ export function renderJob(root, route, ctx) {
       facts.append(callout('warn', h('p', null, 'The parent job ', h('span', {class: 'mono break'}, parentId),
         ' is not in this export, so the chain stops here.', parent.reason ? ` ${str(parent.reason)}` : '', note)));
       crossCheckGap(note, parent);
+    } else if (parentStatus === 'left_out') {
+      facts.append(callout('info', h('p', null, 'The designer left the parent job ', h('span', {class: 'mono break'}, parentId),
+        ' out of this export, so the chain stops here.')));
     }
     const descendants = isNum(lineage.descendant_count) ? lineage.descendant_count : null;
     if (descendants !== null && descendants > children.length) {
@@ -328,7 +341,7 @@ export function renderJob(root, route, ctx) {
       references.map((ref) => {
         const r = obj(ref);
         const target = r.target && typeof r.target === 'object' ? r.target : null;
-        let targetEl = h('span', {class: 'muted'}, 'Nothing in this export');
+        let targetEl = h('span', {class: 'muted'}, r.link === 'left_out' ? 'A moodboard left out of this export' : 'Nothing in this export');
         if (target && target.kind === 'moodboard') {
           targetEl = h('a', {href: hrefs.moodboard(exportId, target.id)}, icon('board', {size: 14}), ' ', str(target.name) || str(target.id));
         } else if (target && target.kind === 'profile') {
