@@ -255,6 +255,40 @@ def standard_export() -> Export:
     return export.sync_counts()
 
 
+LEFT_OUT_PARENT_REASON = 'The designer left the parent out of this export'
+SELECTION_LIMITATION = 'Items the designer left out are not in this export.'
+
+
+def selection_export() -> Export:
+    """standard_export() as the exporter writes it when the designer chose what to export.
+
+    Two of four moodboards were left out: 'board-left' is the moodboard of the exported job-niji (by its
+    reference id), the other one is only counted. The parent of the new job-left-child was left out, while
+    job-gap keeps an ordinary parent gap. Two generations appeared after choosing (not reviewed), and three
+    more generations of board-1 were not exported. See test_model.SelectionTests for what the viewer shows.
+    """
+    export = standard_export()
+    niji = export.jobs[4]
+    niji['personalization_codes'] = [ref('moodboard', 'board-left', 'mbcodeL')]
+    niji['flags']['profile'] = ['mbcodeL']
+    niji['full_command'] += ' --profile mbcodeL'
+    export.jobs.append(make_job('job-left-child', '2026-03-19T10:00:00+00:00', 'lantern detail', kind='upscale',
+                                images=1, event_type='upscale', parent_id='job-left-parent', parent_index=1,
+                                parent_grid=1))
+    export.boards[0]['generated_left_out'] = 3
+    export.boards[1]['generated_left_out'] = 0
+    export.meta['parent_gaps'].append({'job_id': 'job-left-child', 'parent_id': 'job-left-parent',
+                                       'reason': LEFT_OUT_PARENT_REASON, 'left_out': True})
+    export.meta['limitations'].append(SELECTION_LIMITATION)
+    export.meta['selection'] = {
+        'chosen_at': '2026-03-19T09:00:00.000Z',
+        'moodboards': {'available': 4, 'exported': 2, 'left_out': 2},
+        'jobs': {'available': 25, 'exported': 10, 'left_out': 13, 'not_reviewed': 2},
+        'left_out_moodboard_ids': ['board-left'],
+    }
+    return export.sync_counts()
+
+
 GALLERY_PALETTE = [(46, 94, 170), (214, 120, 52), (58, 150, 112), (176, 62, 92), (122, 98, 182), (226, 190, 70),
                    (70, 160, 190), (150, 84, 50), (96, 120, 70), (200, 90, 140), (40, 40, 60), (230, 220, 200)]
 GALLERY_WORDS = ['amber', 'basalt', 'cobalt', 'drift', 'ember', 'fjord', 'glacier', 'harbor', 'indigo', 'juniper']

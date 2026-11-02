@@ -331,6 +331,199 @@ class LinkRuleTests(unittest.TestCase):
         self.assertEqual(detail['job']['codes'], [{'code': 'flagonly', 'type': 'flag', 'resolved': False}])
 
 
+def outputs(index):
+    """Everything the API serves for an export, minus the raw export_meta.json and the source path."""
+    overview = dict(index.overview())
+    overview.pop('meta')
+    overview['summary'] = dict(overview['summary'], source=None)
+    return {'overview': overview, 'jobs': {j: index.job_detail(j) for j in index.jobs},
+            'boards': {b: index.moodboard_detail(b) for b in index.boards}, 'moodboards': index.moodboards(),
+            'profiles': index.profiles_list(), 'likes': index.likes_list(), 'all': index.query_jobs({'limit': '500'})}
+
+
+class SelectionTests(unittest.TestCase):
+    """Exports in which the designer chose what to export (export_meta.selection), from fixtures.selection_export()."""
+
+    SENTENCE = ('2 of 4 moodboards and 10 of 25 generations. 13 generations and 2 moodboards were left out; '
+                '2 generations appeared after choosing and were not exported.')
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix='mjv-selection-')
+        cls.index = build(fx.selection_export(), os.path.join(cls._tmp.name, 'shared'))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(dir=self._tmp.name)
+
+    def check(self, check_id, index=None):
+        return [c for c in (index or self.index).checks if c['id'] == check_id][0]
+
+    def test_the_overview_describes_the_selection_in_plain_words(self):
+        check = self.check('selection')
+        self.assertEqual((check['level'], check['title'], check['detail']),
+                         ('info', 'The designer chose what to export', self.SENTENCE))
+        self.assertEqual(self.index.overview()['selection'], {
+            'chosen_at': '2026-03-19T09:00:00.000Z', 'moodboards': {'available': 4, 'exported': 2, 'left_out': 2},
+            'jobs': {'available': 25, 'exported': 10, 'left_out': 13, 'not_reviewed': 2},
+            'left_out_moodboard_ids': ['board-left']})
+        # What the designer left out is reported, never as a warning or an error.
+        self.assertEqual(checks(self.index), {
+            'extension_version': 'ok', 'status': 'ok', 'failures': 'ok', 'counts': 'ok', 'generated_job_ids': 'ok',
+            'scope': 'info', 'selection': 'info', 'unresolved_references': 'info', 'references_left_out': 'info',
+            'parent_gaps': 'info', 'parent_gaps_left_out': 'info'})
+        self.assertEqual((self.index.summary['warnings'], self.index.summary['errors']), (0, 0))
+        self.assertEqual(self.index.overview()['limitations'][-1], fx.SELECTION_LIMITATION)
+
+    def test_a_reference_to_a_left_out_moodboard_is_labelled_left_out(self):
+        detail = self.index.job_detail('job-niji')
+        self.assertEqual([(r['source'], r['link'], r['target'], r['reason']) for r in detail['references']],
+                         [('reference', 'left_out', None, 'the designer left this moodboard out of the export')])
+        self.assertEqual(detail['job']['codes'], [{'code': 'mbcodeL', 'type': 'moodboard', 'resolved': True}])
+        self.assertEqual((detail['moodboards'], detail['profiles']), ([], []))
+        # Not unresolved: neither listed as such nor offered as an unmatched code.
+        overview = self.index.overview()
+        self.assertEqual([(u['job_id'], u['code']) for u in overview['unresolved']['references']], [('job-grid-c', 'ucode9')])
+        self.assertEqual([u['code'] for u in self.index.profiles_list()['unmatched_codes']], ['ucode9'])
+        self.assertEqual([f['id'] for f in self.index.facets['profiles'] if f['unresolved']], ['code:ucode9'])
+        self.assertEqual(ids(self.index.query_jobs({'profile': 'code:mbcodeL'})), [])
+        self.assertEqual(self.check('references_left_out')['items'], [
+            {'job_id': 'job-niji', 'type': 'moodboard', 'id': 'board-left', 'code': 'mbcodeL', 'source': 'reference',
+             'reason': 'the designer left this moodboard out of the export'}])
+        self.assertEqual(self.check('unresolved_references')['title'], '1 personalization reference(s) could not be linked')
+
+    def test_a_left_out_parent_is_the_designers_choice_not_a_gap(self):
+        card = self.index.card('job-left-child')
+        self.assertEqual((card['parent_id'], card['parent_status']), ('job-left-parent', 'left_out'))
+        lineage = self.index.job_detail('job-left-child')['lineage']
+        self.assertEqual((lineage['parent'], lineage['ancestors']), ({'id': 'job-left-parent', 'status': 'left_out', 'index': 1}, []))
+        self.assertEqual(self.check('parent_gaps_left_out')['items'], [
+            {'job_id': 'job-left-child', 'parent_id': 'job-left-parent',
+             'reason': 'the designer left the parent out of this export'}])
+        # The ordinary gap stays one, and only it is unresolved.
+        self.assertEqual(self.check('parent_gaps')['title'], '1 job(s) have a parent outside this export')
+        self.assertEqual([g['job_id'] for g in self.index.overview()['unresolved']['parent_gaps']], ['job-gap'])
+        self.assertEqual(self.index.card('job-gap')['parent_status'], 'missing')
+        self.assertNotIn('parent_gaps_stale', checks(self.index))
+
+    def test_moodboards_say_how_many_generations_were_left_out(self):
+        items = {b['id']: b for b in self.index.moodboards()['items']}
+        self.assertEqual((items['board-1']['generated_left_out'], items['board-2']['generated_left_out']), (3, 0))
+        board = self.index.moodboard_detail('board-1')
+        self.assertEqual(board['moodboard']['generated_left_out'], 3)
+        self.assertEqual(board['notes'][0], '3 more generations made with this moodboard were left out by the designer.')
+        self.assertEqual([(g['job']['job_id'], g['link']) for g in board['generations']], [('job-grid-a', 'exporter')])
+        other = self.index.moodboard_detail('board-2')
+        self.assertEqual(other['moodboard']['generated_left_out'], 0)
+        self.assertFalse([n for n in other['notes'] if 'left out' in n])
+
+    def test_wording_for_single_items_and_for_nothing_left_out(self):
+        export = fx.selection_export()
+        export.meta['selection'].update(moodboards={'available': 1, 'exported': 1, 'left_out': 0},
+                                        jobs={'available': 12, 'exported': 10, 'left_out': 1, 'not_reviewed': 1})
+        export.boards[1]['generated_left_out'] = 1
+        export.boards[1]['generated_job_ids'] = []
+        export.jobs[3]['personalization_codes'] = []  # board-2 then has no generation in the export
+        export.jobs[3]['flags']['profile'] = []
+        index = build(export, self.tmp)
+        self.assertEqual(self.check('selection', index)['detail'],
+                         '1 of 1 moodboard and 10 of 12 generations. 1 generation was left out; '
+                         '1 generation appeared after choosing and was not exported.')
+        self.assertEqual(index.moodboard_detail('board-2')['notes'][0],
+                         '1 generation made with this moodboard was left out by the designer.')
+        export.meta['selection'].update(moodboards={'available': 1234, 'exported': 1234, 'left_out': 0},
+                                        jobs={'available': 1203, 'exported': 1203, 'left_out': 0, 'not_reviewed': 0})
+        index = build(export, os.path.join(self.tmp, 'again'))
+        self.assertEqual(self.check('selection', index)['detail'],
+                         '1,234 of 1,234 moodboards and 1,203 of 1,203 generations. Nothing was left out.')
+
+    def test_the_moodboard_id_wins_over_a_matching_code(self):
+        # The reference names the left-out board by id; board-1 sharing its code does not make it board-1's job.
+        export = fx.selection_export()
+        export.jobs[4]['personalization_codes'] = [fx.ref('moodboard', 'board-left', 'mbcodeA')]
+        export.jobs[4]['flags']['profile'] = ['mbcodeA']
+        index = build(export, self.tmp)
+        self.assertEqual([r['link'] for r in index.job_detail('job-niji')['references']], ['left_out'])
+        self.assertNotIn('job-niji', [g['job']['job_id'] for g in index.moodboard_detail('board-1')['generations']])
+
+    def test_a_left_out_id_that_names_an_exported_record_keeps_its_link(self):
+        export = fx.selection_export()
+        export.meta['selection']['left_out_moodboard_ids'] = ['board-left', 'board-1', 'profile-1']
+        index = build(export, self.tmp)
+        self.assertEqual(index.card('job-grid-a')['moodboards'],
+                         [{'id': 'board-1', 'name': 'Synthetic board one', 'link': 'exporter'}])
+        reference = index.job_detail('job-grid-b')['references'][0]
+        self.assertEqual(reference['link'], 'explicit')
+        self.assertIn('also equals the id of a moodboard the designer left out', reference['reason'])
+        problem = self.check('selection_invalid', index)
+        self.assertEqual(problem['level'], 'warning')
+        self.assertEqual(problem['items'], [{
+            'file': 'export_meta.json', 'field': 'selection.left_out_moodboard_ids', 'ids': ['board-1'],
+            'problem': '1 id(s) name moodboards that are in this export; they are shown as exported'}])
+
+    def test_unreadable_selection_values_are_a_warning_and_ignored(self):
+        export = fx.selection_export()
+        export.meta['selection'] = 'yes'
+        index = build(export, self.tmp)
+        self.assertEqual(self.check('selection_invalid', index)['items'],
+                         [{'file': 'export_meta.json', 'field': 'selection', 'problem': 'is a string, not an object; ignored'}])
+        self.assertNotIn('selection', checks(index))
+        self.assertNotIn('selection', index.overview())
+        self.assertEqual(index.job_detail('job-niji')['references'][0]['link'], 'unresolved')
+        self.assertEqual(index.summary['warnings'], 1)
+
+        export.meta['selection'] = {'chosen_at': 'soon', 'moodboards': [1], 'extra': True,
+                                    'jobs': {'available': -1, 'exported': 2.5, 'left_out': True, 'not_reviewed': '2', 'more': 0},
+                                    'left_out_moodboard_ids': ['board-left', 7, None, {}]}
+        export.boards[0]['generated_left_out'] = 'three'
+        export.boards[1]['generated_left_out'] = -1
+        index = build(export, os.path.join(self.tmp, 'parts'))
+        selection = index.overview()['selection']
+        self.assertEqual(selection, {'chosen_at': None, 'moodboards': {'available': None, 'exported': None, 'left_out': None},
+                                     'jobs': {'available': None, 'exported': None, 'left_out': None, 'not_reviewed': None},
+                                     'left_out_moodboard_ids': ['board-left', '7']})
+        self.assertEqual(self.check('selection', index)['detail'], 'export_meta.json records the choice, but not its numbers.')
+        problems = self.check('selection_invalid', index)['items']
+        self.assertEqual([(p['file'], p['field']) for p in problems], [
+            ('export_meta.json', 'selection.chosen_at'), ('export_meta.json', 'selection.moodboards'),
+            ('export_meta.json', 'selection.jobs.available'), ('export_meta.json', 'selection.jobs.exported'),
+            ('export_meta.json', 'selection.jobs.left_out'), ('export_meta.json', 'selection.jobs.not_reviewed'),
+            ('export_meta.json', 'selection.left_out_moodboard_ids'),
+            ('moodboards.jsonl', 'generated_left_out'), ('moodboards.jsonl', 'generated_left_out')])
+        self.assertEqual([p.get('id') for p in problems[-2:]], ['board-1', 'board-2'])
+        self.assertIn('2 value(s) are not ids', problems[6]['problem'])
+        self.assertEqual(index.moodboard_detail('board-1')['moodboard'].get('generated_left_out', 'absent'), 'absent')
+        self.assertEqual(index.job_detail('job-niji')['references'][0]['link'], 'left_out')  # the readable ids still count
+        unknown = {(i['file'], i['field']) for i in self.check('unknown_fields', index)['items']}
+        self.assertEqual(unknown, {('export_meta.json', 'selection.extra'), ('export_meta.json', 'selection.jobs.more')})
+        self.assertEqual((index.summary['warnings'], index.summary['errors']), (1, 0))
+
+    def test_only_a_true_left_out_flag_marks_a_parent(self):
+        export = fx.selection_export()
+        export.meta['parent_gaps'][-1]['left_out'] = 'yes'
+        export.meta['parent_gaps'][0]['left_out'] = 1
+        index = build(export, self.tmp)
+        self.assertEqual(index.card('job-left-child')['parent_status'], 'missing')
+        self.assertNotIn('parent_gaps_left_out', checks(index))
+        self.assertEqual([g['job_id'] for g in index.overview()['unresolved']['parent_gaps']], ['job-gap', 'job-left-child'])
+
+    def test_a_null_selection_reads_exactly_like_an_export_without_one(self):
+        # The exporter writes selection: null when the designer did not choose; older exporters write no key.
+        plain = build(fx.standard_export(), os.path.join(self.tmp, 'plain'))
+        export = fx.standard_export()
+        export.meta['selection'] = None
+        chosen_nothing = build(export, os.path.join(self.tmp, 'null'))
+        self.assertEqual(outputs(chosen_nothing), outputs(plain))
+        self.assertIsNone(chosen_nothing.selection)
+        for index in (plain, chosen_nothing):
+            self.assertNotIn('selection', index.overview())
+            self.assertFalse([b for b in index.moodboards()['items'] if 'generated_left_out' in b])
+            self.assertNotIn('generated_left_out', index.moodboard_detail('board-1')['moodboard'])
+
+
 class RobustnessTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix='mjv-robust-')

@@ -38,7 +38,8 @@ class CheckTests(unittest.TestCase):
         self.assertEqual((report['ok'], report['path_name'], report['error']), (True, 'good.zip', None))
         root = report['exports'][0]
         self.assertEqual(set(root), {'root', 'status', 'extension_version', 'version_support', 'export_time', 'counts',
-                                     'errors', 'warnings'})
+                                     'selection', 'errors', 'warnings'})
+        self.assertIsNone(root['selection'])  # the designer did not choose what to export
         self.assertEqual((root['root'], root['status'], root['extension_version'], root['version_support']),
                          (fx.ROOT, 'complete', '0.3.1', 'supported'))
         self.assertEqual(root['export_time'], '2026-03-20T12:00:00.000Z')
@@ -50,6 +51,32 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn('good.zip: OK', out)
         self.assertIn('9 jobs, 2 moodboards, 2 profiles, 1 likes; images 33 of 33 present, 0 missing', out)
+
+    def test_a_selection_is_described_and_what_was_left_out_is_no_problem(self):
+        path = fx.write_zip(fx.selection_export(), os.path.join(self.base, 'chosen.zip'))
+        status, out, err = run('--check', path, '--json')
+        self.assertEqual((status, err), (0, ''))
+        root = json.loads(out)['exports'][0]
+        sentence = ('The designer chose what to export: 2 of 4 moodboards and 10 of 25 generations. 13 generations and '
+                    '2 moodboards were left out; 2 generations appeared after choosing and were not exported.')
+        self.assertEqual(root['selection'], {
+            'chosen_at': '2026-03-19T09:00:00.000Z', 'moodboards': {'available': 4, 'exported': 2, 'left_out': 2},
+            'jobs': {'available': 25, 'exported': 10, 'left_out': 13, 'not_reviewed': 2}, 'text': sentence})
+        self.assertNotIn('board-left', out)  # numbers only: the report names no moodboard
+        self.assertEqual((root['errors'], root['warnings']), ([], []))
+        self.assertEqual(root['counts']['jobs'], 10)
+        status, out, _ = run('--check', path)
+        self.assertEqual(status, 0)
+        self.assertIn('\n  ' + sentence + '\n', out)
+        # A selection record this viewer cannot read is a warning, never an error.
+        export = fx.selection_export()
+        export.meta['selection'] = ['not', 'an', 'object']
+        path = fx.write_zip(export, os.path.join(self.base, 'odd.zip'))
+        status, out, _ = run('--check', path, '--json')
+        root = json.loads(out)['exports'][0]
+        self.assertEqual((status, root['selection'], root['errors']), (0, None, []))
+        self.assertEqual(len(root['warnings']), 1)
+        self.assertTrue(root['warnings'][0].startswith('Some selection details were ignored'), root['warnings'])
 
     def test_errors_and_warnings_exit_1(self):
         export = fx.standard_export()

@@ -12,10 +12,14 @@ Relationship rules (the viewer never invents a relationship):
   flag code that is one of the board's codes).
 * Profile <-> job: 'explicit' when a reference id equals the profile id,
   'inferred_code' when only a code matches.
+* A reference whose id names no exported record but a moodboard the designer
+  left out of the export (export_meta.selection.left_out_moodboard_ids) is
+  'left_out', whatever its code matches.
 * A reference that matches nothing is 'unresolved' and stays visible as an
   unmatched code.
 * Lineage uses parent_id only. parent_index comes from parent_index, else an
-  integer parent_grid. Walks are guarded against cycles.
+  integer parent_grid. Walks are guarded against cycles. A parent that
+  export_meta.parent_gaps marks left_out is 'left_out' rather than 'missing'.
 """
 from __future__ import annotations
 
@@ -48,8 +52,12 @@ MAX_LIMIT = 500
 SUMMARY_COUNTS = ('jobs', 'moodboards', 'profiles', 'likes', 'images_expected', 'images_present')
 
 KNOWN_META = {'extension_version', 'export_time', 'username', 'scope', 'status', 'counts',
-              'failures', 'parent_gaps', 'feed_exhausted', 'limitations'}
+              'failures', 'parent_gaps', 'feed_exhausted', 'limitations', 'selection'}
 KNOWN_SCOPE = {'mode', 'max', 'since', 'images', 'testSubset'}
+# export_meta.selection, written when the designer chose what to export (null when they did not).
+KNOWN_SELECTION = {'chosen_at', 'moodboards', 'jobs', 'left_out_moodboard_ids'}
+SELECTION_COUNTS = (('moodboards', ('available', 'exported', 'left_out')),
+                    ('jobs', ('available', 'exported', 'left_out', 'not_reviewed')))
 KNOWN_COUNTS = {'jobs', 'moodboards', 'profiles', 'likes', 'files', 'completed_jobs', 'download_bytes'}
 KNOWN_JOB = {'job_id', 'created_at', 'prompt', 'full_command', 'flags', 'profile_default',
              'unknown_flags', 'parent_id', 'parent_index', 'kind', 'image_files', 'image_urls',
@@ -57,7 +65,8 @@ KNOWN_JOB = {'job_id', 'created_at', 'prompt', 'full_command', 'flags', 'profile
              'image_likes', 'video'}
 KNOWN_FLAGS = {'ar', 'v', 'stylize', 'chaos', 'weird', 'sref', 'profile', 'niji', 'raw', 'tile', 'iw'}
 KNOWN_REFERENCE = {'code', 'id', 'type', 'user_id'}
-KNOWN_BOARD = {'id', 'code', 'codes', 'name', 'version', 'created_at', 'generated_job_ids', 'images'}
+KNOWN_BOARD = {'id', 'code', 'codes', 'name', 'version', 'created_at', 'generated_job_ids', 'images',
+               'generated_left_out'}
 KNOWN_BOARD_IMAGE = {'source_url', 'file', 'width', 'height'}
 KNOWN_PROFILE = {'id', 'codes', 'name', 'version', 'created_at', 'ratings_count', 'service', 'type'}
 KNOWN_LIKE = {'job_id', 'image_likes'}
@@ -163,6 +172,11 @@ def _capped(items: list, limit: int = MAX_CHECK_ITEMS) -> Tuple[list, str]:
     if len(items) <= limit:
         return items, ''
     return items[:limit], ' Showing the first %d of %d.' % (limit, len(items))
+
+
+def _things(n: int, one: str) -> str:
+    """'1 moodboard', '1,203 generations'."""
+    return '{:,} {}'.format(n, one if n == 1 else one + 's')
 
 
 # -------------------------------------------------------------------- dates
@@ -390,7 +404,7 @@ class _Job:
 
 class _Board:
     __slots__ = ('id', 'line', 'raw', 'name', 'code', 'codes', 'version', 'created_iso', 'created_raw',
-                 'generated', 'generated_state', 'slots', 'unknown_fields', 'links',
+                 'generated', 'generated_state', 'generated_left_out', 'slots', 'unknown_fields', 'links',
                  'unresolved_generated', 'omitted')
 
 
@@ -476,6 +490,52 @@ class ExportIndex:
             state.update(state='invalid', detail='top level is %s, not an object' % _json_type(value))
             return
         self.meta = value
+
+    def _read_selection(self) -> None:
+        """export_meta.selection: absent or null when the designer did not choose. A value that is missing or of
+        the wrong type is ignored and listed (a warning); the readable rest is used."""
+        self.selection: Optional[dict] = None
+        self.selection_problems: List[dict] = []
+        raw = self.meta.get('selection') if self.meta is not None else None
+        if raw is None:
+            return
+        problems = self.selection_problems
+
+        def problem(field: str, text: str) -> None:
+            problems.append({'file': META_FILE, 'field': field, 'problem': text})
+
+        if not isinstance(raw, dict):
+            problem('selection', 'is %s, not an object; ignored' % _json_type(raw))
+            return
+        self._note_unknown(META_FILE, ['selection.' + k for k in raw if k not in KNOWN_SELECTION])
+        chosen = parse_date(raw.get('chosen_at'))
+        if chosen is None:
+            problem('selection.chosen_at', 'missing or not a date')
+        selection: dict = {'chosen_at': iso_utc(chosen)}
+        for group, keys in SELECTION_COUNTS:
+            block = raw.get(group)
+            counts = dict.fromkeys(keys)
+            if isinstance(block, dict):
+                self._note_unknown(META_FILE, ['selection.%s.%s' % (group, k) for k in block if k not in keys])
+                for key in keys:
+                    value = block.get(key)
+                    if _is_int(value) and value >= 0:
+                        counts[key] = value
+                    else:
+                        problem('selection.%s.%s' % (group, key), 'missing or not a whole number of 0 or more')
+            else:
+                problem('selection.' + group, 'missing or not an object')
+            selection[group] = counts
+        ids = raw.get('left_out_moodboard_ids')
+        if isinstance(ids, list):
+            selection['left_out_moodboard_ids'] = _dedupe(x for x in (_as_id(v) for v in ids) if x)
+            bad = sum(1 for v in ids if _as_id(v) is None)
+            if bad:
+                problem('selection.left_out_moodboard_ids', '%d value(s) are not ids; ignored' % bad)
+        else:
+            selection['left_out_moodboard_ids'] = []
+            problem('selection.left_out_moodboard_ids', 'missing or not a list')
+        self.selection = selection
 
     def _iter_lines(self, name: str):
         pieces: List[bytes] = []
@@ -659,6 +719,7 @@ class ExportIndex:
                 self._note_unknown(META_FILE, ['scope.' + k for k in self.scope if k not in KNOWN_SCOPE])
             if isinstance(self.meta.get('counts'), dict):
                 self._note_unknown(META_FILE, ['counts.' + k for k in self.meta['counts'] if k not in KNOWN_COUNTS])
+        self._read_selection()
         self._build_jobs(rows[JOBS])
         self._build_boards(rows[BOARDS])
         self._build_profiles(rows[PROFILES])
@@ -818,6 +879,9 @@ class ExportIndex:
                     board.generated_state = 'present'
                 else:
                     board.generated, board.generated_state = None, 'invalid'
+                # Written only when the designer chose what to export: generations not exported because of it.
+                left_out = row.get('generated_left_out')
+                board.generated_left_out = left_out if _is_int(left_out) and left_out >= 0 else None
                 images = row.get('images') if isinstance(row.get('images'), list) else []
                 board.slots = []
                 for index, image in enumerate(images):
@@ -840,6 +904,9 @@ class ExportIndex:
                 unknown += ['images[].' + k for im in images if isinstance(im, dict) for k in im if k not in KNOWN_BOARD_IMAGE]
                 board.unknown_fields = self._note_unknown(BOARDS, unknown)
                 self.boards[board_id] = board
+                if 'generated_left_out' in row and board.generated_left_out is None:
+                    self.selection_problems.append({'file': BOARDS, 'line': line, 'id': board_id, 'field': 'generated_left_out',
+                                                    'problem': 'not a whole number of 0 or more; ignored'})
             except Exception as exc:  # a value nothing anticipated skips its row, not the export root
                 self.row_problems.append({'file': BOARDS, 'line': line,
                                           'message': 'row could not be read (%s); skipped' % type(exc).__name__})
@@ -912,6 +979,14 @@ class ExportIndex:
         coded_profiles: Dict[str, Dict[str, str]] = defaultdict(dict)
         self.unmatched: Dict[str, dict] = {}
         self.unresolved_refs: List[dict] = []
+        self.left_out_refs: List[dict] = []
+        left_out_ids = self.selection['left_out_moodboard_ids'] if self.selection else []
+        left_out_boards = set(left_out_ids)
+        in_export = [board_id for board_id in left_out_ids if board_id in self.boards]
+        if in_export:
+            self.selection_problems.append({
+                'file': META_FILE, 'field': 'selection.left_out_moodboard_ids', 'ids': in_export,
+                'problem': '%d id(s) name moodboards that are in this export; they are shown as exported' % len(in_export)})
 
         def unmatched(code: str, kind: str, job_id: str) -> None:
             entry = self.unmatched.setdefault(code, {'types': [], 'job_ids': []})
@@ -937,6 +1012,8 @@ class ExportIndex:
                     reason = 'reference id equals the %s id' % matched[0]
                     if len(matched) > 1:
                         reason += '; it also equals a %s id' % matched[1]
+                    if 'moodboard' not in matched and ref['id'] in left_out_boards:
+                        reason += '; it also equals the id of a moodboard the designer left out of the export'
                     entry.update(link='explicit', target=self._target(matched[0], ref['id']), reason=reason)
                     # Like the exporter (lib/normalize.js), an id links to every record that has it,
                     # whatever the reference type says.
@@ -944,6 +1021,11 @@ class ExportIndex:
                         explicit_boards[ref['id']].append(job.id)
                     if 'profile' in matched:
                         explicit_profiles[ref['id']][job.id] = "the job's personalization reference id equals the profile id"
+                elif ref['id'] in left_out_boards:
+                    # The id names the board itself, so a code that happens to match another record is not used.
+                    entry.update(link='left_out', reason='the designer left this moodboard out of the export')
+                    self.left_out_refs.append({'job_id': job.id, 'type': ref['type'], 'id': ref['id'],
+                                               'code': ref['code'], 'source': 'reference', 'reason': entry['reason']})
                 elif ref['code']:
                     boards = board_codes.get(ref['code'], [])
                     profiles = profile_codes.get(ref['code'], [])
@@ -1092,9 +1174,17 @@ class ExportIndex:
         self.gaps_listed = self.meta is not None and isinstance(self.meta.get('parent_gaps'), list)
         meta_gaps = self.meta['parent_gaps'] if self.gaps_listed else []
         reported = {(_as_id(g.get('job_id')), _as_id(g.get('parent_id'))) for g in meta_gaps if isinstance(g, dict)}
+        # The exporter marks a parent that was in scope but not exported because of the designer's selection.
+        left_out = {(_as_id(g.get('job_id')), _as_id(g.get('parent_id'))) for g in meta_gaps
+                    if isinstance(g, dict) and g.get('left_out') is True}
         self.gaps = []
+        self.left_out_gaps = []
         for job in self.jobs.values():
-            if job.parent_status == 'missing':
+            if job.parent_status == 'missing' and (job.id, job.parent_id) in left_out:
+                job.parent_status = 'left_out'
+                self.left_out_gaps.append({'job_id': job.id, 'parent_id': job.parent_id,
+                                           'reason': 'the designer left the parent out of this export'})
+            elif job.parent_status == 'missing':
                 self.gaps.append({'job_id': job.id, 'parent_id': job.parent_id,
                                   'reported_by_exporter': (job.id, job.parent_id) in reported if self.gaps_listed else None,
                                   'reason': 'the parent job is not in this export'})
@@ -1288,6 +1378,13 @@ class ExportIndex:
                 self._check('test_subset', 'warning', 'Small test export: one moodboard and one profile at most',
                             'Small test was on, so only the first moodboard and the first profile were exported. '
                             'References to the others stay unresolved.')
+        if self.selection is not None:
+            self._check('selection', 'info', 'The designer chose what to export',
+                        self._selection_text() or 'export_meta.json records the choice, but not its numbers.')
+        if self.selection_problems:
+            self._check('selection_invalid', 'warning', 'Some selection details were ignored',
+                        "Values about the designer's selection are missing, not understood or contradict the files, "
+                        'so the viewer ignored them. Everything else is shown as found.', self.selection_problems)
 
         failures = meta.get('failures') if meta else None
         if isinstance(failures, list) and failures:
@@ -1369,6 +1466,11 @@ class ExportIndex:
             self._check('unresolved_references', 'info',
                         '%d personalization reference(s) could not be linked' % len(self.unresolved_refs),
                         'They stay visible as unmatched codes and can be used as filters.', self.unresolved_refs)
+        if self.left_out_refs:
+            self._check('references_left_out', 'info',
+                        '%d personalization reference(s) point to moodboards the designer left out' % len(self.left_out_refs),
+                        'Those moodboards are not in this export, so the references are labelled left out, not unresolved.',
+                        self.left_out_refs)
 
         absent = [b.id for b in self.boards.values() if b.generated_state == 'absent']
         invalid = [b.id for b in self.boards.values() if b.generated_state == 'invalid']
@@ -1400,6 +1502,9 @@ class ExportIndex:
                 detail = 'All are listed in export_meta.parent_gaps.'
             self._check('parent_gaps', 'warning' if unreported else 'info',
                         '%d job(s) have a parent outside this export' % len(self.gaps), detail, self.gaps)
+        if self.left_out_gaps:
+            self._check('parent_gaps_left_out', 'info', '%d job(s) have a parent the designer left out' % len(self.left_out_gaps),
+                        "The parent was in the export's scope, but the designer chose not to export it.", self.left_out_gaps)
         if self.stale_gaps:
             self._check('parent_gaps_stale', 'warning', 'export_meta.parent_gaps lists entries that do not apply',
                         '', self.stale_gaps)
@@ -1427,6 +1532,28 @@ class ExportIndex:
         if scope.get('testSubset') is True:
             parts.append('small test on (one moodboard and one profile at most)')
         return '; '.join(parts)
+
+    def _selection_text(self) -> str:
+        """Plain wording of export_meta.selection; a number that was not readable is left out of it."""
+        boards, jobs = self.selection['moodboards'], self.selection['jobs']
+        chosen = ['%s of %s' % ('{:,}'.format(c['exported']), _things(c['available'], noun))
+                  for c, noun in ((boards, 'moodboard'), (jobs, 'generation'))
+                  if c['exported'] is not None and c['available'] is not None]
+        sentences = [' and '.join(chosen) + '.'] if chosen else []
+        left = [(n, noun) for n, noun in ((jobs['left_out'], 'generation'), (boards['left_out'], 'moodboard')) if n]
+        clauses = []
+        if left:
+            clauses.append('%s %s left out' % (' and '.join(_things(n, noun) for n, noun in left),
+                                               'was' if len(left) == 1 and left[0][0] == 1 else 'were'))
+        elif jobs['left_out'] == 0 and boards['left_out'] == 0:
+            clauses.append('Nothing was left out')
+        late = jobs['not_reviewed']
+        if late:
+            clauses.append('%s appeared after choosing and %s not exported' % (_things(late, 'generation'),
+                                                                              'was' if late == 1 else 'were'))
+        if clauses:
+            sentences.append('; '.join(clauses) + '.')
+        return ' '.join(sentences)
 
     def _missing_files(self) -> List[dict]:
         return [{'path': rec.rel, 'referenced_by': [_owner(o) for o in rec.referenced_by]}
@@ -1494,7 +1621,7 @@ class ExportIndex:
         meta = self.meta
         observed = self._observed_counts()
         listing = lambda key: meta.get(key) if meta and isinstance(meta.get(key), list) else []  # noqa: E731
-        return {
+        out = {
             'summary': self.summary,
             'meta': meta,
             'scope': self.scope,
@@ -1519,6 +1646,9 @@ class ExportIndex:
                 'unreadable': self._unreadable_files(),
             },
         }
+        if self.selection is not None:  # only exports where the designer chose what to export carry one
+            out['selection'] = self.selection
+        return out
 
     def query_jobs(self, params: Dict[str, str]) -> dict:
         terms = [t.casefold() for t in (params.get('q') or '').split()]
@@ -1637,6 +1767,8 @@ class ExportIndex:
                 'generations': self._generation_counts(board),
                 'cover': [r for r in refs if r['status'] == 'present'][:4],
             })
+            if board.generated_left_out is not None:
+                items[-1]['generated_left_out'] = board.generated_left_out
         return {'items': items, 'notes': self._board_notes()}
 
     def moodboard_detail(self, board_id: str) -> Optional[dict]:
@@ -1648,14 +1780,21 @@ class ExportIndex:
         for job_id, (link, evidence) in sorted(board.links.items(), key=lambda kv: order.get(kv[0], 0)):
             generations.append({'job': self._card(self.jobs[job_id]), 'link': link, 'evidence': evidence})
         notes = self._board_notes()
+        left_out = board.generated_left_out
+        if left_out:
+            notes.insert(0, '{:,} {}{} made with this moodboard {} left out by the designer.'.format(
+                left_out, 'more ' if generations else '', 'generation' if left_out == 1 else 'generations',
+                'was' if left_out == 1 else 'were'))
         if board.generated_state == 'absent':
             notes.append('This moodboard row has no generated_job_ids; generations are derived from explicit job references.')
         if board.unresolved_generated:
             notes.append('%d generated job id(s) point to jobs that are not in this export.' % len(board.unresolved_generated))
+        moodboard = {'id': board.id, 'name': board.name, 'code': board.code, 'codes': board.codes,
+                     'version': board.version, 'created_at': board.created_iso, 'created_at_raw': board.created_raw}
+        if board.generated_left_out is not None:
+            moodboard['generated_left_out'] = board.generated_left_out
         return {
-            'moodboard': {'id': board.id, 'name': board.name, 'code': board.code, 'codes': board.codes,
-                          'version': board.version, 'created_at': board.created_iso,
-                          'created_at_raw': board.created_raw},
+            'moodboard': moodboard,
             'raw': board.raw,
             'unknown_fields': board.unknown_fields,
             'references': [self._image_ref(slot) for slot in board.slots],

@@ -339,6 +339,53 @@ class ApiTests(ServerTestCase):
 
 
 
+class SelectionApiTests(ServerTestCase):
+    """An export in which the designer chose what to export (fixtures.selection_export())."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        path = fx.write_zip(fx.selection_export(), os.path.join(cls.data, 'chosen.zip'))
+        status, body = cls.live.post_json('/api/exports/open', {'path': path})
+        assert status == 200, body
+        cls.eid = body['exports'][0]['id']
+
+    def api(self, path):
+        status, body = self.live.get_json('/api/exports/%s%s' % (self.eid, path))
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_overview_adds_the_selection_and_reports_left_out_items_as_notes(self):
+        overview = self.api('/overview')
+        self.assertEqual(set(overview), {'summary', 'meta', 'scope', 'status', 'feed_exhausted', 'counts', 'failures',
+                                         'parent_gaps', 'limitations', 'checks', 'facets', 'unresolved', 'files',
+                                         'selection'})
+        self.assertEqual(overview['selection']['jobs'], {'available': 25, 'exported': 10, 'left_out': 13, 'not_reviewed': 2})
+        self.assertEqual(overview['selection']['left_out_moodboard_ids'], ['board-left'])
+        levels = {c['id']: c['level'] for c in overview['checks']}
+        self.assertEqual([levels[k] for k in ('selection', 'references_left_out', 'parent_gaps_left_out')], ['info'] * 3)
+        self.assertEqual((overview['summary']['warnings'], overview['summary']['errors']), (0, 0))
+        self.assertEqual([g['job_id'] for g in overview['unresolved']['parent_gaps']], ['job-gap'])
+        self.assertEqual([g.get('left_out') for g in overview['parent_gaps']], [None, True])  # as the exporter wrote them
+
+    def test_job_routes_label_left_out_references_and_parents(self):
+        detail = self.api('/jobs/job-niji')
+        self.assertEqual([(r['link'], r['id']) for r in detail['references']], [('left_out', 'board-left')])
+        child = self.api('/jobs/job-left-child')
+        self.assertEqual(child['lineage']['parent'], {'id': 'job-left-parent', 'status': 'left_out', 'index': 1})
+        cards = {c['job_id']: c for c in self.api('/jobs?kind=upscale')['items']}
+        self.assertEqual((cards['job-left-child']['parent_status'], cards['job-gap']['parent_status']), ('left_out', 'missing'))
+        self.assertEqual(self.api('/jobs?profile=' + urllib.parse.quote('code:mbcodeL'))['total'], 0)
+
+    def test_moodboard_routes_count_left_out_generations(self):
+        items = {b['id']: b for b in self.api('/moodboards')['items']}
+        self.assertEqual({k: v['generated_left_out'] for k, v in items.items()}, {'board-1': 3, 'board-2': 0})
+        board = self.api('/moodboards/board-1')
+        self.assertEqual(board['moodboard']['generated_left_out'], 3)
+        self.assertEqual(board['notes'][0], '3 more generations made with this moodboard were left out by the designer.')
+        self.assertEqual(self.live.get_json('/api/exports/%s/moodboards/board-left' % self.eid)[0], 404)
+
+
 class DamagedExportTests(ServerTestCase):
     """Exports that open only in part: each test opens its own, so ApiTests keeps its single export."""
 

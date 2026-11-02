@@ -24,6 +24,15 @@ def _check_text(check: dict) -> str:
     return '%s: %s' % (check['title'], detail) if detail else check['title']
 
 
+def _selection(index: ExportIndex) -> Optional[dict]:
+    """What the designer chose to export, as numbers and the overview's sentence (no ids), or None."""
+    if index.selection is None:
+        return None
+    text = [_check_text(c) for c in index.checks if c['id'] == 'selection']
+    return {'chosen_at': index.selection['chosen_at'], 'moodboards': dict(index.selection['moodboards']),
+            'jobs': dict(index.selection['jobs']), 'text': text[0] if text else None}
+
+
 def _root_report(index: ExportIndex) -> dict:
     summary = index.summary
     observed = index.overview()['counts']['observed']
@@ -34,6 +43,7 @@ def _root_report(index: ExportIndex) -> dict:
         'version_support': summary['version_support'],
         'export_time': summary['export_time'],
         'counts': {key: observed[key] for key in COUNT_KEYS},
+        'selection': _selection(index),
         'errors': [_check_text(c) for c in index.checks if c['level'] == 'error'],
         'warnings': [_check_text(c) for c in index.checks if c['level'] == 'warning'],
     }
@@ -63,7 +73,7 @@ def check_path(path: str, limits: Limits = Limits()) -> dict:
             except Exception as exc:  # report it like the server would, then check the other roots
                 report['exports'].append({
                     'root': root, 'status': None, 'extension_version': None, 'version_support': None,
-                    'export_time': None, 'counts': {key: 0 for key in COUNT_KEYS},
+                    'export_time': None, 'counts': {key: 0 for key in COUNT_KEYS}, 'selection': None,
                     'errors': ['could not read this export root (%s)' % type(exc).__name__], 'warnings': []})
                 continue
             report['exports'].append(_root_report(index))
@@ -86,6 +96,8 @@ def _human(report: dict) -> List[str]:
         lines.append('  %d jobs, %d moodboards, %d profiles, %d likes; images %d of %d present, %d missing' % (
             c['jobs'], c['moodboards'], c['profiles'], c['likes'], c['images_present'], c['images_expected'],
             c['images_missing']))
+        if e['selection'] and e['selection']['text']:
+            lines.append('  %s' % display_name(e['selection']['text'], 400))
         for level in ('errors', 'warnings'):
             for text in e[level]:
                 lines.append('  %s: %s' % (level[:-1], display_name(text, 400)))
