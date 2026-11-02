@@ -1188,8 +1188,8 @@ class DeleteFlowTests(FlowTestCase):
         hosted, session = self.start()
         before = self.stored()
         for faults, fault, text in ((self.blob.faults, '500', 'HTTP 500'), (self.blob.faults, '403', 'HTTP 403'),
-                                    (self.blob.write_faults, '500', 'HTTP 500'),
                                     (self.blob.write_faults, '403', 'write access may have expired'),
+                                    (self.blob.write_faults, '404', 'HTTP 404'),
                                     (self.blob.write_faults, '302', 'redirect')):
             with self.subTest(fault=fault, write=faults is self.blob.write_faults):
                 faults['catalog.json'] = fault
@@ -1221,6 +1221,48 @@ class DeleteFlowTests(FlowTestCase):
         self.assertEqual(self.blob.count(REDIRECT_TARGET), 0)
         self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 0)
         self.assert_no_secret(hosted.log.getvalue())
+
+    def test_a_write_without_a_clear_answer_is_checked_before_answering(self):
+        """Storage may store catalog.json and give no answer (a timeout, a reset) or a 5xx: the server reads it
+        again, and answers by whether this deletion's record is there."""
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        before = self.stored()
+        lose_the_read = lambda name, method: self.blob.faults.update({'catalog.json': '500'})
+        for before_write, says in ((None, 'catalog.json read again does not show the deletion'),
+                                   (lose_the_read, 'reading catalog.json again failed: '
+                                                   'catalog.json: storage answered HTTP 500')):
+            with self.subTest(says=says):
+                self.blob.write_faults['catalog.json'], self.blob.before_write = '500', before_write
+                try:
+                    status, answer = self.delete(hosted, session, mine)
+                finally:
+                    self.blob.write_faults.clear()
+                    self.blob.faults.clear()
+                    self.blob.before_write = None
+                self.assertEqual((status, answer['error']['code']), (502, 'delete_unconfirmed'))
+                self.assertEqual(answer['error']['message'], 'catalog.json: storage answered HTTP 500; could not confirm '
+                                 'whether the export was deleted (%s): reload the page to check' % says)
+                self.assertEqual(self.stored(), before)
+                self.assertIsNotNone(self.blob.file(mine['blob']))
+        self.assertEqual(self.blob.count(mine['blob'], method='DELETE'), 0)
+        # Stored, but the answer never arrived: deleted all the same, and answered so.
+        self.blob.write_faults['catalog.json'] = 'drop'
+        try:
+            self.assertEqual(self.delete(hosted, session, mine), (200, {'deleted': mine['id']}))
+        finally:
+            self.blob.write_faults.clear()
+        self.assertEqual([(s['id'], s['deleted_by']) for s in self.stored()['deleted']], [(mine['id'], 'alice@example.com')])
+        self.assertEqual(self.stored()['exports'], [])
+        self.assertIsNone(self.blob.file(mine['blob']))
+        listing = json.loads(hosted.get('/api/exports', session)[2])
+        self.assertEqual(listing['catalog']['items'], [])
+        log = hosted.log.getvalue()
+        for line in ('catalog: no clear answer to the write of catalog.json (catalog.json: storage unreachable',
+                     'catalog: the write of catalog.json was stored', 'deleted %s by alice@example.com' % mine['id']):
+            self.assertEqual(log.count(line), 1, line)
+        self.assert_no_secret(log)
 
     def test_a_catalog_that_would_not_read_back_is_never_written(self):
         mine = self.publish()

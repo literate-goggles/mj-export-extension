@@ -18,7 +18,8 @@ the way a blob container answers requests signed with a SAS:
   follows it), a truncated body (the full Content-Length, then the connection
   closes half way), a slow body (a pause before each chunk) and a body without
   Content-Length (it ends when the connection closes); for PUT and DELETE
-  (write_faults) 403, 404, 409, 412, 500 and a redirect. before_write(name,
+  (write_faults) 403, 404, 409, 412, 500, a redirect, and 'drop': the write is
+  done, then the connection closes without an answer. before_write(name,
   method), when set, runs before each PUT or DELETE is checked, to stand in for
   another writer that gets there first.
 
@@ -42,8 +43,9 @@ DEFAULT_QUERY = 'sv=2099-01-01&ss=b&srt=co&sp=rl&se=2099-12-31T00%3A00%3A00Z&sig
 DEFAULT_WRITE_QUERY = ('sv=2099-01-01&ss=b&srt=co&sp=rwdl&se=2099-12-31T00%3A00%3A00Z'
                        '&sig=TESTONLYwriteSig9876543210fedcbaSECRET%3D')
 FAULTS = ('403', '404', '500', '302', 'truncate', 'slow', 'nolength')
-WRITE_FAULTS = {'403': 'AuthorizationPermissionMismatch', '404': 'BlobNotFound', '409': 'LeaseIdMissing',
-                '412': 'ConditionNotMet', '500': 'InternalError'}
+WRITE_FAULTS = {'403': (403, 'AuthorizationPermissionMismatch'), '404': (404, 'BlobNotFound'),
+                '409': (409, 'LeaseIdMissing'), '412': (412, 'ConditionNotMet'), '500': (500, 'InternalError')}
+DROP = 'drop'  # a write fault: the write is done, but its answer never arrives
 REDIRECT_TARGET = 'redirected-here.zip'
 
 
@@ -160,11 +162,19 @@ class _Handler(BaseHTTPRequestHandler):
             record(302)
             self._plain(302, b'', {'Location': '%s/%s?%s' % (self.blob.base_url, REDIRECT_TARGET, query)})
             return True
-        if fault:
-            record(int(fault))
-            self._refuse(int(fault), WRITE_FAULTS[fault])
+        if fault in WRITE_FAULTS:
+            status, code = WRITE_FAULTS[fault]
+            record(status)
+            self._refuse(status, code)
             return True
         return False
+
+    def _answer_written(self, name: str, status: int, headers: Dict[str, str]) -> None:
+        """Answer a write that was done, unless the 'drop' fault says to hang up instead."""
+        if self.blob.write_faults.get(name) == DROP:
+            self.close_connection = True
+            return None
+        return self._plain(status, b'', headers)
 
     def do_PUT(self):  # noqa: N802
         name, query = self._target()
@@ -191,7 +201,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.blob.put(name, body)
             etag = self.blob.etag(name)
             record(201)
-        return self._plain(201, b'', {'ETag': etag})
+        return self._answer_written(name, 201, {'ETag': etag})
 
     def do_DELETE(self):  # noqa: N802
         name, query = self._target()
@@ -215,7 +225,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._refuse(412, 'ConditionNotMet')
             self.blob.remove(name)
             record(202)
-        return self._plain(202, b'')
+        return self._answer_written(name, 202, {})
 
     def _method_not_allowed(self):
         self.close_connection = True

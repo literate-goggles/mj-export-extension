@@ -63,7 +63,7 @@ MAINTENANCE_S = 60.0  # how often the catalog is re-read and unpublished exports
 MAX_GOOGLE_BYTES = 256 * 1024
 MAX_POST_BODY = 4096
 DELETE_STATUS = {'delete_disabled': 403, 'not_owner': 403, 'unknown_catalog_entry': 404, 'catalog_busy': 409,
-                 'storage_error': 502}
+                 'storage_error': 502, 'delete_unconfirmed': 502}
 _HOST_RE = re.compile(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?')
 _DOMAIN_RE = re.compile(r'(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]')
 _SIGNED_RE = re.compile(r'[A-Za-z0-9_-]{2,4000}\.[A-Za-z0-9_-]{43}')

@@ -937,7 +937,8 @@ class DeleteTests(unittest.TestCase):
         for text in texts:
             for secret in (self.blob.write_secret, self.blob.write_query, self.blob.secret, self.blob.query):
                 self.assertNotIn(secret, text)
-        self.assertEqual(json.loads(responses[-1][2])['error']['code'], 'storage_error')
+        self.assertEqual([json.loads(body)['error']['code'] for _, _, body in responses[-2:]],
+                         ['storage_error', 'delete_unconfirmed'])
 
 
 class CacheCheckTests(unittest.TestCase):

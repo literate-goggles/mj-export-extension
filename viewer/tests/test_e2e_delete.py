@@ -169,13 +169,13 @@ class DeleteBrowserTests(_BrowserCase):
         self.assertEqual(self.page.locator('#announcer').inner_text(), 'Deleted Coast studies')
 
     def test_a_failure_shows_the_servers_message_and_keeps_the_dialog(self):
-        self.blob.write_faults['catalog.json'] = '500'
+        self.blob.write_faults['catalog.json'] = '403'
         self.card(self.mine).locator('button', has_text='Delete…').click()
         self.dialog().locator('button', has_text='Delete export').click()
         error = self.dialog().locator('.confirm__error')
         error.wait_for(timeout=15000)
-        self.assertEqual(error.inner_text(),
-                         'Could not delete: catalog.json: storage answered HTTP 500; nothing was deleted')
+        self.assertEqual(error.inner_text(), 'Could not delete: catalog.json: storage refused the request (HTTP 403); '
+                                             'the write access may have expired; nothing was deleted')
         self.assertTrue(self.dialog().locator('button', has_text='Delete export').is_enabled())
         self.assertEqual(self.active('a.textContent'), 'Cancel')
         self.assertEqual(self.listed(), [self.mine['id'], self.theirs['id'], self.unowned['id']])
