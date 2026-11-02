@@ -106,7 +106,9 @@ usage problem such as a path that does not exist. The JSON fields are in
   Completeness checks are grouped by severity, the counts in `export_meta.json`
   sit next to what is really in the files, and missing, unreferenced and
   unreadable files, the exporter's failures, parent gaps and unresolved links
-  are listed.
+  are listed. When the designer chose what to export, the overview says so in
+  plain words and shows how many moodboards and generations were exported and
+  left out.
 - **Gallery:** every job as a card, newest first, with lazily loaded thumbnails
   (only the images in view load; more load as you scroll) and pages of 60 jobs
   added as you reach the end. A request the browser drops because the
@@ -119,13 +121,15 @@ usage problem such as a path that does not exist. The JSON fields are in
   parsed flags (unknown flags are kept as written), dimensions, kind with its
   `job_type` and `event_type`, version and where it came from, file paths and
   source URLs (shown as text, never loaded), the personalization references and
-  what each resolves to, the raw `jobs.jsonl` row, and the lineage: the chain of
-  parents up to the root, the image of the parent it was made from, and the
-  children made from it, all as links.
+  what each resolves to (a moodboard the designer left out of the export says
+  so), the raw `jobs.jsonl` row, and the lineage: the chain of parents up to the
+  root, the image of the parent it was made from, and the children made from
+  it, all as links. A parent the designer left out is shown as left out.
 - **Moodboards:** each board with its codes and counts. A board page keeps its
   **reference images** (the pictures saved on the board, in amber frames) apart
   from the **generations** (your jobs made using the board, as job cards), and
-  says how each generation is linked.
+  says how each generation is linked, and how many more generations made with
+  the board the designer left out of the export.
 - **Profiles:** custom profiles with their codes, aggregate rating counts and
   linked jobs; the global profiles the exporter synthesizes from counts; and
   personalization codes that match nothing in the export, each with its jobs.
@@ -147,13 +151,15 @@ The viewer never invents a relationship. Every link says where it comes from:
 | Derived from job reference | The job's personalization reference has the board's id, but the board row has no `generated_job_ids` (an older export), or that list leaves the job out. The second case is also reported as a warning, because the exporter builds the list from exactly these references. |
 | Explicit reference | A job's personalization reference has the profile's id. |
 | Inferred by code match | Only a code matches: a reference code or a `--profile` flag code is one of the board's or profile's codes. Likely, but not proven, so it is always marked and the "Explicit links only" switch hides it. |
+| Left out by the designer | The reference's id is a moodboard the designer chose not to export (`export_meta.json` lists it in `selection`), so there is nothing in the export to link to. It is not counted as unresolved. |
 | Unresolved | The reference matches nothing in the export, for example a `user` reference that has a code but no id. It stays visible as an unmatched code you can filter by. |
 
 Lineage uses `parent_id` only, never the feed's selection flags. The image a
 job was made from comes from `parent_index`, else from an integer
 `parent_grid`. A parent outside the export is shown as a gap (cross-checked
-with `export_meta.json`'s `parent_gaps`), and walks stop if parent links ever
-form a cycle. Ids are compared as exact strings.
+with `export_meta.json`'s `parent_gaps`), unless `parent_gaps` says the
+designer left it out; then it is shown as left out. Walks stop if parent links
+ever form a cycle. Ids are compared as exact strings.
 
 Other things the viewer shows as recorded rather than guessing:
 
@@ -188,6 +194,10 @@ The viewer copes with:
   that are missing, unreferenced, unreadable or not a supported raster type,
   and a root without `export_meta.json` (reported as an interrupted run while
   everything else is still shown);
+- exports in which the designer chose what to export (`selection` in
+  `export_meta.json`): what they left out is labelled as left out, never as
+  missing or unresolved, and selection values the viewer cannot read are
+  ignored with a warning;
 - an export that cannot be read at all: the server reports it and keeps
   running.
 
@@ -470,6 +480,15 @@ skipped unless enabled:
 ```sh
 python3 -m pip install --user playwright && python3 -m playwright install chromium
 MJV_E2E=1 python3 -m unittest tests.test_e2e_browser -v
+```
+
+`tests/test_e2e_selection.py`, opt-in the same way, opens a synthetic export
+in which the designer left moodboards, generations and a parent job out, and
+checks how the overview, job pages and moodboard pages show them. Its browser
+aborts every request that does not go to the viewer:
+
+```sh
+MJV_E2E=1 python3 -m unittest tests.test_e2e_selection -v
 ```
 
 CI (`.github/workflows/check.yml`) runs the unit tests on Python 3.12, once

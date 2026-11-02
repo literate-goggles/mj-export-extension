@@ -118,6 +118,7 @@ Top-level fields:
 - `scope` is `meta.scope`, or null.
 - `status` and `feed_exhausted` come from `meta`.
 - `failures`, `parent_gaps` and `limitations` are the metadata lists. They are `[]` when absent or not lists.
+- **Deviation (additive):** `selection` is there only when `meta.selection` records that the designer chose what to export: `{chosen_at, moodboards: {available, exported, left_out}, jobs: {available, exported, left_out, not_reviewed}, left_out_moodboard_ids}`. `chosen_at` is normalized ISO UTC, and a value the viewer cannot read is null (an id list `[]`); the `selection_invalid` warning names it. When the designer did not choose (`selection` null or absent) or `meta.selection` is not an object, the key is absent.
 
 `counts.observed` holds:
 
@@ -140,6 +141,8 @@ Top-level fields:
 | `feed` | info / warning | `feed_exhausted` is false (info in `max` mode, where stopping early is expected), or missing or not a boolean while `export_meta.json` exists (warning: the exporter leaves it out when a run stops before the feed was read once). |
 | `scope` | info | Always shown when `scope` exists: a plain summary. `max` is mentioned only in `max` mode and `since` only in `since` mode (`jobs created on or after <date> (00:00 UTC)`). |
 | `test_subset` | warning | `scope.testSubset` is true: at most one moodboard and one profile were exported. |
+| `selection` | info | **Deviation (additive).** The designer chose what to export. The detail says it in plain words, for example `2 of 4 moodboards and 10 of 25 generations. 13 generations and 2 moodboards were left out; 2 generations appeared after choosing and were not exported.` |
+| `selection_invalid` | warning | **Deviation (additive).** A value of `meta.selection` or a board's `generated_left_out` is missing or of the wrong type, or `left_out_moodboard_ids` names a board that is in the export. The value is ignored. Items: `{file, field, problem}`, plus `line` and `id` for a board row and `ids` for boards that are in the export. |
 | `failures` | ok / warning | The exporter reported failures. |
 | `counts` | ok / warning | `meta.counts` differs from the observed data. `files` is compared with `images_present`. |
 | `parse_errors` | warning | Skipped lines, as `{file, line, message}`. |
@@ -154,12 +157,14 @@ Top-level fields:
 | `jobs_without_files` | warning / info | A job has no recorded files (stopped or paused runs). |
 | `video` | info | Video jobs. Video media is not exported. |
 | `unresolved_references` | info | A reference or `--profile` code matches nothing. |
+| `references_left_out` | info | **Deviation (additive).** A reference names a moodboard the designer left out (link `left_out`), as `{job_id, type, id, code, source, reason}`. Such references are not unresolved. |
 | `generated_job_ids` | ok | Board links are consistent. |
 | `generated_job_ids_absent` | info | An older board row has no `generated_job_ids`, so its links are derived. |
 | `generated_job_ids_invalid` | warning | `generated_job_ids` is not a list. |
 | `generated_job_ids_unresolved` | warning | An id in `generated_job_ids` names a job that is not in the export. |
 | `generated_job_ids_omitted` | warning | An explicit id reference is missing from a present `generated_job_ids`. |
 | `parent_gaps` | info / warning | A parent is outside the export. The level is a warning when `meta.parent_gaps` does not list the gap. |
+| `parent_gaps_left_out` | info | **Deviation (additive).** `meta.parent_gaps` marks a missing parent `left_out: true` (exactly `true`): the designer left it out. Items `{job_id, parent_id, reason}`. These jobs are not counted under `parent_gaps`. |
 | `parent_gaps_stale` | warning | `meta.parent_gaps` lists a gap that does not apply. |
 | `lineage_cycle` | warning | Parent links form a cycle. |
 
@@ -173,9 +178,9 @@ Top-level fields:
 
 `unresolved` holds:
 
-- `references: [{job_id, type, id, code, source: 'reference'|'flag', reason}]`.
+- `references: [{job_id, type, id, code, source: 'reference'|'flag', reason}]`. References to a moodboard the designer left out are not listed.
 - `generated_job_ids: [{board_id, job_id}]`.
-- `parent_gaps: [{job_id, parent_id, reported_by_exporter, reason}]`: the observed gaps, cross-checked with `meta.parent_gaps`. `reported_by_exporter` is null when `export_meta.json` has no `parent_gaps` list to compare with.
+- `parent_gaps: [{job_id, parent_id, reported_by_exporter, reason}]`: the observed gaps, cross-checked with `meta.parent_gaps`. `reported_by_exporter` is null when `export_meta.json` has no `parent_gaps` list to compare with. Parents the designer left out are not listed.
 
 `files` holds:
 
@@ -210,11 +215,12 @@ Returns `{total, offset, limit, items: [JobCard]}`.
 {job_id, created_at, prompt, kind, kind_source: 'export'|'viewer',
  version: {value, label, source: 'flag'|'job_type'|'none'}, width, height,
  images: [ImageRef], moodboards: [{id, name, link}], profiles: [{id, name, link}],
- codes: [{code, type, resolved}], parent_id, parent_status: 'none'|'in_export'|'missing',
+ codes: [{code, type, resolved}], parent_id, parent_status: 'none'|'in_export'|'missing'|'left_out',
  child_count, liked}
 ```
 
 - `created_at` is normalized ISO UTC, or null. The original value stays in `raw`.
+- **Deviation (additive):** `parent_status` is `left_out` when the parent is not in the export because the designer left it out (`meta.parent_gaps` marks it `left_out: true`); every other parent outside the export is `missing`.
 - `kind_source` is `viewer` when the row had no usable `kind`. The viewer then applies the rules of `lib/normalize.js`, using the number of image slots in place of `batch_size`.
 - In `codes`, `type` is the reference type, or `flag` for a `--profile` code that has no matching reference.
 - `liked` is true when `image_likes` is non-empty or `likes.jsonl` lists the job.
@@ -257,7 +263,8 @@ Returns `{total, offset, limit, items: [JobCard]}`.
 - `children` are sorted by `parent_index`, then by date.
 - `cycle` is true when the ancestor walk repeats a job or the job belongs to a cycle.
 - `references` has one entry per raw reference, then one per extra `--profile` code. **Deviation (additive):** `source` is `reference` or `flag`.
-  - `link` is `explicit`, `inferred_code` or `unresolved`. As in `lib/normalize.js`, a reference id links to every exported board and profile with that id, whatever the reference `type`; `explicit` never depends on the type.
+  - `link` is `explicit`, `inferred_code`, `left_out` or `unresolved`. As in `lib/normalize.js`, a reference id links to every exported board and profile with that id, whatever the reference `type`; `explicit` never depends on the type.
+  - **Deviation (additive):** `left_out` means no exported board or profile has the id, but `meta.selection.left_out_moodboard_ids` lists it: the designer left that moodboard out. A code match is then not used, `target` is null, and the reference counts as resolved in `codes`, so it never becomes an unmatched code.
   - `target` is `{kind: 'moodboard'|'profile', id, name}`, or null. When an id matches both a board and a profile, `target` is the one the type names (a profile for type `profile`, else the board), `reason` mentions the other, and both links are made.
   - `reason` is always text, and inferred reasons start with `inferred:`.
 - `likes` lists the rows of `likes.jsonl` for this job, with line numbers.
@@ -268,11 +275,15 @@ Returns `{total, offset, limit, items: [JobCard]}`.
 
 **Deviation (additive):** `created_at_raw` is the value exactly as recorded (a string or number, else null). The exporter writes board dates without a time zone (`YYYY-MM-DD HH:MM:SS.ffffff`); `created_at` reads them as UTC, while the UI shows the raw value as written and says the zone is not recorded.
 
+**Deviation (additive):** `generated_left_out` is there only when the board row records it as a whole number of 0 or more (exports in which the designer chose what to export): how many generations made with the board were not exported because of that choice.
+
 ### `GET /api/exports/{id}/moodboards/{board_id}`
 
 `{moodboard: {id, name, code, codes, version, created_at, created_at_raw}, raw, unknown_fields, references: [ImageRef], generations: [{job: JobCard, link: 'exporter'|'derived'|'inferred_code', evidence}], unresolved_generated_job_ids: [ids], notes: [str]}`
 
 `references` are the board's own pictures. `generations` are jobs made with the board, newest first. The two lists never mix.
+
+**Deviation (additive):** `moodboard.generated_left_out` is there as in the list. When it is above 0, `notes` starts with `<N> more generations made with this moodboard were left out by the designer.` (without "more" when none of the board's generations is in the export).
 
 ### `GET /api/exports/{id}/profiles`
 
@@ -331,15 +342,17 @@ Returns `{total, offset, limit, items: [JobCard]}`.
 {ok, path_name, error,
  exports: [{root, status, extension_version, version_support, export_time,
             counts: {jobs, moodboards, profiles, likes, images_expected, images_present, images_missing},
+            selection,
             errors: [str], warnings: [str]}]}
 ```
 
 - `path_name` is the last component of `PATH` only, never the full path.
 - `root`, `status`, `extension_version`, `version_support` and `export_time` are as in `ExportSummary`; `counts` are the observed counts of the overview.
+- **Deviation (additive):** `selection` is null when the designer did not choose what to export (or the record cannot be read, which is a warning), else `{chosen_at, moodboards: {available, exported, left_out}, jobs: {available, exported, left_out, not_reviewed}, text}` as in the overview, with the `selection` check as `"<title>: <detail>"` in `text`. It names no moodboard. What the designer left out is never an error or a warning.
 - `errors` and `warnings` are the overview checks at that level, each as `"<title>: <detail>"` (or the title alone).
 - **Deviation (additive):** `error` is `null`, or `{code, message}` when the source cannot be opened at all (`unreadable`, `not_a_zip`, `bad_zip`, `too_many_entries`, `no_export_root`, ...); `exports` is then empty. A root that fails to load is listed with `errors: ["could not read this export root (<ExceptionType>)"]`, and the other roots are checked as usual.
 
-Without `--json` it prints a short summary per root, then `error:` and `warning:` lines.
+Without `--json` it prints a short summary per root (with the `selection` sentence, when there is one), then `error:` and `warning:` lines.
 
 ## Hosted mode
 
