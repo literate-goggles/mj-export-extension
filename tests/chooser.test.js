@@ -18,3 +18,8 @@ test('the chooser loads images only from the Midjourney CDN', () => {
   assert.match(source, /if\(parsed\.origin===CDN\)src=parsed\.href/);
   assert(!/\bfetch\(|XMLHttpRequest|sendBeacon|WebSocket/.test(source), 'the chooser makes no requests of its own');
 });
+
+test('the chooser says when the list was read and that profiles are always exported', () => {
+  assert(source.includes('`Your work as of ${asOf(scan.scanned_at)} · ${scopeLabel(scan.scope)}. Work you make later is not exported until you choose again.`'));
+  assert(source.includes("'Your profiles are always exported: they are not part of this choice.'"));
+});

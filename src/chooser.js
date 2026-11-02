@@ -56,7 +56,9 @@ h4{font-size:14px;font-weight:600}
 .main .empty{padding:20px 0;color:#94a3b8}
 .more{display:block;margin:18px auto 0}
 .bottom{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 20px;border-top:1px solid #1e293b;background:#0f172a}
-.summary{flex:1;min-width:220px;font-weight:600}
+.totals{flex:1;min-width:220px}
+.summary{font-weight:600}
+.totals .muted{margin-top:2px;font-size:12.5px}
 button{font:inherit;font-size:13px;line-height:1.3;padding:6px 12px;border:1px solid #475569;border-radius:6px;background:transparent;color:#e2e8f0;cursor:pointer}
 button:hover{background:#1e293b}
 button:disabled{opacity:.45;cursor:default}
@@ -146,7 +148,7 @@ input[type=checkbox]:disabled{cursor:default}
    h('div',{class:'body'},
     h('nav',{class:'side','aria-label':'Moodboards'},h('h3',{class:'side-title'},'Your moodboards'),boardRows.length?h('ul',{class:'groups'},boardRows.map(row=>row.item)):h('p',{class:'muted empty'},'No moodboards in this scan.'),h('ul',{class:'groups'},rows.filter(row=>row.group.board===null).map(row=>row.item))),
     main),
-   h('footer',{class:'bottom'},summary,confirmBar,buttons)));
+   h('footer',{class:'bottom'},h('div',{class:'totals'},summary,h('p',{class:'muted'},'Your profiles are always exported: they are not part of this choice.')),confirmBar,buttons)));
   backdrop.addEventListener('mousedown',event=>{if(event.target===backdrop)event.preventDefault();});
   root.append(backdrop);
   function show(group){
