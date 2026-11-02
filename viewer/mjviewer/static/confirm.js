@@ -1,7 +1,8 @@
 // A small modal dialog that asks before an action that cannot be undone. Focus
 // starts on Cancel; Esc and Cancel close it without acting. While the action
-// runs the buttons are disabled; when it fails, its message is shown and the
-// dialog stays open.
+// runs the buttons are disabled and the dialog stays open, whatever tries to
+// close it (a repeated Esc, its view going away); when the action fails, the
+// failure is shown and the dialog stays open.
 
 import {h, nextId} from './dom.js';
 import {str} from './format.js';
@@ -11,14 +12,17 @@ let current = null;
 /**
  * Show the dialog; action() runs when the danger button is pressed, and the
  * dialog closes once it has succeeded. Resolves true when it succeeded, false
- * when the dialog was cancelled. returnFocus() names where focus goes back to
- * on cancel when the element that opened the dialog is gone.
+ * when the dialog was cancelled. A failure is never dropped: failure(err) is
+ * shown in the dialog, and should the dialog be gone from the page by then,
+ * the promise rejects with the error so that the caller can say so on the
+ * page. returnFocus() names where focus goes back to on cancel when the
+ * element that opened the dialog is gone.
  */
-export function confirmAction({title, body = null, confirmLabel, busyLabel = 'Working…', failure = 'Could not finish',
-  action, returnFocus = null}) {
+export function confirmAction({title, body = null, confirmLabel, busyLabel = 'Working…',
+  failure = (err) => `Could not finish: ${str(err && err.message) || 'unknown error'}`, action, returnFocus = null}) {
   closeConfirm();
   const opener = document.activeElement;
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const titleId = nextId('confirm-title');
     const bodyId = nextId('confirm-body');
     const error = h('p', {class: 'confirm__error', role: 'alert', hidden: true});
@@ -31,6 +35,14 @@ export function confirmAction({title, body = null, confirmLabel, busyLabel = 'Wo
       h('div', {class: 'confirm__actions'}, cancel, go));
     let busy = false;
     let hidden = false;
+
+    function show() {
+      try {
+        dialog.showModal();
+      } catch {
+        dialog.setAttribute('open', '');
+      }
+    }
 
     function hide() {
       hidden = true;
@@ -62,11 +74,12 @@ export function confirmAction({title, body = null, confirmLabel, busyLabel = 'Wo
         cancel.disabled = false;
         go.disabled = false;
         go.textContent = confirmLabel;
-        if (hidden) {
-          resolve(false);
+        if (hidden || !dialog.isConnected || !dialog.open) {
+          hide();
+          reject(err);
           return;
         }
-        error.textContent = `${failure}: ${str(err && err.message) || 'unknown error'}`;
+        error.textContent = failure(err);
         error.hidden = false;
         cancel.focus();
         return;
@@ -82,24 +95,25 @@ export function confirmAction({title, body = null, confirmLabel, busyLabel = 'Wo
       dismiss();
     });
     dialog.addEventListener('close', () => {
-      // The browser may close it on a repeated Esc without a cancelable event; a running action still finishes.
+      // A repeated Esc may close it without a cancelable event: while the action runs, it opens again at once.
       if (hidden) return;
-      if (busy) hide();
-      else dismiss();
+      if (!busy) dismiss();
+      else if (dialog.isConnected) show();
     });
     document.body.append(dialog);
     document.documentElement.classList.add('is-locked');
-    try {
-      dialog.showModal();
-    } catch {
-      dialog.setAttribute('open', '');
-    }
+    show();
     cancel.focus();
-    current = {dialog, close: () => (busy ? hide() : dismiss())};
+    current = {dialog, close: dismiss};
   });
 }
 
-/** Close the dialog when its view goes away; an action already running still finishes. */
+/** Close the dialog when its view goes away; while its action runs it stays open until that ends. */
 export function closeConfirm() {
   if (current) current.close();
+}
+
+/** True while a confirmation dialog is open. */
+export function confirmOpen() {
+  return Boolean(current);
 }

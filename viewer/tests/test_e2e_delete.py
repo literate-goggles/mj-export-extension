@@ -31,6 +31,8 @@ except Exception:  # pragma: no cover - optional dependency
 ENABLED = os.environ.get('MJV_E2E') == '1'
 WIDTH, HEIGHT = 1280, 800
 LOCAL = ('127.0.0.1', 'localhost')
+REFUSED = ('Could not delete: catalog.json: storage refused the request (HTTP 403); the write access may have expired; '
+           'nothing was deleted')  # what the dialog says when storage refuses to write catalog.json
 
 
 class _BrowserCase(unittest.TestCase):
@@ -106,6 +108,7 @@ class DeleteBrowserTests(_BrowserCase):
 
     def setUp(self):
         self.google.reset()
+        self.blob.faults.clear()
         self.blob.write_faults.clear()
         self.blob.before_write = None
         self.mine = self.blob.put_export(self.zips['mine'], name='mj_export_alice_20260430.zip',
@@ -130,6 +133,17 @@ class DeleteBrowserTests(_BrowserCase):
 
     def active(self, script):
         return self.page.evaluate('() => { const a = document.activeElement; return %s; }' % script)
+
+    def dialog_open(self):
+        return self.page.evaluate("() => Boolean((document.querySelector('dialog.confirm') || {}).open)")
+
+    def refuse_slowly(self, seconds=1.5):
+        """The next write of catalog.json takes a while, then storage refuses it: nothing is deleted."""
+        def slow_then_refuse(name, method):
+            if name == 'catalog.json':
+                time.sleep(seconds)
+                self.blob.write_faults['catalog.json'] = '403'
+        self.blob.before_write = slow_then_refuse
 
     def test_the_owner_deletes_an_export_after_confirming(self):
         self.assertEqual(self.page.locator('.xcard--catalog').count(), 3)
@@ -176,8 +190,7 @@ class DeleteBrowserTests(_BrowserCase):
         self.dialog().locator('button', has_text='Delete export').click()
         error = self.dialog().locator('.confirm__error')
         error.wait_for(timeout=15000)
-        self.assertEqual(error.inner_text(), 'Could not delete: catalog.json: storage refused the request (HTTP 403); '
-                                             'the write access may have expired; nothing was deleted')
+        self.assertEqual(error.inner_text(), REFUSED)
         self.assertTrue(self.dialog().locator('button', has_text='Delete export').is_enabled())
         self.assertEqual(self.active('a.textContent'), 'Cancel')
         self.assertEqual(self.listed(), [self.mine['id'], self.theirs['id'], self.unowned['id']])
@@ -186,6 +199,60 @@ class DeleteBrowserTests(_BrowserCase):
         self.dialog().locator('button', has_text='Delete export').click()
         self.page.wait_for_selector('text=Deleted Coast studies.', timeout=15000)
         self.assertEqual(self.listed(), [self.theirs['id'], self.unowned['id']])
+
+    def test_the_dialog_stays_open_while_deleting_and_shows_a_failure(self):
+        """Chromium closes a modal dialog on a repeated Esc without a cancelable event; while the request runs the
+        dialog opens again, so that a failure is shown in it rather than nowhere."""
+        self.refuse_slowly()
+        self.card(self.mine).locator('button', has_text='Delete…').click()
+        self.dialog().locator('button', has_text='Delete export').click()
+        for _ in range(3):
+            self.page.wait_for_timeout(200)
+            self.page.keyboard.press('Escape')
+        self.page.wait_for_timeout(200)
+        self.assertTrue(self.dialog_open())
+        self.assertEqual(self.dialog().locator('button', has_text='Deleting…').count(), 1)
+        error = self.dialog().locator('.confirm__error')
+        error.wait_for(timeout=15000)
+        self.assertEqual(error.inner_text(), REFUSED)
+        self.assertTrue(self.dialog_open())
+        self.assertEqual(self.listed(), [self.mine['id'], self.theirs['id'], self.unowned['id']])
+        self.page.keyboard.press('Escape')  # nothing runs now: Esc cancels
+        self.dialog().wait_for(state='detached', timeout=15000)
+        self.assertEqual(self.page.locator('.xcard--catalog').count(), 3)
+
+    def test_a_failure_after_the_dialog_is_gone_is_shown_on_the_page(self):
+        self.refuse_slowly()
+        self.card(self.mine).locator('button', has_text='Delete…').click()
+        self.dialog().locator('button', has_text='Delete export').click()
+        self.page.wait_for_timeout(300)
+        self.page.evaluate("() => document.querySelector('dialog.confirm').remove()")
+        self.page.locator('.callout--err', has_text=REFUSED).wait_for(timeout=15000)
+        self.assertEqual(self.dialog().count(), 0)
+        self.assertFalse(self.page.evaluate("() => document.documentElement.classList.contains('is-locked')"))
+        self.assertEqual(self.listed(), [self.mine['id'], self.theirs['id'], self.unowned['id']])
+
+    def test_the_only_export_opening_leaves_an_open_dialog_alone(self):
+        """With one published export the first visit opens it and goes to its overview once it is ready, unless a
+        delete dialog is open by then: the dialog and the start page stay."""
+        only = self.blob.put_export(fx.export_zip_bytes(fx.gallery_export(30), root='mj_export_only_20260430'),
+                                    name='mj_export_only_20260430.zip', label='Only one', owner='alice@example.com')
+        self.blob.write_catalog([only])
+        self.blob.faults[only['blob']] = 'slow'
+        self.blob.chunk, self.blob.slow_delay = 512, 0.05
+        self.page.reload()
+        self.card(only).locator('button', has_text='Delete…').click()
+        self.dialog().wait_for(timeout=15000)
+        # Downloaded and ready: its card links to it, or (what must not happen) the overview is shown.
+        self.page.wait_for_function("() => location.hash.includes('/overview') || document.querySelector('.xcard__link')",
+                                    timeout=60000)
+        self.page.wait_for_timeout(500)
+        self.assertNotIn('/overview', self.page.evaluate('location.hash'))
+        self.assertTrue(self.dialog_open())
+        self.dialog().locator('button', has_text='Cancel').click()
+        self.dialog().wait_for(state='detached', timeout=15000)
+        self.assertNotIn('/overview', self.page.evaluate('location.hash'))
+        self.assertEqual(self.listed(), [only['id']])
 
     def test_the_dialog_says_what_the_storage_keeps_as_the_deployment_states_it(self):
         for days, says in ((None, "The storage's own settings decide whether a recoverable copy is kept."),

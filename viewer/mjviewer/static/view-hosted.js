@@ -1,6 +1,7 @@
 // Hosted start page: the exports published for this deployment. Opening one
 // downloads and checks it on the server (with progress), then shows its overview.
-// Its owner, or an administrator, can delete it from here after confirming.
+// Its owner, or an administrator, can delete it from here after confirming; a
+// failed deletion is always shown, in the dialog or else on the page.
 
 import {h, icon, fill} from './dom.js';
 import {hrefs, parseHash} from './router.js';
@@ -9,7 +10,7 @@ import {arr, str, obj, isNum, fmtInt, fmtBytes, plural} from './format.js';
 import {
   pageHead, section, statusBadge, supportBadge, badge, emptyState, errorState, loadingState, callout, timeEl, announce,
 } from './ui.js';
-import {confirmAction, closeConfirm} from './confirm.js';
+import {confirmAction, closeConfirm, confirmOpen} from './confirm.js';
 
 // The name of an export deleted while one of its views was open in this tab: the start page says it is gone.
 let deletedNotice = '';
@@ -145,8 +146,12 @@ export function renderHostedHome(root, route, ctx) {
       const exports = arr(ready.exports);
       if (!quiet) announce(`${itemLabel(ready)} is ready`);
       if (exports.length !== 1 || quiet) return;
-      if (go) location.replace(hrefs.overview(exports[0].id));  // no history entry that would open it again
-      else location.hash = hrefs.overview(exports[0].id);
+      if (go) {
+        if (confirmOpen()) return;  // a delete dialog is open: stay here (the card links to the export)
+        location.replace(hrefs.overview(exports[0].id));  // no history entry that would open it again
+      } else {
+        location.hash = hrefs.overview(exports[0].id);
+      }
     } catch (err) {
       if (isAbort(err) || !ctx.isActive()) return;
       // err.detail is the server's message alone: the card adds its own 'Could not open:'.
@@ -159,18 +164,26 @@ export function renderHostedHome(root, route, ctx) {
     const name = itemLabel(item);
     const days = await softDeleteDays();
     if (!ctx.isActive()) return;
-    const done = await confirmAction({
-      title: 'Delete this export?',
-      body: deleteSummary(item, days),
-      confirmLabel: 'Delete export',
-      busyLabel: 'Deleting…',
-      failure: 'Could not delete',
-      action: () => deleteExport(item.id),
-      returnFocus: () => {
-        const card = cards.get(item.id);
-        return card ? card.el.querySelector('.xcard__delete') : null;
-      },
-    });
+    let done;
+    try {
+      done = await confirmAction({
+        title: 'Delete this export?',
+        body: deleteSummary(item, days),
+        confirmLabel: 'Delete export',
+        busyLabel: 'Deleting…',
+        failure: deleteFailure,
+        action: () => deleteExport(item.id),
+        returnFocus: () => {
+          const card = cards.get(item.id);
+          return card ? card.el.querySelector('.xcard__delete') : null;
+        },
+      });
+    } catch (err) {
+      // The dialog was gone when deleting failed: say so on the start page, or above whatever view is open.
+      if (ctx.isActive()) fill(doneSlot, callout('err', h('p', null, deleteFailure(err))));
+      else pageNotice(deleteFailure(err));
+      return;
+    }
     if (!done) return;
     announce(`Deleted ${name}`);
     if (fromCatalogItem(parseHash(location.hash).exportId, item.id)) {
@@ -194,6 +207,21 @@ export function renderHostedHome(root, route, ctx) {
     stop();
     closeConfirm();
   };
+}
+
+/** What the delete dialog says when deleting failed. */
+function deleteFailure(err) {
+  return `Could not delete: ${str(err && err.message) || 'unknown error'}`;
+}
+
+/** An error callout above whatever view is open, until the reader dismisses it. */
+function pageNotice(text) {
+  const notices = document.getElementById('notices');
+  if (!notices) return;
+  const box = h('div', {class: 'page-notice'});
+  fill(box, callout('err', h('p', null, text),
+    h('p', null, h('button', {type: 'button', class: 'btn btn--sm', onclick: () => box.remove()}, 'Dismiss'))));
+  notices.append(box);
 }
 
 /** MJV_SOFT_DELETE_DAYS as /api/health reports it: a whole number of days, or null when not set or unknown. */
