@@ -64,7 +64,7 @@
    const identity=await ownIdentity();const {scan_data:scanned}=await chrome.storage.local.get('scan_data');
    if(!reusableScan(scanned,identity.user_id,options)){status((scanned?.user_id===identity.user_id&&sameScope(scanned.scope,options)?'Your last scan is more than 10 minutes old, so it scans again to show your latest work.':'There is no scan of this scope for this account yet, so it scans first.')+' Scanning reads your job list and downloads no images.');await scanScope(options,identity);}
    status('Choose what to export in the window over this page.');
-   choosing=true;try{return await chooser.open();}finally{choosing=false;}
+   choosing=true;try{return await chooser.open(options);}finally{choosing=false;}
   });
   if(!selection){status('Closed without saving. Nothing changed.');return;}
   const stored=await chrome.storage.local.get(['selection','run']);const saved=stored.run;

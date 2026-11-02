@@ -124,7 +124,7 @@ const boardFeed = {
   profiles: { profiles: [{ id: 'p1', title: 'Synthetic profile', majorVersion: '7', rankingCount: 3, service: 'main', type: 'profile', created: 0 }], counts: {} },
 };
 const allJobs = { mode: 'all', max: 20, since: '', images: true, testSubset: false };
-const scope = { mode: 'all', max: 20, since: '', testSubset: false };
+const scope = { mode: 'all', max: 20, since: '' };
 // Job 3 and board 102 are left out; job 5 was not seen when choosing.
 const selection = {
   user_id: 'self', scope, chosen_at: '2026-02-01T00:00:00.000Z',
@@ -314,11 +314,28 @@ test('choosing scans first when there is no scan for the account and scope, and 
   assert.deepEqual(old.ops, ['identity', 'jobs', 'moodboards', 'profiles']);
   assert(old.statuses.includes('Your last scan is more than 10 minutes old, so it scans again to show your latest work. Scanning reads your job list and downloads no images.'));
   assert(Date.parse(old.state.scan_data.scanned_at) > Date.parse(stale.scanned_at));
-  // A scan of another scope does not count.
+  // A scan of another scope does not count; Small test is not part of the scope.
   const otherScope = harness({ feed: boardFeed, stored: { scan_data: app.state.scan_data }, chooser });
-  await otherScope.run('choose', { ...allJobs, testSubset: true });
+  await otherScope.run('choose', { ...allJobs, mode: 'max' });
   assert.deepEqual(otherScope.ops, ['identity', 'jobs', 'moodboards', 'profiles']);
-  assert.equal(otherScope.state.scan_data.scope.testSubset, true);
+  assert.equal(otherScope.state.scan_data.scope.mode, 'max');
+  let shown;
+  const small = harness({ feed: boardFeed, stored: { scan_data: app.state.scan_data }, chooser: () => ({ async open(options) { shown = options; return null; } }) });
+  await small.run('choose', { ...allJobs, testSubset: true });
+  assert.deepEqual(small.ops, ['identity']);
+  assert.equal(shown.testSubset, true);
+});
+
+test('Small test does not change which choice applies, only how much of it is exported', async () => {
+  const app = harness({ feed: boardFeed, stored: { selection } });
+  await app.run('new', { ...allJobs, testSubset: true });
+  const { jobs, boards, profiles, meta } = app.output();
+  assert.equal(meta.status, 'complete');
+  assert.deepEqual(jobs.map(j => j.job_id), [1, 2, 4, 6].map(jobId));
+  assert.deepEqual(boards.map(b => b.id), ['101']);
+  assert.equal(profiles.length, 1);
+  assert.equal(meta.selection.chosen_at, selection.chosen_at);
+  for (const url of hiddenDownloads) assert(!app.downloads.includes(url), `${url} was downloaded`);
 });
 
 test('while the chooser is open, other commands are refused and nothing is exported', async () => {

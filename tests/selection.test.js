@@ -13,7 +13,7 @@ const job = (n, references = [], extra = {}) => normalizeJob({
   id: id(n), enqueue_time: `2026-01-${String(n).padStart(2, '0')}T10:00:00+00:00`, full_command: `synthetic prompt ${n} --ar 1:1`,
   batch_size: 4, personalization_codes: references, image_likes: [], ...extra,
 });
-const scope = {mode: 'all', max: 20, since: '', testSubset: false};
+const scope = {mode: 'all', max: 20, since: ''};
 const options = {...scope, images: true};
 const identity = {user_id: 'self', username_v2: 'synthetic'};
 function feed() {
@@ -151,8 +151,10 @@ test('scan data groups jobs by every own board they reference', () => {
     ['101', [id(1), id(2)]], ['102', [id(2), id(3)]], ['103', [id(5)]], ['104', []],
     [null, [id(4), id(6), id(7), id(8)]],
   ]);
-  // Small test still shows every board: it trims the export, not the choice.
-  assert.equal(compactScan(identity, {...options, testSubset: true}, data.jobs, data.moodboards).boards.length, 4);
+  // Small test still shows every board, and is not part of the scope: it trims the export, not the choice.
+  const small = compactScan(identity, {...options, testSubset: true}, data.jobs, data.moodboards);
+  assert.equal(small.boards.length, 4);
+  assert.deepEqual(small.scope, scope);
 });
 
 test('Choose reuses a scan of the same account and scope only while it is under ten minutes old', () => {
@@ -206,18 +208,19 @@ test('whole-board, single-generation and select-all changes', () => {
   assert.equal(summaryText({moodboards: {chosen: 1, total: 1}, jobs: {chosen: 0, total: 1}}), 'Exporting 1 of 1 moodboard · 0 of 1 generation');
 });
 
-test('a saved choice is restored only for its own account and scope', () => {
+test('the chooser starts from the latest saved choice for the account, whatever its scope', () => {
   const data = feed();
   const scan = compactScan(identity, options, data.jobs, data.moodboards);
-  const restored = initialChoice(scan, selection);
-  assert.equal(restored.jobs[id(3)], false);
-  assert.equal(restored.moodboards['102'], false);
-  // Items the saved choice never saw start ticked.
-  assert.equal(restored.jobs[id(5)], true);
-  assert.equal(restored.moodboards['104'], true);
-  for (const other of [{...selection, user_id: 'someone-else'}, {...selection, scope: {...scope, mode: 'max'}}, {...selection, scope: {...scope, testSubset: true}}]) {
-    assert(Object.values(initialChoice(scan, other).jobs).every(Boolean));
+  for (const saved of [selection, {...selection, scope: {...scope, mode: 'max', max: 3}}, {...selection, scope: {...scope, testSubset: true}}]) {
+    const restored = initialChoice(scan, saved);
+    assert.equal(restored.jobs[id(3)], false);
+    assert.equal(restored.moodboards['102'], false);
+    // Items the saved choice never saw start ticked.
+    assert.equal(restored.jobs[id(5)], true);
+    assert.equal(restored.moodboards['104'], true);
   }
+  assert(Object.values(initialChoice(scan, {...selection, user_id: 'someone-else'}).jobs).every(Boolean));
+  const restored = initialChoice(scan, selection);
   const saved = makeSelection(scan, restored, '2026-02-02T00:00:00.000Z');
   assert.deepEqual(Object.keys(saved), ['user_id', 'scope', 'chosen_at', 'jobs', 'moodboards']);
   assert.deepEqual(saved.scope, scope);
@@ -231,7 +234,9 @@ test('a saved selection is refused for another account or scope', () => {
   assert.equal(selectionProblem(selection, options, 'self'), null);
   assert.match(selectionProblem(selection, options, 'someone-else'), /another Midjourney account/);
   assert.match(selectionProblem(selection, {...options, mode: 'max', max: 20}), /made for All jobs, not Max 20 jobs\. Choose again for this scope, or clear the selection\./);
-  assert.match(selectionProblem(selection, {...options, testSubset: true}), /not All jobs · small test/);
+  // Small test and Include images are not part of the scope.
+  assert.equal(selectionProblem(selection, {...options, testSubset: true, images: false}, 'self'), null);
+  assert.equal(selectionProblem({...selection, scope: {...scope, testSubset: true}}, options, 'self'), null);
   assert.match(selectionProblem({...selection, scope: undefined}, options), /another scope/);
   // The scope check alone runs before the account is known.
   assert.equal(selectionProblem({...selection, user_id: 'someone-else'}, options), null);
@@ -239,7 +244,7 @@ test('a saved selection is refused for another account or scope', () => {
   assert(sameScope(scope, {...scope, max: 50, since: '2026-01-01'}));
   assert(!sameScope({...scope, mode: 'max'}, {...scope, mode: 'max', max: 21}));
   assert(!sameScope({...scope, mode: 'since', since: '2026-01-01'}, {...scope, mode: 'since', since: '2026-01-02'}));
-  assert.equal(scopeLabel({mode: 'since', since: '2026-01-01', testSubset: false}), 'Jobs since 2026-01-01');
+  assert.equal(scopeLabel({mode: 'since', since: '2026-01-01', testSubset: true}), 'Jobs since 2026-01-01');
 });
 
 test('the one-line selection summary says what Export and New export will use', () => {

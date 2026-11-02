@@ -123,17 +123,17 @@ function choiceOf(map, id) {
 function countLabel(n, word) {
  return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
+// A choice's scope. Include images and Small test change only what an export saves, so they are not part of it.
 function scopeOf(options) {
- return {mode: options.mode, max: options.max, since: options.since, testSubset: !!options.testSubset};
+ return {mode: options.mode, max: options.max, since: options.since};
 }
-// Images on or off does not change what is in scope; N and the date matter only in their own mode.
+// N and the date matter only in their own mode.
 function sameScope(a, b) {
- if (!a || !b || a.mode !== b.mode || !!a.testSubset !== !!b.testSubset) return false;
+ if (!a || !b || a.mode !== b.mode) return false;
  return (a.mode !== 'max' || a.max === b.max) && (a.mode !== 'since' || a.since === b.since);
 }
 function scopeLabel(scope) {
- const base = scope.mode === 'max' ? `Max ${scope.max} jobs` : scope.mode === 'since' ? `Jobs since ${scope.since}` : 'All jobs';
- return scope.testSubset ? `${base} · small test` : base;
+ return scope.mode === 'max' ? `Max ${scope.max} jobs` : scope.mode === 'since' ? `Jobs since ${scope.since}` : 'All jobs';
 }
 // Choose shows a scan of the same account and scope only while it is under ten minutes old; after that it scans again.
 function reusableScan(scan, userId, options, now = Date.now()) {
@@ -159,9 +159,9 @@ function chooserGroups(scan) {
  groups.push({key: 'other', board: null, name: 'Other generations', references: [], jobs: scan.jobs.filter(job => !job.boards?.length).map(job => job.id)});
  return groups;
 }
-// Everything starts ticked; a saved choice for the same account and scope restores its decisions.
+// Everything starts ticked; the latest saved choice for the same account restores its decisions, whatever its scope.
 function initialChoice(scan, saved) {
- const usable = !!saved && saved.user_id === scan.user_id && sameScope(saved.scope, scan.scope);
+ const usable = !!saved && saved.user_id === scan.user_id;
  const pick = (map, id) => (usable ? choiceOf(map, id) : undefined) ?? true;
  return {
   jobs: Object.fromEntries(scan.jobs.map(job => [job.id, pick(saved?.jobs, job.id)])),

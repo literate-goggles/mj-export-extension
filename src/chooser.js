@@ -103,13 +103,13 @@ input[type=checkbox]:disabled{cursor:default}
   img.addEventListener('error',()=>img.replaceWith(placeholder('No preview')),{once:true});
   img.src=src;return img;
  }
- // A second open while the window is being built or shown gets the same answer.
- function open(){
+ // A second open while the window is being built or shown gets the same answer. options: the export controls.
+ function open(options={}){
   if(current){current.focus();return current.done;}
-  if(!pending)pending=build().finally(()=>{pending=null;});
+  if(!pending)pending=build(options).finally(()=>{pending=null;});
   return pending;
  }
- async function build(){
+ async function build(options){
   const stored=await chrome.storage.local.get(['scan_data','selection']);const scan=stored.scan_data;
   if(!scan)throw new Error('Scan first, then choose what to export');
   const choice=initialChoice(scan,stored.selection),initial=JSON.stringify(choice),groups=chooserGroups(scan),jobs=new Map(scan.jobs.map(job=>[job.id,job]));
@@ -142,7 +142,7 @@ input[type=checkbox]:disabled{cursor:default}
     h('div',{class:'bar'},
      h('button',{type:'button','aria-label':'Select all moodboards and generations',onclick:()=>change(()=>setEverything(choice,true))},'Select all'),
      h('button',{type:'button','aria-label':'Select no moodboards and no generations',onclick:()=>change(()=>setEverything(choice,false))},'Select none'))),
-   scan.scope.testSubset?h('p',{class:'note'},'Small test is on: the export keeps only the first chosen moodboard and one profile.'):null,
+   options.testSubset?h('p',{class:'note'},'Small test is on: the export keeps only the first chosen moodboard and one profile.'):null,
    h('div',{class:'body'},
     h('nav',{class:'side','aria-label':'Moodboards'},h('h3',{class:'side-title'},'Your moodboards'),boardRows.length?h('ul',{class:'groups'},boardRows.map(row=>row.item)):h('p',{class:'muted empty'},'No moodboards in this scan.'),h('ul',{class:'groups'},rows.filter(row=>row.group.board===null).map(row=>row.item))),
     main),
