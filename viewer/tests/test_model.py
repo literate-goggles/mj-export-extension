@@ -480,6 +480,31 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(len(self.check('references_left_out', index)['items']), 2)
         self.assertEqual(index.overview()['selection']['left_out_moodboards_used'], 1)
 
+    def test_a_selection_with_nothing_in_scope_says_the_export_is_empty(self):
+        # A run that stops before it reads the feed writes a selection whose counts are all 0, and empty files.
+        export = fx.selection_export()
+        export.jobs, export.boards, export.profiles, export.likes = [], [], [], []
+        export.meta.update(status='stopped', parent_gaps=[],
+                           failures=[{'kind': 'run', 'id': 'export', 'reason': 'Run stopped'}])
+        del export.meta['feed_exhausted']
+        export.meta['selection'] = {
+            'chosen_at': '2026-03-19T09:00:00.000Z', 'left_out_moodboard_ids': [],
+            'moodboards': {'available': 0, 'exported': 0, 'left_out': 0},
+            'jobs': {'available': 0, 'exported': 0, 'left_out': 0, 'not_reviewed': 0}}
+        index = build(export.sync_counts(), self.tmp)
+        check = self.check('selection', index)
+        self.assertEqual((check['level'], check['detail']), ('info', ''))
+        self.assertEqual(check['title'], 'The designer chose what to export, but this export has no moodboards or generations')
+        self.assertNotIn('selection_invalid', checks(index))
+        # Rows beside an all-zero record: the numbers as recorded, never 'Nothing was left out'.
+        export = fx.selection_export()
+        export.meta['selection'].update(moodboards={'available': 0, 'exported': 0, 'left_out': 0},
+                                        jobs={'available': 0, 'exported': 0, 'left_out': 0, 'not_reviewed': 0})
+        index = build(export, os.path.join(self.tmp, 'rows'))
+        check = self.check('selection', index)
+        self.assertEqual((check['title'], check['detail']),
+                         ('The designer chose what to export', '0 of 0 moodboards and 0 of 0 generations.'))
+
     def test_the_moodboard_id_wins_over_a_matching_code(self):
         # The reference names the left-out board by id; board-1 sharing its code does not make it board-1's job.
         export = fx.selection_export()

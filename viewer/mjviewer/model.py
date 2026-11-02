@@ -1457,8 +1457,15 @@ class ExportIndex:
                             'Small test was on, so only the first moodboard and the first profile were exported. '
                             'References to the others stay unresolved.')
         if self.selection is not None:
-            self._check('selection', 'info', 'The designer chose what to export',
-                        self._selection_text() or 'export_meta.json records the choice, but not its numbers.')
+            boards, jobs = self.selection['moodboards'], self.selection['jobs']
+            if (boards['available'] == 0 and jobs['available'] == 0 and not self.selection_contradicted
+                    and not self.jobs and not self.boards):
+                # A run that stops before it reads the feed writes this all-zero selection beside empty files.
+                self._check('selection', 'info',
+                            'The designer chose what to export, but this export has no moodboards or generations')
+            else:
+                self._check('selection', 'info', 'The designer chose what to export',
+                            self._selection_text() or 'export_meta.json records the choice, but not its numbers.')
         if self.selection_problems:
             self._check('selection_invalid', 'warning', 'Some selection details are unreadable or do not add up',
                         "Values about the designer's selection are missing, not understood, or contradict each other "
@@ -1624,8 +1631,10 @@ class ExportIndex:
         if left:
             clauses.append('%s %s left out' % (' and '.join(_things(n, noun) for n, noun in left),
                                                'was' if len(left) == 1 and left[0][0] == 1 else 'were'))
-        elif jobs['left_out'] == 0 and boards['left_out'] == 0 and not self.selection_contradicted:
-            clauses.append('Nothing was left out')  # not when selection_invalid says the record contradicts itself
+        elif (jobs['left_out'] == 0 and boards['left_out'] == 0 and not self.selection_contradicted
+              and not (jobs['available'] == 0 and boards['available'] == 0)):
+            # Not when selection_invalid says the record contradicts itself, nor when there was nothing to choose from.
+            clauses.append('Nothing was left out')
         late = jobs['not_reviewed']
         if late:
             clauses.append('%s appeared after choosing and %s not exported' % (_things(late, 'generation'),
