@@ -45,6 +45,15 @@ ids = {j['job_id'] for j in jobs}
 assert len(ids) == len(jobs), 'Duplicate jobs'
 missing_parents = [j['job_id'] for j in jobs if j['parent_id'] and j['parent_id'] not in ids]
 assert len(missing_parents) == len(meta['parent_gaps']), 'Parent-gap report is inconsistent'
+# 0.4.0 and later: what the designer chose (null, or absent before 0.4.0, when nothing was chosen).
+selection = meta.get('selection')
+if selection:
+    assert selection['jobs']['exported'] == len(jobs), 'Selection job count differs from jobs.jsonl'
+    assert selection['moodboards']['exported'] == len(boards), 'Selection moodboard count differs from moodboards.jsonl'
+    for key, part in [('jobs', selection['jobs']), ('moodboards', selection['moodboards'])]:
+        assert part['exported'] + part['left_out'] + part.get('not_reviewed', 0) <= part['available'], f'Selection counts exceed what was available: {key}'
+    assert all(isinstance(b.get('generated_left_out'), int) for b in boards), 'A moodboard row has no generated_left_out'
+    assert not {b['id'] for b in boards} & set(selection['left_out_moodboard_ids']), 'A left-out moodboard has a row'
 references = []
 for job in jobs:
     if meta['scope']['images'] and not job.get('video'):
@@ -72,6 +81,8 @@ result = {
     'kinds': dict(collections.Counter(j['kind'] for j in jobs)),
     'parent_links': sum(bool(j['parent_id']) for j in jobs),
     'unresolved_parent_links': len(missing_parents),
+    'left_out_parents': sum(bool(g.get('left_out')) for g in meta['parent_gaps']),
+    'selection': selection,
     'image_types': dict(types), 'dimension_mismatches': dimension_mismatches,
     'image_bytes': sum((root / name).stat().st_size for name in checksums),
     'failures': meta['failures'], 'sha256': checksums,

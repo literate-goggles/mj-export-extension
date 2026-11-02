@@ -42,6 +42,15 @@ An own job detail rendered an original image at `https://cdn.midjourney.com/<job
 
 It tries `0_<index>.jpeg`, with a `.png` fallback when Chrome reports unavailable/bad content (it does not expose an exact HTTP status for downloads); these alternatives must belong to a job in an observed own-feed response. Other errors follow bounded retry rules. Moodboard URLs are used exactly as returned. Images outside the two permitted origins are reported and not fetched. All successful bytes are downloaded unchanged; MIME type determines the local suffix.
 
+## Chooser thumbnails
+
+The "Choose what to export" window shows small pictures so designers can recognize their work. These are ordinary image loads by the Midjourney page, like the site's own: the chooser sets the source of an image element in its window. They are not API calls, they do not go through the read scheduler, the page bridge or `chrome.downloads`, and nothing is saved.
+
+- A generation tries `https://cdn.midjourney.com/<job-id>/0_0_384_N.webp`, then `0_0.jpeg`, then `0_0.png`, and shows a neutral placeholder when all three fail. The `_384_N.webp` name is a best guess from the archive's own thumbnails, which were observed with size and quality parameters; whether the name works without them has not been verified, which is why the originals follow it. Only ids matching `^[a-f0-9-]{36}$` (any case) are used.
+- A moodboard reference image uses its URL as returned, and only when its origin is `https://cdn.midjourney.com`; anything else shows a placeholder and is never loaded.
+- Video jobs show a placeholder.
+- Pictures load lazily, only for the moodboard or group on screen and only for the page of about 120 cards shown.
+
 ## Likes
 
 The own feed exposes `image_likes`, and the archive UI has a Liked filter. `likes.jsonl` records this field for selected own jobs when nonempty. It is not a crawl of liked work by other creators. A separate all-account liked-items endpoint has not been verified.
