@@ -34,20 +34,41 @@
   }while(cursor);
   return {jobs,exhausted:!cursor};
  }
- async function getData(options){
-  const identity=await api('identity');
-  if(!identity?.username_v2||!identity.user_id)throw new Error('Current account identity is unavailable');
+ async function ownIdentity(){const identity=await api('identity');if(!identity?.username_v2||!identity.user_id)throw new Error('Current account identity is unavailable');return identity;}
+ // Raw boards and profiles: applySelection builds the rows from the jobs that are exported.
+ async function getData(options,identity){
+  identity=identity||await ownIdentity();
   if(run&&run.identity.user_id!==identity.user_id)throw new Error('Account changed: start a new export explicitly');
   const result=await collect(options);
-  const boards=normalizeBoards(await api('moodboards'),result.jobs);
-  const profiles=normalizeProfiles(await api('profiles'),identity,result.jobs);
-  return {identity,...result,boards,profiles};
+  const moodboards=await api('moodboards');
+  const profiles=await api('profiles');
+  return {identity,...result,moodboards,profiles};
  }
  function validateOptions(options){if(options.mode==='max'&&(!Number.isSafeInteger(options.max)||options.max<1))throw new Error('Maximum jobs must be a positive integer');if(options.mode==='since'&&(!options.since||!Number.isFinite(Date.parse(options.since))))throw new Error('Choose a valid since date');if(!['max','since','all'].includes(options.mode))throw new Error('Invalid scope');}
- async function scan(options){
+ async function exclusive(options,task){
   if(active)throw new Error('A run is already active in this tab');validateOptions(options);active=true;try{await worker({type:'acquire'});}catch(error){active=false;throw error;}paused=false;scheduler=new ReadScheduler();const savedRun=run;run=null;
-  try{const data=await getData(options);const available={moodboards:data.boards.length,profiles:data.profiles.length};if(options.testSubset){data.boards=data.boards.slice(0,1);data.profiles=data.profiles.slice(0,1);}const images=data.jobs.reduce((n,j)=>n+j.image_urls.length,0)+data.boards.reduce((n,b)=>n+b.images.length,0);const summary={scope:options,available,jobs:data.jobs.length,moodboards:data.boards.length,profiles:data.profiles.length,feed_exhausted:data.exhausted,estimated_bytes:images*1024*1024,estimate_basis:'Rough estimate: 1 MiB per image, not measured; no images fetched'};await chrome.storage.local.set({scan:summary});status(JSON.stringify(summary,null,2));}
-  finally{active=false;run=savedRun;await worker({type:'release'});}
+  try{return await task();}finally{active=false;run=savedRun;await worker({type:'release'});}
+ }
+ async function scanScope(options,identity){
+  const data=await getData(options,identity);const all=applySelection(data,null);const available={moodboards:all.boards.length,profiles:all.profiles.length};if(options.testSubset){all.boards=all.boards.slice(0,1);all.profiles=all.profiles.slice(0,1);}const images=data.jobs.reduce((n,j)=>n+j.image_urls.length,0)+all.boards.reduce((n,b)=>n+b.images.length,0);const summary={scope:options,available,jobs:data.jobs.length,moodboards:all.boards.length,profiles:all.profiles.length,feed_exhausted:data.exhausted,estimated_bytes:images*1024*1024,estimate_basis:'Rough estimate: 1 MiB per image, not measured; no images fetched'};
+  const scanData=compactScan(data.identity,options,data.jobs,data.moodboards);await chrome.storage.local.set({scan:summary,scan_data:scanData});status(JSON.stringify(summary,null,2));return scanData;
+ }
+ const scan=options=>exclusive(options,()=>scanScope(options));
+ async function showSelection(stored){if(!panel)return;const {selection,run:saved}=stored||await chrome.storage.local.get(['selection','run']);panel.querySelector('[data-selection]').textContent=selectionLine(selection,saved);}
+ // The chooser (src/chooser.js) saves the selection itself; a saved export keeps the one it started with.
+ async function choose(options){
+  const chooser=globalThis.mjExportChooser;if(!chooser)throw new Error('The chooser did not load: reload this page and try again');
+  await exclusive(options,async()=>{
+   const identity=await ownIdentity();const {scan_data:scanned}=await chrome.storage.local.get('scan_data');
+   if(scanned?.user_id===identity.user_id&&sameScope(scanned.scope,options))return;
+   status('There is no scan of this scope for this account yet, so it scans first. Scanning reads your job list and downloads no images.');await scanScope(options,identity);
+  });
+  status('Choose what to export in the window over this page.');
+  const selection=await chooser.open();
+  if(!selection){status('Closed without saving. Nothing changed.');return;}
+  const stored=await chrome.storage.local.get(['selection','run']);const saved=stored.run;
+  status(`Saved. ${summaryText(choiceCounts(selection))}. `+(!saved?'Export uses this choice.':saved.status==='complete'?'Use New export to export with this choice.':'Your unfinished export keeps the choice it started with: use New export to export with this one.'));
+  await showSelection(stored);
  }
  async function image(url,file){
   verifyPage();const prior=run.done_files[file];
@@ -70,7 +91,7 @@
  async function writeMetadata(){
   if(!run)return;
   const likes=run.jobs.filter(j=>j.image_likes?.length).map(j=>({job_id:j.job_id,image_likes:j.image_likes}));
-  const metadata={extension_version:chrome.runtime.getManifest().version,export_time:new Date().toISOString(),username:run.identity.username_v2,scope:run.options,status:run.status,counts:{jobs:run.jobs.length,moodboards:run.boards.length,profiles:run.profiles.length,likes:likes.length,files:Object.keys(run.done_files).length,completed_jobs:run.done_ids.length,download_bytes:Object.values(run.done_files).reduce((sum,f)=>sum+(f.bytes||0),0)},failures:run.failures,parent_gaps:parentGaps(run.jobs),feed_exhausted:run.exhausted,limitations:['Likes cover the selected own jobs only.','Profile codes are available only when present in exported job references or profile records.','Missing version and creation fields are null; image dimensions are API metadata.']};
+  const metadata={extension_version:chrome.runtime.getManifest().version,export_time:new Date().toISOString(),username:run.identity.username_v2,scope:run.options,selection:run.selection?run.selection_summary||null:null,status:run.status,counts:{jobs:run.jobs.length,moodboards:run.boards.length,profiles:run.profiles.length,likes:likes.length,files:Object.keys(run.done_files).length,completed_jobs:run.done_ids.length,download_bytes:Object.values(run.done_files).reduce((sum,f)=>sum+(f.bytes||0),0)},failures:run.failures,parent_gaps:parentGaps(run.jobs,run.left_out_parents),feed_exhausted:run.exhausted,limitations:['Likes cover the selected own jobs only.','Profile codes are available only when present in exported job references or profile records.','Missing version and creation fields are null; image dimensions are API metadata.',...(run.selection?['Items the designer left out are not in this export.']:[])]};
   const files={'jobs.jsonl':run.jobs,'moodboards.jsonl':run.boards,'profiles.jsonl':run.profiles,'likes.jsonl':likes};
   for(const [name,rows]of Object.entries(files)){const result=await worker({type:'text-file',filename:`${run.folder}/${name}`,text:rows.map(r=>JSON.stringify(r)).join('\n')+(rows.length?'\n':'')});run.lastDownloadId=result.id;}
   const result=await worker({type:'text-file',filename:`${run.folder}/export_meta.json`,text:JSON.stringify(metadata,null,2)+'\n'});run.lastDownloadId=result.id;run.local_folder=result.filename.replace(/[\\/][^\\/]+$/,'');await save();
@@ -80,21 +101,23 @@
   if(active)throw new Error('A run is already active in this tab');validateOptions(options);active=true;try{await worker({type:'acquire'});}catch(error){active=false;throw error;}paused=false;scheduler=new ReadScheduler();let writable=false;
   try{
    const stored=(await chrome.storage.local.get('run')).run;
-   run=newRun?null:stored;
+   run=newRun?null:stored;let selection=null;
    if(run){
     if(run.options.mode!==options.mode||run.options.max!==options.max||run.options.since!==options.since||run.options.testSubset!==options.testSubset)throw new Error('Scope differs from saved progress. Use New export to start a separate run.');
     run.options.images=options.images;run.failures=[];
-   }
+   }else{selection=(await chrome.storage.local.get('selection')).selection||null;const problem=selectionProblem(selection,options);if(problem)throw new Error(problem);}
    const identity=await api('identity');
    if(run&&run.identity.user_id!==identity.user_id)throw new Error('Account differs from saved export. Use New export.');
-   if(!run){const name=identity.username_v2.replace(/[^a-zA-Z0-9_.-]/g,'_');const date=new Date().toISOString().slice(0,10).replaceAll('-','');run={identity,folder:`mj_export_${name}_${date}${newRun?'_'+Date.now():''}`,options,done_ids:[],done_files:{},jobs:[],boards:[],profiles:[],failures:[],cursor:null,checkpoint:null};}
+   // A new run copies the saved selection; every later attempt of it uses that copy, never a newer choice.
+   if(!run){const problem=selectionProblem(selection,options,identity.user_id);if(problem)throw new Error(problem);const name=identity.username_v2.replace(/[^a-zA-Z0-9_.-]/g,'_');const date=new Date().toISOString().slice(0,10).replaceAll('-','');run={identity,folder:`mj_export_${name}_${date}${newRun?'_'+Date.now():''}`,options,selection,done_ids:[],done_files:{},jobs:[],boards:[],profiles:[],failures:[],cursor:null,checkpoint:null};if(selection){run.selection_summary=summarizeSelection(selection,[],[],[],[]);run.left_out_parents=[];}}
    writable=true;run.status='reading';await save();
    const data=await getData(options);
    // Revalidate ownership on every explicit resume before using saved download progress.
+   const chosen=applySelection(data,run.selection,options);
    const existing=new Map(run.jobs.map(j=>[j.job_id,j]));
-   run.jobs=data.jobs.map(j=>({...j,image_files:existing.get(j.job_id)?.image_files||[]}));
-   run.boards=options.testSubset?data.boards.slice(0,1):data.boards;
-   run.profiles=options.testSubset?data.profiles.slice(0,1):data.profiles;
+   run.jobs=chosen.jobs.map(j=>({...j,image_files:existing.get(j.job_id)?.image_files||[]}));
+   run.boards=chosen.boards;run.profiles=chosen.profiles;
+   if(run.selection){run.selection_summary=chosen.selection;run.left_out_parents=chosen.left_out_parents;}
    if(options.images)run.done_ids=run.done_ids.filter(id=>run.jobs.find(j=>j.job_id===id)?.image_files.length>0);
    run.exhausted=data.exhausted;run.status='exporting';await save();
    for(const job of run.jobs){
@@ -115,19 +138,21 @@
   }catch(error){
    if(run&&writable){run.status=paused?'paused':'stopped';failure('run','export',error.message);await save();await writeMetadata().catch(e=>status(`Export stopped: ${error.message}. Metadata save failed: ${e.message}`));}
    else status(error.message);
-  }finally{active=false;await worker({type:'release'});}
+  }finally{active=false;await worker({type:'release'});showSelection().catch(()=>{});}
  }
  async function command(name,options){
   if(name==='pause'){paused=true;scheduler?.stop();status('Pausing after current downloads finish');return;}
   if(name==='folder')return worker({type:'open-folder'});
   if(name==='scan')return scan(options);
+  if(name==='choose')return choose(options);
+  if(name==='clear'){await chrome.storage.local.remove('selection');status('Selection cleared. New exports include everything in the scope again.');return showSelection();}
   if(name==='resume'){const saved=(await chrome.storage.local.get('run')).run;if(!saved)throw new Error('No saved export to resume');return start(saved.options);}
   if(name==='export'||name==='new')return start(options,name==='new');
  }
  chrome.runtime.onMessage.addListener((m,sender,respond)=>{
   if(m.type==='run-state'){respond({active});return;}
   if(m.type==='command'){
-   if(active&&!['pause','folder'].includes(m.command)){respond({error:'Run already active'});return;}
+   if(active&&!['pause','folder','clear'].includes(m.command)){respond({error:'Run already active'});return;}
    command(m.command,m.options||opts()).catch(e=>status(e.message));respond({ok:true});
   }
  });
@@ -136,10 +161,11 @@
   if(!panel){
    panel=document.createElement('details');panel.id='mj-export-panel';
    panel.style.cssText='position:fixed;bottom:12px;right:12px;z-index:2147483647;width:440px;max-height:80vh;overflow:auto;background:#111827;color:#f8fafc;padding:14px;border:1px solid #64748b;border-radius:12px;font:13px system-ui;box-shadow:0 8px 30px #0008';
-   panel.innerHTML='<summary style="cursor:pointer;font-weight:700">MJ Export · Local export</summary><p>Your own work only. Keep this tab open.</p><label>Scope <select name="mode"><option value="max">Max N jobs</option><option value="since">Since date</option><option value="all" selected>All jobs</option></select></label> <label>N <input name="max" type="number" min="1" value="20" style="width:70px"></label><br><label>Since <input type="date" name="since"></label><p><label><input type="checkbox" name="images" checked> Include images</label><br><label><input type="checkbox" name="testSubset"> Small test: one board and one profile</label></p><div data-actions></div><pre data-status style="white-space:pre-wrap;max-height:280px;overflow:auto">Ready. All jobs and images selected; export starts only when you click.</pre><details><summary>API field names</summary><pre data-schema style="white-space:pre-wrap"></pre></details>';
-   for(const [name,label]of [['scan','Scan'],['export','Export / resume'],['pause','Pause'],['new','New export'],['folder','Open export folder']]){const b=document.createElement('button');b.type='button';b.textContent=label;b.style.cssText='padding:7px;margin:3px;color:#111;background:#e2e8f0;border-radius:5px;border:0';b.onclick=()=>command(name,opts()).catch(e=>status(e.message));panel.querySelector('[data-actions]').append(b);}
+   panel.innerHTML='<summary style="cursor:pointer;font-weight:700">MJ Export · Local export</summary><p>Your own work only. Keep this tab open.</p><label>Scope <select name="mode"><option value="max">Max N jobs</option><option value="since">Since date</option><option value="all" selected>All jobs</option></select></label> <label>N <input name="max" type="number" min="1" value="20" style="width:70px"></label><br><label>Since <input type="date" name="since"></label><p><label><input type="checkbox" name="images" checked> Include images</label><br><label><input type="checkbox" name="testSubset"> Small test: one board and one profile</label></p><p data-selection style="color:#cbd5e1"></p><div data-actions></div><pre data-status style="white-space:pre-wrap;max-height:280px;overflow:auto">Ready. All jobs and images selected; export starts only when you click.</pre><details><summary>API field names</summary><pre data-schema style="white-space:pre-wrap"></pre></details>';
+   for(const [name,label]of [['scan','Scan'],['choose','Choose what to export'],['clear','Clear selection'],['export','Export / resume'],['pause','Pause'],['new','New export'],['folder','Open export folder']]){const b=document.createElement('button');b.type='button';b.textContent=label;b.style.cssText='padding:7px;margin:3px;color:#111;background:#e2e8f0;border-radius:5px;border:0';b.onclick=()=>command(name,opts()).catch(e=>status(e.message));panel.querySelector('[data-actions]').append(b);}
+   panel.addEventListener('toggle',()=>{if(panel.open)showSelection().catch(()=>{});});
    document.body.append(panel);
-   const saved=(await chrome.storage.local.get('run')).run;
+   const stored=await chrome.storage.local.get(['run','selection']);const saved=stored.run;showSelection(stored);
    if(saved?.options && saved.status!=='complete'){for(const [key,value]of Object.entries(saved.options)){const field=panel.querySelector(`[name="${key}"]`);if(field){if(field.type==='checkbox')field.checked=!!value;else field.value=value;}}status(`Saved export: ${saved.status}. Export / resume continues these settings; New export starts a different scope.`);}
   }
   const {schemas={}}=await chrome.storage.local.get('schemas');panel.querySelector('[data-schema]').textContent=JSON.stringify(schemas,null,2);

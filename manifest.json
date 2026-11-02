@@ -37,6 +37,7 @@
       ],
       "js": [
         "src/generated/core.js",
+        "src/chooser.js",
         "src/content.js"
       ],
       "run_at": "document_start"

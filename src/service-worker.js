@@ -34,6 +34,7 @@ chrome.runtime.onMessage.addListener((message,sender,respond)=>{
    const tabs=await chrome.tabs.query({url:'https://www.midjourney.com/*'});
    const selected=tabs.find(t=>t.active&&/^https:\/\/www.midjourney.com\/(organize|imagine|personalize|moodboards)(\/|$)/.test(t.url))||tabs.find(t=>/^https:\/\/www.midjourney.com\/(organize|imagine|personalize|moodboards)(\/|$)/.test(t.url));
    if(!selected)throw new Error('Open your Midjourney Organize page first');
+   if(message.command==='choose'){await chrome.tabs.update(selected.id,{active:true}).catch(()=>{});await chrome.windows.update(selected.windowId,{focused:true}).catch(()=>{});}
    return chrome.tabs.sendMessage(selected.id,{type:'command',command:message.command,options:message.options});
   }
   throw new Error('Unsupported extension action');
