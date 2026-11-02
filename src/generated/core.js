@@ -61,7 +61,7 @@ async function mapImages(items, operation, shouldStop=()=>false) {
  return results;
 }
 function safeRelativePath(path) {
- if(typeof path!=='string'||!path||path.length>220||path.startsWith('/')||path.split('/').some(p=>!p||p==='.'||p==='..')||/[\\\x00-\x1f<>:"|?*]/.test(path))throw new Error('Invalid path');
+ if(typeof path!=='string'||!path||path.length>220||path.startsWith('/')||path.split('/').some(p=>!p||p==='.'||p==='..')||/[\\\x00-\x1f<>:"|?*]/.test(path))throw new Error('Invalid export path');
  return path;
 }
 
