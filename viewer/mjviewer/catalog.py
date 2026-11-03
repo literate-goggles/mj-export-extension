@@ -656,7 +656,7 @@ class Catalog:
         self._ok = False
         self._error: Optional[str] = None
         self._inflight: Optional[threading.Event] = None
-        self._version = 0  # counts catalogs this instance wrote itself (adopt)
+        self._generation = 0  # bumped by every catalog installed here (read or written) and by expire()
         self.on_change: Optional[Callable[[], None]] = None  # called after a changed catalog was read
 
     def refresh(self, force: bool = False) -> None:
@@ -683,13 +683,14 @@ class Catalog:
 
     def _fetch(self) -> None:
         with self._lock:
-            etag, version = self._etag, self._version
+            etag, generation = self._etag, self._generation
         try:
             status, tag, body = self.store.get(CATALOG_NAME, 'catalog.json', etag=etag, timeout=self.timeout)
             if status == 304:
                 with self._lock:
-                    self._fetched = self._checked = self._clock()
-                    self._ok, self._error = True, None
+                    if self._generation == generation:  # else dropped, like a 200 below
+                        self._fetched = self._checked = self._clock()
+                        self._ok, self._error = True, None
                 return
             if status != 200:
                 raise CatalogError('storage_error', 'catalog.json: storage answered HTTP %d' % status)
@@ -700,14 +701,17 @@ class Catalog:
                                        else 'catalog.json could not be read (%s)' % type(exc).__name__)
             with self._lock:
                 changed = message != self._error
-                self._checked = self._clock()
+                if self._generation == generation:  # else a read asked for meanwhile is still due
+                    self._checked = self._clock()
                 self._ok, self._error = False, message
             if changed:
                 self._log('catalog: %s; keeping the last good catalog' % message)
             return
         with self._lock:
-            if self._version != version:
-                return  # this instance wrote a newer catalog while this answer was on its way: keep that one
+            if self._generation != generation:
+                # While this answer was on its way, this instance served a catalog it wrote, or a newer read was asked
+                # for (expire, or an adopt that declined): keep what is in use; a read asked for is made at next use.
+                return
             self._install(entries, skipped, updated, deleted, tag)
         self._log('catalog: %d export(s) listed%s' % (len(entries), ''.join(
             '; entry %d skipped (%s)' % (s['index'], s['reason']) for s in skipped[:20])))
@@ -720,25 +724,42 @@ class Catalog:
     def _install(self, entries: List[dict], skipped: List[dict], updated: Optional[str], deleted: List[dict],
                  etag: Optional[str]) -> None:
         """Under the lock: serve this catalog from now on."""
+        self._generation += 1
         self._entries, self._skipped, self._updated_at, self._deleted = entries, skipped, updated, deleted
         self._by_id = {entry['id']: entry for entry in entries}
         self._etag = etag
         self._fetched = self._checked = self._clock()
         self._ok, self._error = True, None
 
-    def adopt(self, raw: bytes, etag: Optional[str]) -> None:
-        """Serve a catalog this instance has just written (with the ETag storage gave it) at once, instead of
-        after the next refresh; a refresh already on its way with the older one is dropped."""
+    @property
+    def generation(self) -> int:
+        """Changes whenever another catalog is installed here (read or written) and at expire(). A write reads it
+        before it reads catalog.json, and passes it to adopt()."""
+        with self._lock:
+            return self._generation
+
+    def adopt(self, raw: bytes, etag: Optional[str], since: Optional[int] = None) -> bool:
+        """Serve a catalog this instance has just written (with the ETag storage gave it), or has just read for a
+        write, at once instead of after the next refresh; a refresh already on its way is dropped. since is the
+        generation from before that read of catalog.json: when another catalog was installed after it (a refresh,
+        which may be newer or older than this one) this one never replaces it, and catalog.json is read again at the
+        next use instead. Returns whether it was installed."""
         deleted: List[dict] = []
         entries, skipped, updated = parse_catalog(raw, deleted)
         with self._lock:
-            self._version += 1
+            if since is not None and since != self._generation:
+                self._checked = None
+                self._generation += 1
+                return False
             self._install(entries, skipped, updated, deleted, etag)
+            return True
 
     def expire(self) -> None:
-        """Read catalog.json again at the next use, whatever MJV_CATALOG_TTL_S says."""
+        """Read catalog.json again at the next use, whatever MJV_CATALOG_TTL_S says (a refresh already on its way
+        is dropped: its answer may be older than what asked for this)."""
         with self._lock:
             self._checked = None
+            self._generation += 1
 
     @property
     def unread_limit_s(self) -> float:
@@ -1228,6 +1249,9 @@ class Published:
         self._rebuilds: Dict[str, threading.Event] = {}  # catalog id -> set when its running rebuild ends
         # Building an index pauses the cyclic GC for the whole process (model._gc_paused): one visible build at a time.
         self._view_builds = threading.BoundedSemaphore(1)
+        # This instance's writes of catalog.json, one at a time from the fresh read to serving what was written, so
+        # that it serves them in the order storage took them (never the older of two after the newer).
+        self._writes = threading.Lock()
         catalog.on_change = self._on_catalog_change
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
@@ -1734,7 +1758,15 @@ class Published:
                 return not any(this(item) for item in items)
             return any(this(item) and item.get('hidden_at') == now and item.get('hidden_by') == user for item in items)
 
-        result, body, tag, entry = self._rewrite(catalog_id, user, admin, 'hide', change, landed)
+        with self._writes:  # not held while the list is applied below
+            result, body, tag, entry, since = self._rewrite(catalog_id, user, admin, 'hide', change, landed)
+            if result is not UNCHANGED:
+                what = 'generation' if kind == 'job' else 'moodboard'
+                self._log('%s in %s by %s; hidden now: %s' % (
+                    ('showed a %s again' if show else 'hid a %s') % what, catalog_id, user,
+                    '%d generations, %d moodboards' % (result['jobs'], result['moodboards']) if result
+                    else 'not counted'))
+                self._serve(body, tag, 'after changing what %s hides' % catalog_id, since)
         if result is UNCHANGED:  # the fresh copy is served already: apply its list here too
             record = entry['hidden']
             if record is None:
@@ -1743,11 +1775,6 @@ class Published:
                 counts = dict(record['counts']) if record['counts'] else None
             self._ensure_variant(catalog_id, quiet=True).wait(wait_s)
             return {'changed': False, 'counts': counts}
-        what = 'generation' if kind == 'job' else 'moodboard'
-        self._log('%s in %s by %s; hidden now: %s' % (
-            ('showed a %s again' if show else 'hid a %s') % what, catalog_id, user,
-            '%d generations, %d moodboards' % (result['jobs'], result['moodboards']) if result else 'not counted'))
-        self._serve(body, tag, 'after changing what %s hides' % catalog_id)
         self._ensure_variant(catalog_id, quiet=True).wait(wait_s)
         return {'changed': True, 'counts': result}
 
@@ -1805,13 +1832,23 @@ class Published:
             return isinstance(stones, list) and any(isinstance(item, dict) and all(
                 item.get(key) == stone[key] for key in ('id', 'deleted_at', 'deleted_by')) for item in stones)
 
-        _, body, tag, entry = self._rewrite(catalog_id, user, admin, 'delete', change, landed)
-        self._finish(catalog_id, entry['sha256'], user, body, tag)
+        # What follows the write: serve the new catalog.json here at once (under _writes, like the write), delete
+        # the ZIP from storage, close the export here.
+        with self._writes:
+            _, body, tag, entry, since = self._rewrite(catalog_id, user, admin, 'delete', change, landed)
+            self._log('deleted %s by %s' % (catalog_id, user))
+            if not self._after_delete(catalog_id, 'serving the new catalog.json',
+                                      lambda: self.catalog.adopt(body, tag, since)):
+                self.catalog.expire()  # the copy in use still lists it: read the new one at the next request
+        sha = entry['sha256']
+        self._after_delete(catalog_id, 'deleting its ZIP from storage', lambda: self._delete_blob(catalog_id, sha))
+        self._after_delete(catalog_id, 'closing it on this instance',
+                           lambda: self._purge({catalog_id: sha}, wait_s=CLOSE_WAIT_S, quiet=True))
         return entry
 
     def _rewrite(self, catalog_id: str, user: str, admin: bool, action: str,
                  change: Callable[[dict, dict, dict], object],
-                 landed: Callable[[dict, object], bool]) -> Tuple[object, Optional[bytes], Optional[str], dict]:
+                 landed: Callable[[dict, object], bool]) -> Tuple[object, Optional[bytes], Optional[str], dict, int]:
         """The one way this server writes catalog.json (deleting, hiding and showing again): read it fresh with its
         ETag (never the copy in use), find the entry, check the owner or an administrator on that copy, let change
         edit the raw JSON of that copy in place (every field this server does not know survives), check that every
@@ -1819,13 +1856,15 @@ class Published:
         first, all of it starts over, WRITE_ATTEMPTS times at most. change(data, raw entry, entry) returns a result
         for landed, or UNCHANGED: then nothing is written and the fresh copy is served at once instead. A write
         that got no answer, or a 5xx, may have been stored all the same: catalog.json is read again and
-        landed(data, result) tells. Returns (result, body written, its ETag, the entry as read). action ('delete'
-        or 'hide') words the errors; a delete's are the ones it always had."""
+        landed(data, result) tells. Returns (result, body written, its ETag, the entry as read, the catalog's
+        generation from before that read, for adopt). action ('delete' or 'hide') words the errors; a delete's are the
+        ones it always had. Called holding _writes, which the caller keeps until it has served what was written."""
         words = ACTION_WORDS[action]
         match = EXPORT_ID_RE.fullmatch(catalog_id or '')
         if not match or match.group(2):
             raise CatalogError('unknown_catalog_entry', NOT_LISTED)
         for attempt in range(1, WRITE_ATTEMPTS + 1):
+            since = self.catalog.generation
             data, etag, raw = self._fresh_catalog(words['nothing'])
             found = next(((n, entry) for n, entry in _usable(data['exports'])[0] if entry['id'] == catalog_id), None)
             if found is None:
@@ -1836,8 +1875,8 @@ class Published:
                 raise CatalogError('not_owner', words['not_owner'] if owner else words['no_owner'])
             result = change(data, data['exports'][position], entry)
             if result is UNCHANGED:
-                self._serve(raw, etag, 'after an unchanged request on %s' % catalog_id)
-                return result, None, None, entry
+                self._serve(raw, etag, 'after an unchanged request on %s' % catalog_id, since)
+                return result, None, None, entry, since
             body = _encode(data, grow_from=None if action == 'delete' else len(raw), nothing=words['nothing'])
             try:
                 tag = self.store.put(CATALOG_NAME, body, 'catalog.json', if_match=etag)
@@ -1849,15 +1888,15 @@ class Published:
                 if exc.code != 'unreachable' and (exc.status or 0) < 500:  # refused: certainly not stored
                     raise CatalogError('storage_error', '%s; %s' % (exc.message, words['nothing'])) from None
                 body, tag = self._stored_anyway(lambda stored: landed(stored, result), exc, words)
-            return result, body, tag, entry
+            return result, body, tag, entry, since
         raise CatalogError('catalog_busy', 'the list of exports kept changing while it was being updated; '
                                            '%s, try again' % words['nothing'])
 
-    def _serve(self, body: bytes, tag: Optional[str], when: str) -> None:
-        """Serve a catalog.json just written or read fresh at once; when that fails, read it again at the next
-        request instead (the copy in use may be older)."""
+    def _serve(self, body: bytes, tag: Optional[str], when: str, since: int) -> None:
+        """Serve a catalog.json just written or read fresh at once, unless a newer one may be in use (Catalog.adopt);
+        when that fails, read it again at the next request instead (the copy in use may be older)."""
         try:
-            self.catalog.adopt(body, tag)
+            self.catalog.adopt(body, tag, since)
         except Exception as exc:
             self.catalog.expire()
             self._log('catalog: %s, serving the new catalog.json failed (%s)' % (when, type(exc).__name__))
@@ -1881,23 +1920,16 @@ class Published:
             return raw, etag
         raise CatalogError(words['unconfirmed'], words['unclear'] % (problem.message, unknown))
 
-    def _finish(self, catalog_id: str, sha: str, user: str, body: bytes, tag: Optional[str]) -> None:
-        """What follows a catalog.json that no longer lists the export: serve it here at once, delete the ZIP from
-        storage, close the export here. The export is deleted by then, so a step that fails is logged, never
-        answered, and the steps after it still run."""
-        self._log('deleted %s by %s' % (catalog_id, user))
-        steps = (('serving the new catalog.json', lambda: self.catalog.adopt(body, tag)),
-                 ('deleting its ZIP from storage', lambda: self._delete_blob(catalog_id, sha)),
-                 ('closing it on this instance', lambda: self._purge({catalog_id: sha}, wait_s=CLOSE_WAIT_S,
-                                                                     quiet=True)))
-        for n, (what, step) in enumerate(steps):
-            try:
-                step()
-            except Exception as exc:
-                self._log('catalog: after deleting %s, %s failed (%s)' % (catalog_id, what, type(exc).__name__))
-                self._log(self.store.scrub(traceback.format_exc(limit=5)).rstrip())
-                if n == 0:
-                    self.catalog.expire()  # the copy in use still lists it: read the new one at the next request
+    def _after_delete(self, catalog_id: str, what: str, step: Callable[[], object]) -> bool:
+        """One step that follows a catalog.json that no longer lists the export. The export is deleted by then, so
+        a step that fails is logged, never answered, and the steps after it still run. Returns whether it worked."""
+        try:
+            step()
+            return True
+        except Exception as exc:
+            self._log('catalog: after deleting %s, %s failed (%s)' % (catalog_id, what, type(exc).__name__))
+            self._log(self.store.scrub(traceback.format_exc(limit=5)).rstrip())
+            return False
 
     def _fresh_catalog(self, nothing: str = 'nothing was deleted') -> Tuple[dict, str, bytes]:
         """catalog.json as storage holds it right now (never the copy in use): (data, ETag, raw bytes)."""

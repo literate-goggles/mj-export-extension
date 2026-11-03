@@ -392,6 +392,46 @@ class CatalogRefreshTests(BlobTestCase):
                 self.assertTrue(cat.outdated())
                 self.blob.write_catalog([])
 
+    def test_a_catalog_written_here_never_replaces_one_read_since(self):
+        """adopt() serves what this instance wrote (or read for a write) only when no other catalog was installed
+        since that read began: a refresh meanwhile may have read a newer one, so catalog.json is read again at the
+        next use instead. expire() likewise drops a refresh already on its way."""
+        entry = self.blob.put_export(b'PK\x05\x06' + b'\0' * 18)
+        self.blob.write_catalog([entry])
+        clock = [0.0]
+        cat = Catalog(BlobStore(self.blob.url), ttl_s=60, clock=lambda: clock[0])
+        self.assertEqual(len(cat.entries()), 1)
+        since = cat.generation  # a write reads catalog.json now...
+        with open(self.blob.file('catalog.json'), 'rb') as handle:
+            written = handle.read()
+        second = self.blob.put_export(b'PK\x05\x06' + b'\1' * 18, name='second.zip')
+        self.blob.write_catalog([entry, second])  # ...and a refresh reads a newer one before the write is served
+        clock[0] += 61
+        self.assertEqual(len(cat.entries()), 2)
+        self.assertIs(cat.adopt(written, '"invented"', since), False)
+        self.assertEqual(len(cat.snapshot()[0]), 2)
+        reads = self.blob.count('catalog.json')
+        self.assertEqual(len(cat.entries()), 2)  # read again at once
+        self.assertEqual(self.blob.count('catalog.json'), reads + 1)
+        self.assertIs(cat.adopt(written, '"invented"', cat.generation), True)  # nothing read since: served at once
+        self.assertEqual(len(cat.snapshot()[0]), 1)
+        # A refresh on its way when expire() is called is dropped, so the next use still reads catalog.json.
+        self.blob.faults['catalog.json'] = 'slow'
+        self.blob.slow_delay = 0.3
+        cat.expire()
+        leader = threading.Thread(target=cat.entries)
+        leader.start()
+        for _ in range(100):
+            if self.blob.count('catalog.json') == reads + 2:
+                break
+            time.sleep(0.01)
+        cat.expire()
+        leader.join(10)
+        self.blob.faults.clear()
+        self.assertEqual(len(cat.snapshot()[0]), 1)
+        self.assertEqual(len(cat.entries()), 2)
+        self.assertEqual(self.blob.count('catalog.json'), reads + 3)
+
     def test_a_catalog_over_the_size_cap_is_refused(self):
         self.blob.put('catalog.json', b' ' * (catalog_module.MAX_CATALOG_BYTES + 1))
         cat = Catalog(BlobStore(self.blob.url), ttl_s=60)
@@ -1916,6 +1956,43 @@ class HideFlowTests(FlowTestCase):
         self.assertEqual(detail['hidden']['on_its_own']['hidden_by'], 'alice@example.com')
         self.assertEqual(self.code(second, bob, path), (404, 'unknown_job'))
         self.assertEqual(self.puts(), 1)
+
+    def test_two_writes_here_are_served_in_the_order_storage_took_them(self):
+        """Two managers change one export's list through one instance at once. The second write reads catalog.json
+        only once the first is served here, so the instance never goes back to the older list (which would show
+        everyone an item just hidden)."""
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start(MJV_CATALOG_TTL_S='600')
+        self.ready(hosted, session, mine)
+        real, served, answers, second_served = catalog_module.Catalog.adopt, [], {}, threading.Event()
+        worker = threading.Thread(target=lambda: answers.update(second=self.change(hosted, session, mine, 'moodboard',
+                                                                                   'board-zq')))
+
+        def adopt(cat, raw, etag, since=None):
+            served.append(json.loads(raw)['exports'][0]['hidden'])
+            if len(served) == 1:  # the first write is stored: the second one runs before it is served here
+                worker.start()
+                second_served.wait(1.5)  # and cannot get that far first
+            else:
+                second_served.set()
+            return real(cat, raw, etag, since)
+
+        with mock.patch.object(catalog_module.Catalog, 'adopt', autospec=True, side_effect=adopt):
+            first = self.change(hosted, session, mine, 'job', 'job-zq-solo')
+            worker.join(30)
+        self.assertEqual([(answer[0], answer[1]['changed']) for answer in (first, answers['second'])],
+                         [(200, True)] * 2)
+        self.assertEqual([[item['id'] for item in record.get('moodboards') or []] for record in served],
+                         [[], ['board-zq']])  # in the order storage took them
+        stored = self.record()
+        self.assertEqual(([item['id'] for item in stored['jobs']], [item['id'] for item in stored['moodboards']]),
+                         (['job-zq-solo'], ['board-zq']))
+        in_use = hosted.app.catalog.peek(mine['id'])['hidden']
+        self.assertEqual((list(in_use['jobs']), list(in_use['moodboards'])), (['job-zq-solo'], ['board-zq']))
+        bob, base = self.bob(hosted), '/api/exports/%s' % mine['id']
+        self.assertEqual(self.code(hosted, bob, base + '/jobs/job-zq-solo'), (404, 'unknown_job'))
+        self.assertEqual(self.code(hosted, bob, base + '/moodboards/board-zq'), (404, 'unknown_moodboard'))
 
     def test_an_unchanged_closure_is_not_rebuilt(self):
         """Hiding on its own a job that a hidden moodboard already hides changes the list, not what everyone else
