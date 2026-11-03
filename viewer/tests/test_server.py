@@ -255,6 +255,22 @@ class ApiTests(ServerTestCase):
         status, body = self.live.get_json('/api/exports/%s/jobs?limit=0' % self.eid)
         self.assertEqual((status, body['error']['code']), (400, 'bad_parameter'))
 
+    def test_local_mode_has_no_hide_routes(self):
+        """Hiding is hosted only: local mode has none of its routes, keys or statuses."""
+        for path in ('/api/catalog/%s/hide' % self.eid, '/api/catalog/%s/unhide' % self.eid):
+            status, body = self.live.post_json(path, {'kind': 'job', 'id': 'job-grid-a'})
+            self.assertEqual((status, body['error']['code']), (404, 'not_found'), path)
+        status, body = self.live.get_json('/api/exports/%s/hidden' % self.eid)
+        self.assertEqual((status, body['error']['code']), (404, 'not_found'))
+        answers = [self.api('/overview'), self.api('/jobs?limit=500'), self.api('/moodboards'), self.api('/likes'),
+                   self.live.get_json('/api/health')[1], self.live.get_json('/api/exports')[1]]
+        answers += [self.api('/jobs/%s' % card['job_id']) for card in answers[1]['items']]
+        answers += [self.api('/moodboards/%s' % board['id']) for board in answers[2]['items']]
+        text = json.dumps(answers)
+        for key in ('"hidden"', '"hide_preview"', '"raw_withheld"', '"can_hide"', '"hide_enabled"', '"features"',
+                    '"unavailable"'):
+            self.assertNotIn(key, text)
+
     def test_job_detail_lineage_navigation(self):
         detail = self.api('/jobs/job-up')
         self.assertEqual([a['job_id'] for a in detail['lineage']['ancestors']], ['job-grid-a', 'job-var'])

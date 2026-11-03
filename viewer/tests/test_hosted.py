@@ -23,6 +23,7 @@ from mjviewer.__main__ import main
 from mjviewer.hosted import (OAUTH_COOKIE, SESSION_COOKIE, ConfigError, HostedConfig, Secret, check_claims,
                              cookie_values, csrf_token, hosted_cache_dir, issue_session, load_config,
                              read_session, run, safe_next, sign, unsign)
+from mjviewer.model import hidden_closure
 from mjviewer.server import CSP
 from tests import fixtures as fx
 from tests.fake_blob import FakeBlob
@@ -386,8 +387,9 @@ class ProbeAndHeaderTests(HostedTestCase):
             status, headers, body = self.hosted.request('GET', '/healthz', host=host)
             self.assertEqual(status, 200)
             data = self.json_of(body)
-            self.assertEqual(set(data), {'ok', 'mode', 'commit', 'catalog', 'cache'})
+            self.assertEqual(set(data), {'ok', 'mode', 'commit', 'features', 'catalog', 'cache'})
             self.assertEqual((data['ok'], data['mode'], data['cache']), (True, 'hosted', {'ok': True}))
+            self.assertEqual(data['features'], ['hide'])  # also with hiding off: this version applies hidden lists
             self.assertEqual(set(data['catalog']), {'exports', 'ok', 'age_s', 'delete_enabled', 'zip_deletes_pending',
                                                     'soft_delete_days'})
             self.assertEqual((data['catalog']['exports'], data['catalog']['ok']), (1, catalog_ok))
@@ -466,6 +468,7 @@ class ProbeAndHeaderTests(HostedTestCase):
 class UnauthenticatedTests(HostedTestCase):
     ROUTES = ['/', '/index.html', '/x/abc/gallery', '/api/health', '/api/exports', '/api/exports/open',
               '/api/exports/upload', '/api/catalog/{cid}', '/api/catalog/{cid}/open', '/api/catalog/{cid}/delete',
+              '/api/catalog/{cid}/hide', '/api/catalog/{cid}/unhide', '/api/exports/{cid}/hidden',
               '/api/exports/{cid}/overview',
               '/api/exports/{cid}/jobs', '/api/exports/{cid}/jobs/job-grid-a', '/api/exports/{cid}/moodboards',
               '/api/exports/{cid}/moodboards/board-1', '/api/exports/{cid}/profiles', '/api/exports/{cid}/likes',
@@ -970,6 +973,336 @@ class DeleteTests(unittest.TestCase):
                 self.assertNotIn(secret, text)
         self.assertEqual([json.loads(body)['error']['code'] for _, _, body in responses[-2:]],
                          ['storage_error', 'delete_unconfirmed'])
+
+
+def json_keys(value) -> set:
+    """Every key of every object inside a JSON value."""
+    found, stack = set(), [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            found.update(item)
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return found
+
+
+class HideRouteTests(unittest.TestCase):
+    """Hiding through the routes, and what reaches whom. alice@example.com owns two published ZIPs that hide
+    fixtures.HIDE: hiding_export() and the two-root ZIP; a third ZIP has no owner recorded. carol@example.com is an
+    administrator, bob@example.com neither. Every id, name, code and file name of a hidden item carries
+    fixtures.MARKER."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix='mjv-hide-')
+        cls.blob = FakeBlob(os.path.join(cls._tmp.name, 'blob'))
+        cls.google = FakeGoogle()
+        cls.single = cls.blob.put_export(fx.hiding_zip_bytes(), name='mj_export_hiding.zip', owner='alice@example.com')
+        cls.multi = cls.blob.put_export(fx.two_root_hiding_zip(), name='mj_export_two.zip', owner='alice@example.com',
+                                        label='Two roots')
+        cls.orphan = cls.blob.put_export(fx.hiding_zip_bytes(root='mj_export_orphan'), name='mj_export_orphan.zip')
+        cls.write_catalog()
+        cls.hosted = Hosted(cls._tmp.name, cls.blob, cls.google, env={
+            'MJV_CATALOG_WRITE_URL': cls.blob.write_url, 'MJV_ADMIN_EMAILS': 'carol@example.com'})
+        cls.sessions = {name: cls.hosted.session('%s@example.com' % name) for name in ('alice', 'bob', 'carol')}
+        for entry in (cls.single, cls.multi, cls.orphan):
+            cls.hosted.post('/api/catalog/%s/open' % entry['id'], cls.sessions['alice'])
+            deadline = time.time() + 30
+            while json.loads(cls.hosted.get('/api/catalog/%s' % entry['id'], cls.sessions['alice'])[2])['state'] != 'ready':
+                assert time.time() < deadline, 'not ready'
+                time.sleep(0.05)
+
+    @classmethod
+    def write_catalog(cls):
+        record = {'jobs': [{'id': 'job-zq-solo', 'hidden_at': '2026-11-03T10:15:00Z', 'hidden_by': 'alice@example.com'}],
+                  'moodboards': [{'id': 'board-zq', 'hidden_at': '2026-11-03T10:20:00Z',
+                                  'hidden_by': 'carol@example.com'}]}
+        cls.blob.write_catalog([dict(entry, hidden=record) for entry in (cls.single, cls.multi, cls.orphan)])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.hosted.stop()
+        cls.blob.stop()
+        cls.google.stop()
+        cls._tmp.cleanup()
+
+    def setUp(self):
+        self.write_catalog()  # a test that hid or showed something leaves the next one the same lists
+
+    def answer(self, path, who, method='GET', body=None, headers=None):
+        if method == 'POST':
+            status, sent, raw = self.hosted.post(path, self.sessions[who], body=body or b'{}', headers=headers)
+        else:
+            status, sent, raw = self.hosted.get(path, self.sessions[who])
+        return status, sent, raw
+
+    def change(self, who, entry, kind, item_id, show=False):
+        status, _, raw = self.answer('/api/catalog/%s/%s' % (entry['id'], 'unhide' if show else 'hide'), who, 'POST',
+                                     json.dumps({'kind': kind, 'id': item_id}).encode())
+        return status, json.loads(raw)
+
+    def roots(self, entry):
+        """The server's own full index of every root of an entry, which knows every hidden id and file."""
+        prep = self.hosted.app.published._prep(entry['id'])
+        return [self.hosted.app.registry.get(export_id) for export_id in prep.export_ids]
+
+    def routes(self, entry):
+        """Every GET path of 3.9 for an entry: its items, every root's views with every page, filter and search
+        word the full index knows of, the detail of every job and moodboard, and every file and thumbnail."""
+        roots = self.roots(entry)
+        closure = hidden_closure(roots, fx.HIDE['jobs'], fx.HIDE['moodboards'])
+        paths = ['/healthz', '/api/health', '/api/exports', '/api/catalog/%s' % entry['id']]
+        for full in roots:
+            base = '/api/exports/%s' % full.id
+            facets = full.overview()['facets']
+            prompts = {word for job_id in closure.jobs if job_id in full.jobs for word in full.jobs[job_id].prompt.split()}
+            queries = [{'limit': '500'}, {'limit': '500', 'sort': 'oldest'}, {'limit': '2', 'offset': '1'},
+                       {'q': fx.MARKER}, {'q': fx.COPY}, {'links': 'explicit', 'moodboard': 'board-zq'}]
+            queries += [{'q': word} for word in sorted(prompts)]
+            queries += [{'kind': kind['value']} for kind in facets['kinds']]
+            queries += [{'version': version['value']} for version in facets['versions']]
+            queries += [{'moodboard': board['id']} for board in facets['moodboards']]
+            queries += [{'profile': profile['id']} for profile in facets['profiles']]
+            queries += [{'profile': 'code:' + code['code']} for job in full.jobs.values() for code in job.codes]
+            queries += [{'date_from': facets['date_min'], 'date_to': facets['date_min']},
+                        {'date_from': facets['date_min'], 'date_to': facets['date_max']}]
+            paths += [base + '/' + route for route in ('overview', 'moodboards', 'profiles', 'likes')]
+            paths += [base + '/jobs?' + urllib.parse.urlencode(query) for query in queries]
+            paths += [base + '/jobs/' + urllib.parse.quote(job_id, safe='') for job_id in full.jobs]
+            paths += [base + '/moodboards/' + urllib.parse.quote(board_id, safe='') for board_id in full.boards]
+            for file_id in full.file_ids:
+                paths += ['/files/%s/%s' % (full.id, file_id), '/files/%s/%s?size=thumb' % (full.id, file_id)]
+        return paths
+
+    def assert_clean(self, path, headers, body):
+        """No trace of a hidden item in an answer: headers and text never carry the marker, the copied prompt only
+        where its visible upscale is, and nothing that only managers get. (Image bytes are not text: a hidden
+        picture's address answers 404, checked by the caller.)"""
+        self.assertNotIn(fx.MARKER, str(headers).lower(), path)
+        if not headers['Content-Type'].startswith('image/'):
+            text = body.lower()
+            self.assertNotIn(fx.MARKER.encode(), text, path)
+            if fx.COPY.encode() in text:
+                self.assertIn(b'job-child-up', text, path)
+            self.assertNotIn(fx.COPY.encode(), text.replace(fx.COPY_PROMPT.encode(), b''), path)
+            if headers['Content-Type'].startswith('application/json'):
+                self.assertFalse({'hidden', 'hide_preview'} & json_keys(json.loads(body)), path)
+
+    def test_healthz_lists_its_features(self):
+        status, _, body = self.hosted.request('GET', '/healthz', host='internal-probe')
+        data = json.loads(body)
+        self.assertEqual((status, data['features'], data['catalog']['delete_enabled']), (200, ['hide'], True))
+        for who in ('alice', 'bob'):
+            self.assertIs(json.loads(self.answer('/api/health', who)[2])['hide_enabled'], True)
+
+    def test_who_may_hide_and_show_again(self):
+        def rights(who):
+            items = json.loads(self.answer('/api/exports', who)[2])['catalog']['items']
+            return {i['id']: (i['can_hide'], i['can_delete'], 'hidden' in i) for i in items}
+
+        single, multi, orphan = self.single['id'], self.multi['id'], self.orphan['id']
+        self.assertEqual(rights('alice'), {single: (True, True, True), multi: (True, True, True),
+                                           orphan: (False, False, False)})
+        self.assertEqual(rights('bob'), {key: (False, False, False) for key in (single, multi, orphan)})
+        self.assertEqual(rights('carol'), {key: (True, True, True) for key in (single, multi, orphan)})
+        writes = self.blob.count('catalog.json', method='PUT')
+        for who, entry, says in (('bob', self.single, 'only the owner of this export or an administrator can hide or '
+                                                      'show its generations and moodboards'),
+                                 ('bob', self.orphan, 'this export has no owner recorded, so only an administrator can '
+                                                      'hide or show its generations and moodboards'),
+                                 ('alice', self.orphan, 'this export has no owner recorded')):
+            for show in (False, True):
+                with self.subTest(who=who, entry=entry['name'], show=show):
+                    status, answer = self.change(who, entry, 'job', 'job-grid-a' if not show else 'job-zq-solo', show)
+                    self.assertEqual((status, answer['error']['code']), (403, 'not_owner'))
+                    self.assertIn(says, answer['error']['message'])
+                    self.assertIn('could not %s in %s for %s@example.com (not_owner): ' % (
+                        'show again' if show else 'hide', entry['id'], who), self.hosted.log.getvalue())
+        self.assertEqual(self.blob.count('catalog.json', method='PUT'), writes)
+        # The owner and an administrator may, both ways.
+        for who, entry in (('alice', self.single), ('carol', self.orphan)):
+            with self.subTest(who=who):
+                status, answer = self.change(who, entry, 'job', 'job-grid-a')
+                self.assertEqual((status, answer['changed'], answer['catalog']['can_hide']), (200, True, True))
+                # HIDE's 5 generations and 18 pictures, and job-grid-a's 4
+                self.assertEqual(answer['catalog']['hidden'], {'jobs': 6, 'moodboards': 1, 'images': 22})
+                status, answer = self.change(who, entry, 'job', 'job-grid-a', show=True)
+                self.assertEqual((status, answer['changed']), (200, True))
+        # Writes off: nobody manages anything, and every hidden list still applies.
+        other = Hosted(self._tmp.name, self.blob, self.google, env={
+            'MJV_ADMIN_EMAILS': 'carol@example.com', 'MJV_CACHE_DIR': os.path.join(self._tmp.name, 'off')})
+        self.addCleanup(other.stop)
+        carol = other.session('carol@example.com')
+        self.assertIs(json.loads(other.get('/api/health', carol)[2])['hide_enabled'], False)
+        status, _, body = other.post('/api/catalog/%s/hide' % self.single['id'], carol,
+                                     body=json.dumps({'kind': 'job', 'id': 'job-grid-a'}).encode())
+        self.assertEqual((status, json.loads(body)['error']), (403, {'code': 'hide_disabled',
+                                                                     'message': 'hiding is not turned on for this viewer'}))
+        self.assertEqual(json.loads(other.get('/api/exports/%s/hidden' % self.single['id'], carol)[2])['error']['code'],
+                         'hide_disabled')
+        items = json.loads(other.get('/api/exports', carol)[2])['catalog']['items']
+        self.assertEqual({(i['can_hide'], 'hidden' in i) for i in items}, {(False, False)})
+        other.post('/api/catalog/%s/open' % self.single['id'], carol)
+        deadline = time.time() + 30
+        while json.loads(other.get('/api/catalog/%s' % self.single['id'], carol)[2])['state'] != 'ready':
+            self.assertLess(time.time(), deadline)
+            time.sleep(0.05)
+        status, _, body = other.get('/api/exports/%s/jobs/job-zq-solo' % self.single['id'], carol)
+        self.assertEqual((status, json.loads(body)['error']['code']), (404, 'unknown_job'))
+
+    def test_the_request_is_checked(self):
+        path = '/api/catalog/%s/hide' % self.single['id']
+        bad = 'body must be a JSON object such as {"kind": "job", "id": "<job id>"}'
+        for body in (b'', b'not json', b'[]', b'{}', b'{"id": "job-grid-a"}', b'{"kind": "generation", "id": "job-grid-a"}',
+                     b'{"kind": "job"}', b'{"kind": "job", "id": null}', b'{"kind": "job", "id": ""}',
+                     b'{"kind": "job", "id": "   "}', json.dumps({'kind': 'job', 'id': 'j' * 201}).encode(),
+                     b'{"kind": "job", "id": "job\\u0007"}', b'{"kind": "job", "id": 12345}',
+                     b'{"kind": ["job"], "id": "job-grid-a"}'):
+            with self.subTest(body=body[:40]):
+                for route in ('hide', 'unhide'):
+                    status, _, raw = self.hosted.post('/api/catalog/%s/%s' % (self.single['id'], route),
+                                                      self.sessions['alice'], body=body)
+                    self.assertEqual((status, json.loads(raw)['error']), (400, {'code': 'bad_request', 'message': bad}))
+        status, _, raw = self.hosted.post(path, self.sessions['alice'],
+                                          body=b'{"kind": "job", "id": "' + b'a' * 5000 + b'"}')
+        self.assertEqual((status, json.loads(raw)['error']['code']), (413, 'too_large'))
+        for catalog_id in ('0123456789abcdef', 'not-an-id', self.multi['id'] + '-1'):
+            with self.subTest(catalog_id=catalog_id):
+                status, _, raw = self.hosted.post('/api/catalog/%s/hide' % catalog_id, self.sessions['carol'],
+                                                  body=b'{"kind": "job", "id": "job-grid-a"}')
+                self.assertEqual((status, json.loads(raw)['error']['code']), (404, 'unknown_catalog_entry'))
+        for kind, item_id, code in (('job', 'job-invented', 'unknown_job'), ('moodboard', 'board-invented',
+                                                                            'unknown_moodboard'),
+                                    ('job', 'board-1', 'unknown_job'), ('moodboard', 'job-grid-a', 'unknown_moodboard')):
+            with self.subTest(kind=kind, item=item_id):
+                status, answer = self.change('alice', self.single, kind, item_id)
+                self.assertEqual((status, answer['error']['code']), (404, code))
+                self.assertEqual(answer['error']['message'], 'no %s with this id in the export' % kind)
+        self.assertEqual(self.change('alice', self.single, 'job', 'job-invented', show=True)[1]['changed'], False)
+        # A job of the second root only is one of the ZIP's: hiding it works from either root's export.
+        self.assertEqual(self.change('alice', self.multi, 'job', 'job-r2-plain')[1]['changed'], True)
+        for route in ('/api/catalog/%s/hide' % self.single['id'], '/api/catalog/%s/unhide' % self.single['id']):
+            self.assertEqual(self.answer(route, 'alice')[0], 405)
+        self.assertEqual(self.answer('/api/exports/%s/hidden' % self.single['id'], 'alice', 'POST')[0], 405)
+        for headers, code in (({'X-MJV-Token': ''}, 'forbidden'), ({'X-MJV-Token': self.sessions['bob'].token}, 'forbidden'),
+                              ({'Origin': 'http://evil.example'}, 'forbidden_origin'),
+                              ({'Origin': 'null'}, 'forbidden_origin')):
+            with self.subTest(headers=headers):
+                status, _, raw = self.answer(path, 'alice', 'POST', b'{"kind": "job", "id": "job-grid-a"}', headers)
+                self.assertEqual((status, json.loads(raw)['error']['code']), (403, code))
+        self.assertNotIn('Traceback', self.hosted.log.getvalue())
+
+    def test_hidden_ids_and_files_answer_like_unknown_ones_for_everyone_else(self):
+        full = self.roots(self.single)[0]
+        visible = self.hosted.app.published._variants[self.single['id']].views[full.id]
+        pinned = full.files['images/moodboard_board-1_2.png'].file_id
+        hidden_file = full.files['images/job-zq-solo_0.png'].file_id
+        base = '/api/exports/%s' % self.single['id']
+        pairs = [(base + '/jobs/job-zq-solo', base + '/jobs/job-invented'),
+                 (base + '/jobs/job-zq-gone', base + '/jobs/job-invented'),
+                 (base + '/moodboards/board-zq', base + '/moodboards/board-invented')]
+        for file_id in (hidden_file, pinned):
+            for query in ('', '?size=thumb'):
+                pairs.append(('/files/%s/%s%s' % (self.single['id'], file_id, query),
+                              '/files/%s/%s%s' % (self.single['id'], '0' * 20, query)))
+        for hidden, invented in pairs:
+            with self.subTest(path=hidden):
+                status, headers, body = self.answer(hidden, 'bob')
+                other_status, other_headers, other_body = self.answer(invented, 'bob')
+                self.assertEqual((status, headers['Content-Type'], headers['Cache-Control'], body),
+                                 (other_status, other_headers['Content-Type'], other_headers['Cache-Control'], other_body))
+                self.assertEqual(status, 404)
+        self.assertIn('images/moodboard_board-1_2.png', visible.hidden.files)
+        # Managers get them.
+        for path in (base + '/jobs/job-zq-solo', base + '/moodboards/board-zq', pairs[3][0], pairs[4][0]):
+            self.assertEqual(self.answer(path, 'alice')[0], 200, path)
+
+    def test_nothing_hidden_reaches_anyone_else_by_any_route(self):
+        unknown_file = self.answer('/files/%s/%s' % (self.single['id'], '0' * 20), 'bob')[2]
+        for entry in (self.single, self.multi):
+            roots = self.roots(entry)
+            hidden_files = {(index.id, index.files[rel].file_id) for index in roots
+                            for rel in self.hosted.app.published._variants[entry['id']].views[index.id].hidden.files}
+            self.assertTrue(hidden_files)
+            requests = 0
+            for path in self.routes(entry):
+                status, headers, body = self.answer(path, 'bob')
+                requests += 1
+                with self.subTest(path=path):
+                    self.assertIn(status, (200, 404), body[:200])
+                    self.assert_clean(path, headers, body)
+                    if path.startswith('/files/'):
+                        export_id, file_id = path.split('?')[0].split('/')[2:4]
+                        hidden = (export_id, file_id) in hidden_files
+                        self.assertEqual(status, 404 if hidden else 200)
+                        if hidden:  # the very bytes of an id that never existed
+                            self.assertEqual(body, unknown_file)
+                    if '/jobs/' in path or '/moodboards/' in path:
+                        item_id = urllib.parse.unquote(path.rsplit('/', 1)[1])
+                        self.assertEqual(status, 404 if fx.MARKER in item_id else 200, path)
+            self.assertGreater(requests, 150)
+            # POST routes a visitor may send.
+            for route, body in (('open', b'{}'), ('hide', b'{"kind": "job", "id": "job-zq-solo"}'),
+                                ('unhide', b'{"kind": "moodboard", "id": "board-zq"}'),
+                                ('delete', json.dumps({'confirm': entry['id']}).encode())):
+                status, headers, answer = self.answer('/api/catalog/%s/%s' % (entry['id'], route), 'bob', 'POST', body)
+                self.assertEqual(status, 200 if route == 'open' else 403)
+                self.assert_clean(route, headers, answer)
+            for index in roots:
+                status, headers, answer = self.answer('/api/exports/%s/hidden' % index.id, 'bob')
+                self.assertEqual((status, json.loads(answer)['error']['code']), (403, 'not_owner'))
+                self.assert_clean('hidden', headers, answer)
+        # The lists a manager browses are the very same answers.
+        for entry in (self.single, self.multi):
+            for index in self.roots(entry):
+                base = '/api/exports/%s' % index.id
+                for path in (base + '/overview', base + '/jobs?limit=500', base + '/moodboards', base + '/profiles',
+                             base + '/likes', base + '/jobs?q=' + fx.COPY):
+                    self.assertEqual(self.answer(path, 'alice')[2], self.answer(path, 'bob')[2], path)
+
+    def test_managers_see_hidden_items_only_where_asked(self):
+        base = '/api/exports/%s' % self.single['id']
+        listing = json.loads(self.answer(base + '/hidden', 'alice')[2])
+        self.assertEqual(listing['counts'], None)  # written by hand without counts: not counted yet
+        self.assertEqual([(row['id'], row['hidden_by'], row['generations']) for row in listing['moodboards']],
+                         [('board-zq', 'carol@example.com', 4)])
+        self.assertEqual([(row['id'], row['hidden_at'], row['export_id']) for row in listing['jobs']],
+                         [('job-zq-solo', '2026-11-03T10:15:00Z', self.single['id'])])
+        self.assertEqual(listing['jobs'][0]['job']['job_id'], 'job-zq-solo')
+        detail = json.loads(self.answer(base + '/jobs/job-zq-exp', 'alice')[2])
+        self.assertEqual(detail['hidden'], {'on_its_own': None, 'with_moodboards': [
+            {'id': 'board-zq', 'name': 'Zqboard', 'hidden_at': '2026-11-03T10:20:00Z', 'hidden_by': 'carol@example.com'}]})
+        self.assertNotIn('hide_preview', detail)
+        board = json.loads(self.answer(base + '/moodboards/board-zq', 'alice')[2])
+        self.assertEqual(board['hidden'], {'hidden_at': '2026-11-03T10:20:00Z', 'hidden_by': 'carol@example.com',
+                                           'generations': 4, 'stay_hidden': 0})
+        self.assertEqual(len(board['generations']), 4)
+        visible = json.loads(self.answer(base + '/jobs/job-grid-a', 'alice')[2])
+        self.assertEqual((visible['hide_preview'], 'hidden' in visible), ({'made_from_it': 2}, False))
+        visible = json.loads(self.answer(base + '/moodboards/board-1', 'alice')[2])
+        self.assertEqual(visible['hide_preview'], {'generations': 1, 'made_from_them': 2})
+        self.assertEqual(json.loads(self.answer(base + '/jobs/job-child-up', 'alice')[2])['job']['parent_status'],
+                         'unavailable')  # managers browse like everyone (R4)
+        # Their pictures, for managers only.
+        file_url = listing['jobs'][0]['job']['images'][0]['url']
+        self.assertEqual([self.answer(file_url, who)[0] for who in ('alice', 'carol', 'bob')], [200, 200, 404])
+        # The Hidden listing covers the whole ZIP whatever root is asked, and only roots that exist.
+        multi = json.loads(self.answer('/api/exports/%s-2/hidden' % self.multi['id'], 'alice')[2])
+        self.assertEqual(multi, json.loads(self.answer('/api/exports/%s-1/hidden' % self.multi['id'], 'alice')[2]))
+        self.assertEqual(multi['moodboards'][0]['generations'], 5)
+        for path in ('/api/exports/%s-3/hidden' % self.multi['id'], '/api/exports/%s/hidden' % self.multi['id'],
+                     '/api/exports/0123456789abcdef/hidden'):
+            self.assertEqual(json.loads(self.answer(path, 'alice')[2])['error']['code'], 'unknown_export', path)
+        # An administrator manages the export without an owner.
+        self.assertEqual(json.loads(self.answer('/api/exports/%s/hidden' % self.orphan['id'], 'carol')[2])['counts'],
+                         None)
+        # Hiding counts: the item and its listing say what is hidden once the app wrote the list.
+        status, answer = self.change('alice', self.single, 'job', 'job-zq-exp')  # on its own too: no rebuild
+        self.assertEqual((status, answer['catalog']['hidden']), (200, {'jobs': 5, 'moodboards': 1, 'images': 18}))
+        self.assertEqual(json.loads(self.answer(base + '/hidden', 'alice')[2])['counts'],
+                         {'jobs': 5, 'moodboards': 1, 'images': 18})
 
 
 class CacheCheckTests(unittest.TestCase):

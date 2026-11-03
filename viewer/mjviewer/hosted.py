@@ -18,6 +18,12 @@ python3 -m mjviewer --hosted takes its whole configuration from the environment
   set, an export's owner (the email recorded when it was published) or an
   administrator (MJV_ADMIN_EMAILS) can delete it: it leaves catalog.json and
   its ZIP is deleted from storage. Without it nothing is ever written there.
+* The same people (only while MJV_CATALOG_WRITE_URL is set) can hide one
+  generation, or one moodboard with its generations, from everyone else: the
+  entry's hidden list in catalog.json. Every export route goes through one
+  choke point (HostedHandler._export_or_404), which serves everyone but the
+  export's managers an index built without what is hidden; the list applies
+  whether or not this instance can write.
 
 The OAuth client secret, the signing secret and the storage query strings are
 held as Secret values: they never appear in a log line, a page or a response.
@@ -44,8 +50,9 @@ from dataclasses import dataclass
 from typing import List, Mapping, Optional, Tuple
 
 from . import API_VERSION, __version__
-from .catalog import (LOOPBACK, USER_AGENT, BlobStore, Catalog, CatalogError, CatalogUnavailable, Published,
-                      ZipCache, describe, email_address, opener_for)
+from .catalog import (ACTION_WORDS, EXPORT_ID_RE, LOOPBACK, NOT_LISTED, USER_AGENT, BlobStore, Catalog, CatalogError,
+                      CatalogUnavailable, Published, ZipCache, describe, email_address, hidden_id, opener_for)
+from .model import hidden_closure, hidden_listing, hidden_note, hide_preview
 from .server import (DEFAULT_STATIC, PIL_IMAGE, Handler, ViewerApp, ViewerServer, default_cache_dir, dump_json)
 from .sources import Limits
 
@@ -65,6 +72,17 @@ MAX_GOOGLE_BYTES = 256 * 1024
 MAX_POST_BODY = 4096
 DELETE_STATUS = {'delete_disabled': 403, 'not_owner': 403, 'unknown_catalog_entry': 404, 'catalog_busy': 409,
                  'storage_error': 502, 'delete_unconfirmed': 502}
+# What this server can do that an older one could not; /healthz lists it, so a deployment can tell before it rolls
+# back to (or keeps running) an image that would show every hidden item to everyone.
+FEATURES = ('hide',)
+HIDE_STATUS = {'hide_disabled': 403, 'not_owner': 403, 'unknown_catalog_entry': 404, 'unknown_job': 404,
+               'unknown_moodboard': 404, 'catalog_busy': 409, 'too_many_hidden': 409, 'storage_error': 502,
+               'hide_unconfirmed': 502}
+HIDE_EXAMPLE = '{"kind": "job", "id": "<job id>"}'
+HIDE_DISABLED = 'hiding is not turned on for this viewer'
+SEE_HIDDEN = ('only the owner of this export or an administrator can see what is hidden in it',
+              'this export has no owner recorded, so only an administrator can see what is hidden in it')
+NOT_READY = 'this export is not open yet; open it from the start page'
 _HOST_RE = re.compile(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?')
 _DOMAIN_RE = re.compile(r'(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]')
 _SIGNED_RE = re.compile(r'[A-Za-z0-9_-]{2,4000}\.[A-Za-z0-9_-]{43}')
@@ -684,7 +702,8 @@ class HostedHandler(Handler):
                            zip_deletes_pending=self.app.published.zip_deletes_pending(),
                            soft_delete_days=self.config.soft_delete_days)
             return self._send(200, dump_json({'ok': True, 'mode': 'hosted', 'commit': self.config.commit,
-                                              'catalog': catalog, 'cache': {'ok': self.app.cache_ok}}),
+                                              'features': list(FEATURES), 'catalog': catalog,
+                                              'cache': {'ok': self.app.cache_ok}}),
                               'application/json; charset=utf-8')
         return self._send(200, b'User-agent: *\nDisallow: /\n', 'text/plain; charset=utf-8')
 
@@ -782,7 +801,8 @@ class HostedHandler(Handler):
                                     'thumbnails': self.app.thumbs.available, 'max_upload_bytes': 0,
                                     'mode': 'hosted', 'user': self.user, 'delete_enabled': self.app.delete_enabled,
                                     'can_delete_any': self.app.delete_enabled and self._admin(),
-                                    'soft_delete_days': self.config.soft_delete_days})
+                                    'soft_delete_days': self.config.soft_delete_days,
+                                    'hide_enabled': self.app.hide_enabled})
         if parts == ['exports']:
             if method != 'GET':
                 return self._method_not_allowed()
@@ -793,6 +813,8 @@ class HostedHandler(Handler):
                                     'library': [], 'failed': [], 'catalog': catalog})
         if parts in (['exports', 'open'], ['exports', 'upload']):
             return self._error(404, 'not_available', 'not available in hosted mode: exports are published to the catalog')
+        if len(parts) == 3 and parts[0] == 'exports' and parts[2] == 'hidden':
+            return self._hidden(parts[1]) if method == 'GET' else self._method_not_allowed()
         if parts and parts[0] == 'catalog':
             return self._catalog(method, parts)
         return super()._api(method, path, query)
@@ -811,6 +833,8 @@ class HostedHandler(Handler):
             item = self.app.published.open(parts[1], retry=options.get('retry') is True)
         elif len(parts) == 3 and parts[2] == 'delete':
             return self._delete(parts[1]) if method == 'POST' else self._method_not_allowed()
+        elif len(parts) == 3 and parts[2] in ('hide', 'unhide'):
+            return self._hide(parts[1], show=parts[2] == 'unhide') if method == 'POST' else self._method_not_allowed()
         else:
             return self._error(404, 'not_found', 'unknown API route')
         if item is None:
@@ -836,13 +860,98 @@ class HostedHandler(Handler):
             return self._error(DELETE_STATUS[code], code, message)
         return self._json(200, {'deleted': catalog_id})
 
+    def _hide(self, catalog_id: str, show: bool) -> None:
+        """POST /api/catalog/<id>/hide (or /unhide, show) with {"kind": "job" | "moodboard", "id": "..."}: for the
+        export's owner or an administrator. Hiding needs the export open here (it counts what the list hides);
+        showing again does not, so a broken export never keeps an item hidden."""
+        if not self.app.hide_enabled:
+            return self._error(403, 'hide_disabled', HIDE_DISABLED)
+        body = self._body_object(HIDE_EXAMPLE, required=True)
+        if body is None:
+            return None
+        kind, item_id = body.get('kind'), hidden_id(body.get('id'))
+        if kind not in ('job', 'moodboard') or item_id is None:
+            return self._error(400, 'bad_request', 'body must be a JSON object such as %s' % HIDE_EXAMPLE)
+        match = EXPORT_ID_RE.fullmatch(catalog_id or '')
+        entry = self.app.published.entry(catalog_id) if match and not match.group(2) else None
+        if entry is None:
+            return self._hide_refused(catalog_id, show, 'unknown_catalog_entry', NOT_LISTED)
+        if not self._manages(entry['owner']):  # checked again on catalog.json as storage holds it
+            words = ACTION_WORDS['hide']
+            return self._hide_refused(catalog_id, show, 'not_owner',
+                                      words['not_owner'] if entry['owner'] else words['no_owner'])
+        roots, item = self.app.published.full_indexes(catalog_id, RESOLVE_WAIT_S)
+        if roots is None and not show:
+            if item is None:
+                return self._hide_refused(catalog_id, show, 'unknown_catalog_entry', NOT_LISTED)
+            return self._json(409, {'error': {'code': 'export_not_ready', 'message': NOT_READY},
+                                    'catalog': self._for_user(item)})
+        if not show and not any(item_id in (index.jobs if kind == 'job' else index.boards) for index in roots):
+            return self._hide_refused(catalog_id, show, 'unknown_%s' % kind, 'no %s with this id in the export' % kind)
+        try:
+            result = self.app.published.change_hidden(catalog_id, self.user, self._admin(), kind, item_id, show,
+                                                      roots, RESOLVE_WAIT_S)
+        except CatalogError as exc:
+            code = exc.code if exc.code in HIDE_STATUS else 'storage_error'
+            return self._hide_refused(catalog_id, show, code, self.app.store.scrub(exc.message))
+        item = self.app.published.item(catalog_id)
+        return self._json(200, {'changed': result['changed'], 'catalog': self._for_user(item) if item else None})
+
+    def _hide_refused(self, catalog_id: str, show: bool, code: str, message: str) -> None:
+        self.app.log('could not %s in %s for %s (%s): %s' % ('show again' if show else 'hide', catalog_id, self.user,
+                                                             code, message))
+        return self._error(HIDE_STATUS[code], code, message)
+
+    def _hidden(self, export_id: str) -> None:
+        """GET /api/exports/<id>/hidden: what the export's catalog entry hides (every root of the ZIP), for its
+        managers. It needs only the full indexes, so it also works while the list cannot be applied."""
+        if not self.app.hide_enabled:
+            return self._error(403, 'hide_disabled', HIDE_DISABLED)
+        match = EXPORT_ID_RE.fullmatch(export_id or '')
+        entry = self.app.published.entry(match.group(1)) if match else None
+        if entry is None:
+            return self._error(404, 'unknown_export', 'no published export with this id')
+        if not self._manages(entry['owner']):
+            return self._error(403, 'not_owner', SEE_HIDDEN[entry['owner'] is None])
+        roots, item = self.app.published.full_indexes(entry['id'], RESOLVE_WAIT_S)
+        if roots is None:
+            if item is None:
+                return self._error(404, 'unknown_export', 'no published export with this id')
+            return self._json(409, {'error': {'code': 'export_not_ready', 'message': NOT_READY},
+                                    'catalog': self._for_user(item)})
+        if export_id not in [index.id for index in roots]:
+            return self._error(404, 'unknown_export', 'no published export with this id')
+        record = (self.app.published.catalog.peek(entry['id']) or entry)['hidden']
+        closure = None
+        if record:
+            try:
+                closure = hidden_closure(roots, record['jobs'], record['moodboards'])
+            except Exception:  # still list what is hidden, so its managers can show it again (without counts)
+                self.app.log(self.app.store.scrub(traceback.format_exc(limit=5)).rstrip())
+                closure = hidden_closure((), record['jobs'], record['moodboards'])
+        return self._json(200, hidden_listing(roots, closure, record))
+
     def _admin(self) -> bool:
         return self.user in self.config.admin_emails
 
+    def _manages(self, owner: Optional[str]) -> bool:
+        """Whether the signed-in user manages an export: may delete it, hide in it and see what it hides. Only
+        while writes are on; then its owner and the administrators."""
+        return self.app.hide_enabled and (self._admin() or (owner is not None and owner == self.user))
+
     def _for_user(self, item: dict) -> dict:
-        """A catalog item, plus whether the signed-in user may delete it."""
-        mine = item.get('owner') is not None and item.get('owner') == self.user
-        return dict(item, can_delete=self.app.delete_enabled and (mine or self._admin()))
+        """A catalog item, plus whether the signed-in user may delete it and hide in it. Its managers also get
+        what it hides (counts, null while not counted) while it hides something; everyone else never learns
+        whether it does, and sees a failure to apply its list as a plain failure to prepare it."""
+        manages = self._manages(item.get('owner'))
+        out = dict(item, can_delete=manages, can_hide=manages)
+        if manages:
+            hidden = self.app.published.hidden_counts(item['id'])
+            if hidden is not None:
+                out['hidden'] = hidden
+        elif isinstance(item.get('error'), dict) and item['error'].get('code') == 'hidden_apply_failed':
+            out['error'] = {'code': 'internal', 'message': 'could not prepare this export'}
+        return out
 
     def _body_object(self, example: str, required: bool = False) -> Optional[dict]:
         """The small JSON object a POST sends ({} without a body, unless one is required); None once an
@@ -863,15 +972,78 @@ class HostedHandler(Handler):
         return value
 
     def _export_or_404(self, export_id: str):
-        index, item = self.app.published.resolve(export_id, RESOLVE_WAIT_S)
-        if index is None:
+        """The choke point of every /api/exports/<id>/... and /files/<id>/... route: the index everyone sees (built
+        without what the entry hides), or for the export's managers a ManagerView of it. Both keep the export id,
+        so addresses, file ids and thumbnails are the same."""
+        resolved, item = self.app.published.resolve(export_id, RESOLVE_WAIT_S)
+        if resolved is None:
             if item is None:
                 self._error(404, 'unknown_export', 'no published export with this id')
             else:
-                self._json(409, {'error': {'code': 'export_not_ready',
-                                           'message': 'this export is not open yet; open it from the start page'},
+                self._json(409, {'error': {'code': 'export_not_ready', 'message': NOT_READY},
                                  'catalog': self._for_user(item)})
-        return index
+            return None
+        return ManagerView(resolved) if self._manages(resolved.entry['owner']) else resolved.visible
+
+
+class ManagerView:
+    """What an export route serves the export's managers (its owner, an administrator): lists, search, counts and
+    checks exactly as everyone sees them (the visible index), plus hide_preview on visible items; and, asked for by
+    id, the hidden items themselves from the full index, with a note on why they are hidden, and their files."""
+
+    def __init__(self, resolved):
+        self.resolved = resolved
+        visible = resolved.visible
+        self.id, self.view, self.limits, self.summary = visible.id, visible.view, visible.limits, visible.summary
+
+    def overview(self) -> dict:
+        return self.resolved.visible.overview()
+
+    def query_jobs(self, params) -> dict:
+        return self.resolved.visible.query_jobs(params)
+
+    def moodboards(self) -> dict:
+        return self.resolved.visible.moodboards()
+
+    def profiles_list(self) -> dict:
+        return self.resolved.visible.profiles_list()
+
+    def likes_list(self) -> dict:
+        return self.resolved.visible.likes_list()
+
+    def _detail(self, kind: str, item_id: str) -> Optional[dict]:
+        found = self.resolved
+        read = 'job_detail' if kind == 'job' else 'moodboard_detail'
+        detail = getattr(found.visible, read)(item_id)
+        if detail is not None:
+            detail['hide_preview'] = hide_preview(found.roots, found.closure, kind, item_id)
+            return detail
+        if found.closure is None:  # nothing hidden: the visible index is the full one
+            return None
+        if item_id not in (found.closure.jobs if kind == 'job' else found.closure.moodboards):
+            return None
+        detail = getattr(found.full, read)(item_id)
+        if detail is not None:
+            detail['hidden'] = hidden_note(found.roots, found.closure, found.record, kind, item_id)
+        return detail
+
+    def job_detail(self, job_id: str) -> Optional[dict]:
+        return self._detail('job', job_id)
+
+    def moodboard_detail(self, board_id: str) -> Optional[dict]:
+        return self._detail('moodboard', board_id)
+
+    def file(self, file_id: str):
+        rec = self.resolved.visible.file(file_id)
+        if rec is None and self.resolved.full is not self.resolved.visible:
+            rec = self.resolved.full.file(file_id)  # a picture only hidden items use
+        return rec
+
+    def mark_unreadable(self, rec, reason: str) -> None:
+        for index in (self.resolved.visible, self.resolved.full):
+            if index.file_ids.get(rec.file_id) is rec:
+                return index.mark_unreadable(rec, reason)
+        return None
 
 
 # --------------------------------------------------------------------- app
@@ -897,6 +1069,12 @@ class HostedApp(ViewerApp):
     @property
     def delete_enabled(self) -> bool:
         """MJV_CATALOG_WRITE_URL is set: owners and administrators can delete exports."""
+        return self.store.writable
+
+    @property
+    def hide_enabled(self) -> bool:
+        """The same switch: owners and administrators can hide generations and moodboards and show them again.
+        Without it nobody can, but hidden lists still apply to everyone."""
         return self.store.writable
 
     def check_cache(self) -> bool:

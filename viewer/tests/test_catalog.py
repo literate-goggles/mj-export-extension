@@ -1,4 +1,4 @@
-"""Hosted mode: catalog validation and refresh, the verified ZIP cache, downloads and their faults, deleting.
+"""Hosted mode: catalog validation and refresh, the verified ZIP cache, downloads and their faults, deleting, hiding.
 
 Runs against tests/fake_blob.py with invented exports only. The fake container's
 query strings (read-only, and one that may write and delete) stand in for real
@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from unittest import mock
 
 from mjviewer import catalog as catalog_module
+from mjviewer import hosted as hosted_module
+from mjviewer import model as model_module
 from mjviewer import server as server_module
 from mjviewer.catalog import (BlobStore, Catalog, CatalogError, Published, ZipCache, parse_catalog)
 from mjviewer.model import parse_date
@@ -1692,6 +1694,547 @@ class DeleteFlowTests(FlowTestCase):
             texts.extend((str(headers), body.decode('utf-8', 'replace')))
         self.assert_no_secret(*texts)
         self.assertIn('HTTP 403', hosted.log.getvalue() + ''.join(texts))
+
+
+def hidden_record(jobs=(), boards=(), counts=None, **extra) -> dict:
+    """A hidden record as the app writes it (hidden by alice@example.com), plus extra keys."""
+    record = dict(extra)
+    for name, ids in (('jobs', jobs), ('moodboards', boards)):
+        if ids:
+            record[name] = [{'id': item_id, 'hidden_at': '2026-11-01T09:00:00Z', 'hidden_by': 'alice@example.com'}
+                            for item_id in ids]
+    if counts is not None:
+        record['counts'] = counts
+    return record
+
+
+class HideFlowTests(FlowTestCase):
+    """Hiding and showing again through the HTTP API, on fixtures.hiding_export() as published by
+    alice@example.com: the conditional rewrite of catalog.json, applying the list on the acting instance before
+    answering and on other instances at their next catalog read, failed builds, storage failures and limits.
+    bob@example.com manages nothing."""
+
+    def start(self, cache='cache', **env):
+        env.setdefault('MJV_CATALOG_WRITE_URL', self.blob.write_url)
+        self.google.email = 'alice@example.com'
+        return super().start(cache, **env)
+
+    def publish(self, data=None, **kwargs):
+        kwargs.setdefault('owner', 'alice@example.com')
+        return self.blob.put_export(fx.hiding_zip_bytes() if data is None else data, **kwargs)
+
+    def ready(self, hosted, session, entry, state='ready'):
+        self.open(hosted, session, entry['id'])
+        item, _ = self.wait(hosted, session, entry['id'])
+        self.assertEqual(item['state'], state, item)
+        return item
+
+    def change(self, hosted, session, entry, kind, item_id, show=False):
+        status, _, body = hosted.post('/api/catalog/%s/%s' % (entry['id'], 'unhide' if show else 'hide'), session,
+                                      body=json.dumps({'kind': kind, 'id': item_id}).encode())
+        return status, json.loads(body)
+
+    def stored(self):
+        return self.blob.read_json('catalog.json')
+
+    def record(self, n=0):
+        return self.stored()['exports'][n].get('hidden')
+
+    def code(self, hosted, session, path):
+        status, _, body = hosted.get(path, session)
+        return status, (json.loads(body).get('error') or {}).get('code') if status != 200 else None
+
+    def bob(self, hosted):
+        return hosted.session('bob@example.com')
+
+    def puts(self):
+        return self.blob.count('catalog.json', method='PUT')
+
+    def test_hiding_rewrites_the_entry_on_its_etag_and_keeps_unknown_fields(self):
+        mine = dict(self.publish(), x_note={'kept': True},
+                    hidden=hidden_record(jobs=['job-grid-c'], x_record={'kept': [1]}))
+        mine['hidden']['jobs'][0]['x_item'] = 'kept'
+        self.blob.write_catalog([mine], x_publisher={'tool': 'invented'})
+        hosted, session = self.start()
+        self.ready(hosted, session, mine)
+        late = self.blob.put_export(fx.export_zip_bytes(fx.gallery_export(5)), name='late.zip')
+        written = []
+
+        def another_writer(name, method):  # publishes an export between the viewer's read and its write, once
+            if name == 'catalog.json' and not written:
+                written.append(method)
+                data = self.stored()
+                data['exports'].append(late)
+                data['x_added_meanwhile'] = [1, 2]
+                self.blob.put('catalog.json', json.dumps(data).encode())
+
+        self.blob.before_write = another_writer
+        started = time.time()
+        status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo')
+        self.assertEqual((status, answer['changed']), (200, True), answer)
+        puts = [r for r in self.blob.requests if r['method'] == 'PUT']
+        self.assertEqual([r['status'] for r in puts], [412, 201])
+        self.assertTrue(all(r['if_match'] and r['sas'] == 'write' for r in puts))
+        self.assertNotEqual(puts[0]['if_match'], puts[1]['if_match'])  # read again before writing again
+        data = self.stored()
+        self.assertEqual([e['id'] for e in data['exports']], [mine['id'], late['id']])
+        self.assertEqual((data['x_publisher'], data['x_added_meanwhile']), ({'tool': 'invented'}, [1, 2]))
+        entry = data['exports'][0]
+        self.assertEqual(entry['x_note'], {'kept': True})
+        record = entry['hidden']
+        self.assertEqual(list(record), ['x_record', 'jobs', 'counts'])  # as it was, counts last
+        self.assertEqual(record['x_record'], {'kept': [1]})
+        old, new = record['jobs']
+        self.assertEqual(old, dict(mine['hidden']['jobs'][0]))
+        self.assertEqual((set(new), new['id'], new['hidden_by']), ({'id', 'hidden_at', 'hidden_by'}, 'job-zq-solo',
+                                                                    'alice@example.com'))
+        self.assertTrue(started - 1 <= parse_date(new['hidden_at']).timestamp() <= time.time())
+        self.assertEqual(data['updated_at'], new['hidden_at'])
+        # job-grid-c (4 pictures) and job-zq-solo (3, and its picture pinned to board-1)
+        self.assertEqual(record['counts'], {'jobs': 2, 'moodboards': 0, 'images': 8})
+        self.assertEqual(answer['catalog']['hidden'], {'jobs': 2, 'moodboards': 0, 'images': 8})
+        self.assertIs(answer['catalog']['can_hide'], True)
+
+    def test_hiding_is_idempotent_and_show_again_removes_the_record(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        self.ready(hosted, session, mine)
+        self.assertEqual(self.change(hosted, session, mine, 'job', 'job-zq-solo')[1]['changed'], True)
+        writes, stored = self.puts(), self.stored()
+        status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo')
+        self.assertEqual((status, answer['changed'], self.puts(), self.stored()), (200, False, writes, stored))
+        self.assertEqual(self.change(hosted, session, mine, 'moodboard', 'board-1', show=True)[1]['changed'], False)
+        self.assertEqual(self.puts(), writes)
+        status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo', show=True)
+        self.assertEqual((status, answer['changed']), (200, True))
+        self.assertNotIn('hidden', self.stored()['exports'][0])  # nothing else in the record: it goes
+        self.assertNotIn('hidden', answer['catalog'])
+        self.assertEqual(self.code(hosted, self.bob(hosted), '/api/exports/%s/jobs/job-zq-solo' % mine['id'])[0], 200)
+        log = hosted.log.getvalue()
+        self.assertEqual(log.count('hid a generation in %s by alice@example.com' % mine['id']), 1)
+        self.assertIn('showed a generation again in %s by alice@example.com; hidden now: 0 generations, '
+                      '0 moodboards' % mine['id'], log)
+        # A record with a key this server does not know keeps it, and its object, when its last item goes.
+        self.blob.write_catalog([dict(mine, hidden=hidden_record(jobs=['job-zq-solo'], x_keep=1,
+                                                                 counts={'jobs': 1, 'moodboards': 0, 'images': 4}))])
+        status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo', show=True)
+        self.assertEqual((status, answer['changed'], self.record()), (200, True, {'x_keep': 1}))
+        # Showing again an id that is in no export root works: managers remove such items too.
+        self.blob.write_catalog([dict(mine, hidden=hidden_record(jobs=['job-in-no-root']))])
+        self.assertEqual(self.change(hosted, session, mine, 'job', 'job-in-no-root', show=True)[1]['changed'], True)
+        self.assertIsNone(self.record())
+
+    def test_null_lists_are_written_like_empty_ones(self):
+        mine = dict(self.publish(), hidden={'jobs': None, 'moodboards': None, 'counts': None})
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        self.ready(hosted, session, mine)
+        status, answer = self.change(hosted, session, mine, 'moodboard', 'board-zq')
+        self.assertEqual((status, answer['changed']), (200, True), answer)
+        record = self.record()
+        self.assertEqual(([item['id'] for item in record['moodboards']], record['jobs']), (['board-zq'], None))
+        # job-zq-exp, -derived, -inferred and -shared; their 12 pictures and the board's 2
+        self.assertEqual(record['counts'], {'jobs': 4, 'moodboards': 1, 'images': 14})
+
+    def test_a_change_that_would_make_the_entry_unreadable_is_refused(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        self.ready(hosted, session, mine)
+        real = catalog_module._hidden_record
+
+        def refuse(raw):
+            if isinstance(raw, dict) and 'job-zq-solo' in json.dumps(raw):
+                return None, 'invented reason'
+            return real(raw)
+
+        with mock.patch.object(catalog_module, '_hidden_record', side_effect=refuse):
+            status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo')
+        self.assertEqual((status, answer['error']['code']), (502, 'storage_error'))
+        self.assertEqual(answer['error']['message'], 'this change would make the export unreadable for the viewer '
+                                                     '(invented reason); nothing was changed')
+        self.assertEqual((self.puts(), self.record()), (0, None))
+        self.assertEqual(self.code(hosted, self.bob(hosted), '/api/exports/%s/overview' % mine['id'])[0], 200)
+        self.assertIn('could not hide in %s for alice@example.com (storage_error): this change would make'
+                      % mine['id'], hosted.log.getvalue())
+
+    def test_catalog_json_never_grows_past_the_write_limit(self):
+        mine = dict(self.publish(), hidden=hidden_record(jobs=['job-grid-b']))
+        data = {'version': 1, 'updated_at': '2026-04-01T10:00:00Z', 'exports': [mine], 'x_padding': ''}
+        size = len(catalog_module.dump_catalog(data))
+        data['x_padding'] = 'p' * (catalog_module.MAX_WRITE_BYTES - size - 40)  # 40 bytes under the limit
+        self.blob.put('catalog.json', catalog_module.dump_catalog(data))
+        hosted, session = self.start()
+        self.ready(hosted, session, mine)
+        status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo')
+        self.assertEqual((status, answer['error']['code']), (502, 'storage_error'))
+        self.assertEqual(answer['error']['message'], 'catalog.json would be 12.0 MiB, more than this viewer writes '
+                                                     '(12 MiB); nothing was changed')
+        self.assertEqual(self.puts(), 0)
+        # Showing again and deleting make it smaller: they still work.
+        self.assertEqual(self.change(hosted, session, mine, 'job', 'job-grid-b', show=True)[0], 200)
+        status, _, body = hosted.post('/api/catalog/%s/delete' % mine['id'], session,
+                                      body=json.dumps({'confirm': mine['id']}).encode())
+        self.assertEqual((status, json.loads(body)), (200, {'deleted': mine['id']}))
+
+    def test_the_hiding_instance_applies_it_before_answering(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start(MJV_CATALOG_TTL_S='600')
+        self.ready(hosted, session, mine)
+        bob = self.bob(hosted)
+        job = json.loads(hosted.get('/api/exports/%s/jobs/job-zq-solo' % mine['id'], bob)[2])['job']
+        files = [image['url'] for image in job['images'] if image['url']] + [job['images'][0]['thumb_url']]
+        self.assertEqual([hosted.get(url, bob)[0] for url in files], [200] * 4)
+        logged = len(hosted.log.getvalue())
+        status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo')
+        self.assertEqual((status, answer['changed']), (200, True))
+        self.assertEqual(hosted.log.getvalue()[logged:].splitlines(), [
+            'hid a generation in %s by alice@example.com; hidden now: 1 generations, 0 moodboards' % mine['id'],
+            'POST /api/catalog/%s/hide 200' % mine['id']])
+        self.assertEqual(self.code(hosted, bob, '/api/exports/%s/jobs/job-zq-solo' % mine['id']), (404, 'unknown_job'))
+        self.assertEqual([self.code(hosted, bob, url) for url in files], [(404, 'unknown_file')] * 4)
+        self.assertEqual(answer['catalog']['state'], 'ready')
+        self.assertEqual([e['counts']['jobs'] for e in answer['catalog']['exports']], [16])
+
+    def test_an_unchanged_request_adopts_the_fresh_catalog(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        first, at_first = self.start(MJV_CATALOG_TTL_S='600')
+        second, at_second = self.start(MJV_CATALOG_TTL_S='600')  # the same cache folder
+        for hosted, session in ((first, at_first), (second, at_second)):
+            self.ready(hosted, session, mine)
+        bob = self.bob(second)
+        self.assertEqual(self.change(first, at_first, mine, 'job', 'job-zq-solo')[1]['changed'], True)
+        path = '/api/exports/%s/jobs/job-zq-solo' % mine['id']
+        self.assertEqual(self.code(second, bob, path)[0], 200)  # the second instance has not read it yet
+        status, answer = self.change(second, at_second, mine, 'job', 'job-zq-solo')
+        self.assertEqual((status, answer['changed']), (200, False))
+        self.assertEqual(answer['catalog']['hidden'], {'jobs': 1, 'moodboards': 0, 'images': 4})
+        detail = json.loads(second.get(path, at_second)[2])
+        self.assertEqual(detail['hidden']['on_its_own']['hidden_by'], 'alice@example.com')
+        self.assertEqual(self.code(second, bob, path), (404, 'unknown_job'))
+        self.assertEqual(self.puts(), 1)
+
+    def test_an_unchanged_closure_is_not_rebuilt(self):
+        """Hiding on its own a job that a hidden moodboard already hides changes the list, not what everyone else
+        sees: the visible indexes are kept under the new list."""
+        mine = dict(self.publish(), hidden=hidden_record(boards=['board-zq']))
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        self.ready(hosted, session, mine)
+        published = hosted.app.published
+        before = published._variants[mine['id']]
+        real = model_module.ExportIndex.without
+        with mock.patch.object(model_module.ExportIndex, 'without', autospec=True, side_effect=real) as built:
+            status, answer = self.change(hosted, session, mine, 'job', 'job-zq-exp')
+            self.assertEqual((status, answer['changed']), (200, True))
+            self.assertEqual(built.call_count, 0)
+        after = published._variants[mine['id']]
+        self.assertNotEqual(after.key, before.key)
+        self.assertIs(after.views, before.views)
+        detail = json.loads(hosted.get('/api/exports/%s/jobs/job-zq-exp' % mine['id'], session)[2])
+        self.assertEqual(detail['hidden']['on_its_own']['hidden_by'], 'alice@example.com')
+        self.assertEqual([board['id'] for board in detail['hidden']['with_moodboards']], ['board-zq'])
+        self.assertEqual(self.code(hosted, self.bob(hosted), '/api/exports/%s/jobs/job-zq-exp' % mine['id']),
+                         (404, 'unknown_job'))
+
+    def test_visible_builds_run_one_at_a_time(self):
+        mine = self.publish()
+        other = self.publish(fx.hiding_zip_bytes(root='mj_export_other'), name='other.zip')
+        self.blob.write_catalog([mine, other])
+        hosted, session = self.start()
+        for entry in (mine, other):
+            self.ready(hosted, session, entry)
+        real = model_module.ExportIndex.without
+        lock, running, most = threading.Lock(), [0], [0]
+
+        def slow(index, hidden):
+            with lock:
+                running[0] += 1
+                most[0] = max(most[0], running[0])
+            try:
+                time.sleep(0.3)
+                return real(index, hidden)
+            finally:
+                with lock:
+                    running[0] -= 1
+
+        with mock.patch.object(model_module.ExportIndex, 'without', autospec=True, side_effect=slow) as built:
+            # One catalog refresh changes both lists.
+            self.blob.write_catalog([dict(mine, hidden=hidden_record(jobs=['job-zq-solo'])),
+                                     dict(other, hidden=hidden_record(boards=['board-zq']))])
+            for entry in (mine, other):
+                self.assertEqual(self.code(hosted, session, '/api/exports/%s/overview' % entry['id']), (200, None))
+            self.assertEqual((built.call_count, most[0]), (2, 1))
+        self.assertEqual(hosted.log.getvalue().count('applied the hidden list of '), 2)
+
+    def test_another_instance_follows_at_its_catalog_refresh(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        first, at_first = self.start()
+        second, at_second = self.start(MJV_CATALOG_TTL_S='600')  # the same cache folder
+        for hosted, session in ((first, at_first), (second, at_second)):
+            self.ready(hosted, session, mine)
+        bob = self.bob(second)
+        path = '/api/exports/%s/jobs/job-zq-solo' % mine['id']
+        self.assertEqual(self.change(first, at_first, mine, 'job', 'job-zq-solo')[1]['changed'], True)
+        self.assertEqual(self.code(second, bob, path)[0], 200)  # until it reads catalog.json again (R-3)
+        real, release = model_module.ExportIndex.without, threading.Event()
+
+        def slow(index, hidden):
+            release.wait(10)
+            return real(index, hidden)
+
+        answers = []
+        with mock.patch.object(model_module.ExportIndex, 'without', autospec=True, side_effect=slow), \
+                mock.patch.object(hosted_module, 'RESOLVE_WAIT_S', 0.2):
+            second.app.catalog.expire()
+            for _ in range(3):  # while the list is applied: never the item, only "not ready yet"
+                answers.append(self.code(second, bob, path))
+            self.assertEqual(json.loads(second.get('/api/catalog/%s' % mine['id'], bob)[2])['state'], 'opening')
+            release.set()
+            deadline = time.time() + 20
+            while time.time() < deadline and answers[-1][0] == 409:
+                answers.append(self.code(second, bob, path))
+                time.sleep(0.05)
+        self.assertEqual(answers[:3], [(409, 'export_not_ready')] * 3)
+        self.assertEqual(answers[-1], (404, 'unknown_job'))
+        self.assertNotIn((200, None), answers)
+        log = second.log.getvalue()
+        self.assertIn('applied the hidden list of %s (1 generations, 0 moodboards hidden)' % mine['id'], log)
+        self.assertNotIn('by alice@example.com', log)  # only the acting instance says who
+
+    def test_a_record_that_changes_while_opening_is_applied_before_ready(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        bob = self.bob(hosted)
+        # During the download.
+        self.slow(mine, chunk=4096, delay=0.01)
+        self.open(hosted, session, mine['id'])
+        self.wait(hosted, session, mine['id'], states=('downloading',))
+        self.blob.write_catalog([dict(mine, hidden=hidden_record(jobs=['job-zq-solo']))])
+        self.blob.faults.clear()
+        self.ready(hosted, session, mine)
+        self.assertEqual(self.code(hosted, bob, '/api/exports/%s/jobs/job-zq-solo' % mine['id']), (404, 'unknown_job'))
+        self.assertIn('opened %s: 1 export root(s); hiding 1 generations and 0 moodboards' % mine['id'],
+                      hosted.log.getvalue())
+        # During the build of the visible index: the newer list is built and applied instead.
+        real, changed = model_module.ExportIndex.without, []
+
+        def change_meanwhile(index, hidden):
+            if not changed:
+                changed.append(1)
+                self.blob.write_catalog([dict(mine, hidden=hidden_record(boards=['board-zq']))])
+                hosted.app.catalog.expire()
+                hosted.app.catalog.entries()
+            return real(index, hidden)
+
+        hosted.app.published._evicted([mine['sha256']])  # closed here; its ZIP is still in the cache
+        self.blob.write_catalog([dict(mine, hidden=hidden_record(jobs=['job-zq-solo']))])
+        with mock.patch.object(model_module.ExportIndex, 'without', autospec=True, side_effect=change_meanwhile):
+            self.ready(hosted, session, mine)
+        for job_id, code in (('job-zq-solo', None), ('job-zq-exp', 'unknown_job')):
+            self.assertEqual(self.code(hosted, bob, '/api/exports/%s/jobs/%s' % (mine['id'], job_id))[1], code)
+
+    def test_an_invalid_record_stops_serving_the_export_everywhere(self):
+        mine = dict(self.publish(), hidden=hidden_record(jobs=['job-zq-solo']))
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        self.ready(hosted, session, mine)
+        bob = self.bob(hosted)
+        overview = '/api/exports/%s/overview' % mine['id']
+        self.assertEqual(self.code(hosted, bob, overview), (200, None))
+        self.blob.write_catalog([dict(mine, hidden={'jobs': [{'id': ''}]})])
+        self.assertEqual(self.code(hosted, bob, overview), (404, 'unknown_export'))
+        listing = json.loads(hosted.get('/api/exports', bob)[2])
+        self.assertEqual((listing['catalog']['items'], listing['exports']), ([], []))
+        self.assertEqual(listing['catalog']['skipped'], [{'index': 0, 'reason': 'hidden.jobs[0] has no usable id'}])
+        hosted.app.maintain()
+        self.assertIsNone(hosted.app.registry.get(mine['id']))
+        self.assertNotIn(mine['id'], hosted.app.published._variants)
+
+    def test_a_failed_build_keeps_managers_able_to_show_items_again(self):
+        mine = dict(self.publish(), hidden=hidden_record(jobs=['job-zq-solo']))
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        bob = self.bob(hosted)
+        overview = '/api/exports/%s/overview' % mine['id']
+        with mock.patch.object(model_module.ExportIndex, 'without', autospec=True,
+                               side_effect=RuntimeError('invented')) as built:
+            item = self.ready(hosted, session, mine, state='failed')
+            self.assertEqual(item['error'], {'code': 'hidden_apply_failed',
+                                             'message': 'could not apply the list of hidden items (RuntimeError)'})
+            for who, error in ((session, 'hidden_apply_failed'), (bob, 'internal')):
+                status, _, body = hosted.get(overview, who)
+                answer = json.loads(body)
+                self.assertEqual((status, answer['error']['code'], answer['catalog']['state']),
+                                 (409, 'export_not_ready', 'failed'))
+                self.assertEqual(answer['catalog']['error']['code'], error)
+            self.assertEqual(json.loads(hosted.get(overview, bob)[2])['catalog']['error'],
+                             {'code': 'internal', 'message': 'could not prepare this export'})
+            listing = json.loads(hosted.get('/api/exports/%s/hidden' % mine['id'], session)[2])
+            self.assertEqual([row['id'] for row in listing['jobs']], ['job-zq-solo'])
+            calls = built.call_count
+            self.open(hosted, session, mine['id'])  # without retry: not built again
+            self.assertEqual(built.call_count, calls)
+            self.open(hosted, bob, mine['id'], retry=True)  # Try again builds again (and fails again)
+            item, _ = self.wait(hosted, session, mine['id'])
+            self.assertEqual((item['state'], built.call_count), ('failed', calls + 1))
+            # The owner shows the only item again: nothing is hidden any more, so the export opens.
+            status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo', show=True)
+            self.assertEqual((status, answer['changed'], answer['catalog']['state']), (200, True, 'ready'))
+        self.assertEqual(self.code(hosted, bob, overview), (200, None))
+        log = hosted.log.getvalue()
+        self.assertEqual(log.count('could not apply the hidden list of %s (RuntimeError); it is not served on this '
+                                   'instance until it is applied' % mine['id']), 2)
+        self.assertIn('Traceback', log)
+        self.assertIn('hidden now: 0 generations, 0 moodboards', log)
+
+    def test_a_stale_build_never_touches_a_reopened_export(self):
+        for how in ('deleted and published again', 'evicted and opened again'):
+            with self.subTest(how=how):
+                data = fx.hiding_zip_bytes(root='mj_export_%s' % how.split()[0])
+                mine = dict(self.publish(data, name='%s.zip' % how.split()[0]), hidden=hidden_record(jobs=['job-zq-solo']))
+                self.blob.write_catalog([mine])
+                hosted, session = self.start(cache='cache-' + how.split()[0])
+                self.ready(hosted, session, mine)
+                real, entered, release = model_module.ExportIndex.without, threading.Event(), threading.Event()
+                calls = []
+
+                def stale_then_real(index, hidden):
+                    calls.append(1)
+                    if len(calls) == 1:  # the rebuild of the first preparation: slow, then it fails
+                        entered.set()
+                        release.wait(10)
+                        raise RuntimeError('invented')
+                    return real(index, hidden)
+
+                with mock.patch.object(model_module.ExportIndex, 'without', autospec=True, side_effect=stale_then_real):
+                    self.blob.write_catalog([dict(mine, hidden=hidden_record(boards=['board-zq']))])
+                    hosted.get('/api/exports', session)  # reads the new list: the rebuild starts
+                    self.assertTrue(entered.wait(10))
+                    if how.startswith('deleted'):
+                        status, _, _ = hosted.post('/api/catalog/%s/delete' % mine['id'], session,
+                                                   body=json.dumps({'confirm': mine['id']}).encode())
+                        self.assertEqual(status, 200)
+                        self.blob.put_export(data, name='again.zip', owner='alice@example.com')
+                    else:
+                        hosted.app.published._evicted([mine['sha256']])
+                    self.blob.write_catalog([dict(mine, hidden=hidden_record(boards=['board-zq']))])
+                    self.open(hosted, session, mine['id'])
+                    time.sleep(0.2)
+                    release.set()
+                    item, _ = self.wait(hosted, session, mine['id'])
+                self.assertEqual(item['state'], 'ready', item)
+                variant = hosted.app.published._variants[mine['id']]
+                self.assertIsNone(variant.error)
+                self.assertIs(variant.prep, hosted.app.published._prep(mine['id']))
+                self.assertEqual(self.code(hosted, self.bob(hosted), '/api/exports/%s/jobs/job-zq-exp' % mine['id']),
+                                 (404, 'unknown_job'))
+
+    def test_storage_errors_change_nothing_and_unclear_writes_are_checked(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        self.ready(hosted, session, mine)
+        before = self.stored()
+        for fault, text in (('403', 'write access may have expired'), ('404', 'HTTP 404'), ('302', 'redirect')):
+            with self.subTest(fault=fault):
+                self.blob.write_faults['catalog.json'] = fault
+                try:
+                    status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo')
+                finally:
+                    self.blob.write_faults.clear()
+                self.assertEqual((status, answer['error']['code']), (502, 'storage_error'))
+                self.assertIn(text, answer['error']['message'])
+                self.assertTrue(answer['error']['message'].endswith('; nothing was changed'), answer)
+                self.assertEqual(self.stored(), before)
+                self.assert_no_secret(answer)
+        self.blob.write_faults['catalog.json'] = '500'  # not stored, and the read again says so
+        try:
+            status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo')
+        finally:
+            self.blob.write_faults.clear()
+        self.assertEqual((status, answer['error']['code']), (502, 'hide_unconfirmed'))
+        self.assertEqual(answer['error']['message'], 'catalog.json: storage answered HTTP 500; could not confirm '
+                         'whether it changed (catalog.json read again does not show the change): reload the page '
+                         'to check')
+        self.assertEqual(self.stored(), before)
+        self.blob.write_faults['catalog.json'] = 'drop'  # stored, but the answer never arrived
+        try:
+            status, answer = self.change(hosted, session, mine, 'job', 'job-zq-solo')
+        finally:
+            self.blob.write_faults.clear()
+        self.assertEqual((status, answer['changed']), (200, True))
+        self.assertEqual([item['id'] for item in self.record()['jobs']], ['job-zq-solo'])
+        self.assertEqual(self.code(hosted, self.bob(hosted), '/api/exports/%s/jobs/job-zq-solo' % mine['id']),
+                         (404, 'unknown_job'))
+        self.blob.write_faults['catalog.json'] = 'drop'  # and the same for showing again
+        try:
+            self.assertEqual(self.change(hosted, session, mine, 'job', 'job-zq-solo', show=True)[0], 200)
+        finally:
+            self.blob.write_faults.clear()
+        self.assertIsNone(self.record())
+        log = hosted.log.getvalue()
+        self.assertIn('could not hide in %s for alice@example.com (hide_unconfirmed): ' % mine['id'], log)
+        self.assertEqual(log.count('catalog: the write of catalog.json was stored'), 2)
+        self.assert_no_secret(log)
+
+    def test_bounds(self):
+        record = hidden_record(jobs=['job-in-no-root-%d' % n for n in range(999)], boards=['board-in-no-root'])
+        mine = dict(self.publish(), hidden=record)
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        self.ready(hosted, session, mine)
+        for kind, item_id in (('job', 'job-zq-solo'), ('moodboard', 'board-zq')):
+            status, answer = self.change(hosted, session, mine, kind, item_id)
+            self.assertEqual((status, answer['error']['code']), (409, 'too_many_hidden'))
+            self.assertEqual(answer['error']['message'], 'this export already hides 1000 generations and moodboards, '
+                                                         'the most it can; show some again first')
+        self.assertEqual(self.puts(), 0)
+        # Showing one again makes room; hiding then works.
+        self.assertEqual(self.change(hosted, session, mine, 'job', 'job-in-no-root-0', show=True)[0], 200)
+        self.assertEqual(self.change(hosted, session, mine, 'job', 'job-zq-solo')[0], 200)
+        self.assertEqual(len(self.record()['jobs']) + len(self.record()['moodboards']), 1000)
+
+    def test_deleting_an_export_that_hides_items_writes_the_same_tombstone(self):
+        """Tombstones do not copy the hidden list (publishing the ZIP again starts with nothing hidden)."""
+        mine = dict(self.publish(), hidden=hidden_record(jobs=['job-zq-solo']))
+        self.blob.write_catalog([mine])
+        hosted, session = self.start()
+        status, _, _ = hosted.post('/api/catalog/%s/delete' % mine['id'], session,
+                                   body=json.dumps({'confirm': mine['id']}).encode())
+        self.assertEqual(status, 200)
+        stone = self.stored()['deleted'][0]
+        self.assertEqual(set(stone), {'id', 'sha256', 'size', 'owner', 'deleted_at', 'deleted_by'})
+
+    def test_counts_before_opening(self):
+        summary = {'jobs': 17, 'moodboards': 3, 'profiles': 2, 'images': 60, 'export_time': None,
+                   'extension_version': '0.4.0', 'status': 'completed_with_failures'}
+        mine = dict(self.publish(summary=summary),
+                    hidden=hidden_record(jobs=['job-zq-solo'], counts={'jobs': 1, 'moodboards': 0, 'images': 4}))
+        unknown = dict(self.publish(fx.hiding_zip_bytes(root='mj_export_unknown'), name='unknown.zip', summary=summary),
+                       hidden=hidden_record(jobs=['job-zq-solo']))
+        plain = self.publish(fx.hiding_zip_bytes(root='mj_export_plain'), name='plain.zip', summary=summary)
+        self.blob.write_catalog([mine, unknown, plain])
+        hosted, session = self.start()
+        bob = self.bob(hosted)
+        for who, managers in ((session, True), (bob, False)):
+            items = json.loads(hosted.get('/api/exports', who)[2])['catalog']['items']
+            self.assertEqual([(i['summary']['jobs'], i['summary']['moodboards'], i['summary']['images'],
+                               i['summary']['profiles']) for i in items],
+                             [(16, 3, 56, 2), (None, None, None, 2), (17, 3, 60, 2)])
+            self.assertEqual([i.get('hidden') for i in items],
+                             [{'jobs': 1, 'moodboards': 0, 'images': 4}, {'jobs': None, 'moodboards': None, 'images': None},
+                              None] if managers else [None] * 3)
+            self.assertEqual([i['can_hide'] for i in items], [managers] * 3)
+        # Opened, the summaries everyone sees are the visible ones and match the card.
+        item = self.ready(hosted, bob, mine)
+        self.assertEqual(item['summary']['jobs'], item['exports'][0]['counts']['jobs'])
+        self.assertEqual(item['summary']['images'], item['exports'][0]['counts']['images_present'])
 
 
 class PublishedUnitTests(BlobTestCase):

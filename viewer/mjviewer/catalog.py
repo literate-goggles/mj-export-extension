@@ -54,10 +54,11 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import namedtuple
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from . import __version__
-from .model import MAX_COUNT, iso_utc, parse_date
+from .model import MAX_COUNT, hidden_closure, iso_utc, parse_date
 from .sources import CHUNK_SIZE, SourceError
 
 CATALOG_NAME = 'catalog.json'
@@ -99,8 +100,11 @@ EMAIL_RE = re.compile(r"[a-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}@(?:[a-z0-9](?:[a-z0-9
 NOT_LISTED = 'this export is not published any more; it may have been deleted already'
 CATALOG_UNAVAILABLE = "The viewer can't reach its list of exports right now. Try again in a few minutes."
 UNCHANGED = object()  # what a change to catalog.json returns when there is nothing to change: nothing is written
+TOO_MANY_HIDDEN = ('this export already hides %d generations and moodboards, the most it can; show some again first'
+                   % MAX_HIDDEN_ITEMS)
+UNREADABLE_CHANGE = 'this change would make the export unreadable for the viewer (%s); nothing was changed'
 # How each change written to catalog.json words its errors (Published._rewrite); a delete's are the ones it always had.
-_ACTIONS = {
+ACTION_WORDS = {
     'delete': {'nothing': 'nothing was deleted', 'unconfirmed': 'delete_unconfirmed',
                'unclear': '%s; could not confirm whether the export was deleted (%s): reload the page to check',
                'not_shown': 'catalog.json read again does not show the deletion',
@@ -1166,6 +1170,37 @@ class _Prep:
         self.done = done
 
 
+# How a ready export applies its entry's hidden list in this process: the record key it was built for, the closure,
+# and the visible index of every root ({export id: index}); or, when building failed, error instead of views.
+_Variant = namedtuple('_Variant', 'prep key closure views error')
+# What an export route serves (Published.resolve): the entry as read, the full index of the requested root, the index
+# everyone but its managers sees (the full one while nothing is hidden), the closure and the record (None while
+# nothing is hidden), and the full index of every root of the ZIP.
+Resolved = namedtuple('Resolved', 'entry full visible closure record roots')
+
+
+def _visible_summary(entry: dict) -> dict:
+    """The published summary less what is hidden: unknown (null) counts while the hidden list was not counted."""
+    summary = dict(entry['summary'])
+    record = entry.get('hidden')
+    if record:
+        counts = record['counts']
+        for key in HIDDEN_COUNTS:
+            if counts is None:
+                summary[key] = None
+            elif summary.get(key) is not None:
+                summary[key] = max(0, summary[key] - counts[key])
+    return summary
+
+
+def _shown(variant: Optional[_Variant]) -> Tuple[int, int]:
+    """How many generations and moodboards an applied hidden list leaves out, over every root."""
+    if variant is None or variant.views is None:
+        return 0, 0
+    present = [index.hidden.present for index in variant.views.values()]
+    return sum(p['jobs'] for p in present), sum(p['moodboards'] for p in present)
+
+
 class Published:
     """Catalog entries, their state in this process, and the exports opened from them."""
 
@@ -1189,7 +1224,11 @@ class Published:
         self._blob_errors: Dict[str, str] = {}   # sha -> the failure last logged for it
         self._blobs_done: Set[str] = set()       # ZIPs storage no longer holds (or that were uploaded again)
         self._unavailable = False                # catalog.outdated() when it was last checked
-        catalog.on_change = self.purge_deleted
+        self._variants: Dict[str, _Variant] = {}         # catalog id -> its hidden list as applied here
+        self._rebuilds: Dict[str, threading.Event] = {}  # catalog id -> set when its running rebuild ends
+        # Building an index pauses the cyclic GC for the whole process (model._gc_paused): one visible build at a time.
+        self._view_builds = threading.BoundedSemaphore(1)
+        catalog.on_change = self._on_catalog_change
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
         """Stop every preparation and wait for them (up to timeout), so that a download in progress
@@ -1213,13 +1252,29 @@ class Published:
             return {p.entry['sha256'] for p in self._preps.values() if p.state in BUSY}
 
     def _forget(self, preps: List[_Prep]) -> None:
-        """Drop finished preparations and close their exports (unpublished, or their ZIP was evicted)."""
+        """Drop finished preparations and close their exports (unpublished, or their ZIP was evicted), visible
+        indexes included."""
         with self._lock:
             for prep in preps:
-                if self._preps.get(prep.entry['id']) is prep:
-                    del self._preps[prep.entry['id']]
+                catalog_id = prep.entry['id']
+                if self._preps.get(catalog_id) is prep:
+                    del self._preps[catalog_id]
+                variant = self._variants.get(catalog_id)
+                if variant is not None and variant.prep is prep:
+                    del self._variants[catalog_id]
         for prep in preps:
             self.registry.drop(prep.export_ids)
+
+    def _roots(self, prep: _Prep) -> list:
+        """The full index of every root a preparation opened, in root order."""
+        return [index for index in map(self.registry.get, prep.export_ids) if index is not None]
+
+    def _variant(self, entry: dict, prep: _Prep) -> Optional[_Variant]:
+        """The hidden list of an entry as applied for this preparation, built or failed; None while it is not."""
+        key = record_key(entry)
+        with self._lock:
+            variant = self._variants.get(entry['id'])
+        return variant if variant is not None and variant.prep is prep and variant.key == key else None
 
     # ------------------------------------------------------------ views
 
@@ -1236,15 +1291,25 @@ class Published:
             elif state == 'failed':
                 error = dict(prep.error or {})
             elif state == 'ready':
-                exports = [index.summary for index in map(self.registry.get, prep.export_ids) if index is not None]
-                failed_roots = [dict(problem) for problem in prep.failed_roots]
+                indexes = self._roots(prep)
+                if record_key(entry):  # only what everyone sees, once the hidden list is applied
+                    variant = self._variant(entry, prep)
+                    if variant is None:
+                        state = 'opening'
+                    elif variant.error is not None:
+                        state, error = 'failed', dict(variant.error)
+                    else:
+                        indexes = [variant.views[index.id] for index in indexes if index.id in variant.views]
+                if state == 'ready':
+                    exports = [index.summary for index in indexes]
+                    failed_roots = [dict(problem) for problem in prep.failed_roots]
         elif self.cache.present(sha):
             state = 'cached'
         elif self.cache.locked_elsewhere(sha):
             state, done = 'downloading', self.cache.foreign_progress(sha) or 0
         return {'id': entry['id'], 'name': entry['name'], 'label': entry['label'], 'size': size,
                 'published_at': entry['published_at'], 'published_by': entry['published_by'],
-                'owner': entry['owner'], 'summary': dict(entry['summary']), 'state': state,
+                'owner': entry['owner'], 'summary': _visible_summary(entry), 'state': state,
                 'progress': {'done': done, 'total': size} if state in ('downloading', 'verifying') else None,
                 'error': error, 'exports': exports, 'failed_roots': failed_roots}
 
@@ -1256,7 +1321,25 @@ class Published:
     def item(self, catalog_id: str) -> Optional[dict]:
         entry = self.catalog.entry(catalog_id)
         self._require_catalog()
-        return self._item(entry) if entry else None
+        if entry is None:
+            return None
+        self._ensure_variant(entry['id'])  # an open export applies a changed hidden list now (never a failed one)
+        return self._item(entry)
+
+    def entry(self, catalog_id: str) -> Optional[dict]:
+        """The catalog entry in use (read again when stale), or None; CatalogUnavailable (503) while catalog.json
+        has not been read successfully for too long."""
+        entry = self.catalog.entry(catalog_id)
+        self._require_catalog()
+        return entry
+
+    def hidden_counts(self, catalog_id: str) -> Optional[dict]:
+        """For an export's managers: {jobs, moodboards, images} hidden from everyone else (each null while not
+        counted), or None while it hides nothing. The entry in use, without refreshing."""
+        record = (self.catalog.peek(catalog_id) or {}).get('hidden')
+        if not record:
+            return None
+        return dict(record['counts']) if record['counts'] else dict.fromkeys(HIDDEN_COUNTS)
 
     def _available(self) -> bool:
         """False while catalog.json has not been read successfully for too long (Catalog.outdated); every export
@@ -1296,6 +1379,8 @@ class Published:
         if entry is None:
             return None
         self._start(entry, retry=retry)
+        # An open export applies a changed hidden list, and with retry builds a failed one again.
+        self._ensure_variant(entry['id'], retry=retry)
         return self._item(entry)
 
     def _start(self, entry: dict, retry: bool) -> _Prep:
@@ -1312,33 +1397,77 @@ class Published:
         return prep
 
     def resolve(self, export_id: str, wait_s: float):
-        """(index, None) when the export is open here; (None, item) while it is not ready; (None, None) if unknown.
+        """(Resolved, None) when the export is open here and its hidden list applied; (None, item) while it is not
+        ready; (None, None) if unknown.
 
         A ZIP already in the shared cache (another instance downloaded it) is verified and
         opened here, waiting up to wait_s. A request never waits for a download: while one
         runs, the item comes back at once (the UI shows its progress). Downloads start only
         through open().
+
+        Strict switch-over: an entry with a hidden list is served only through the visible indexes built for that
+        very list. While they are being built (a list this instance just learned of) the request waits, up to
+        wait_s in all, then gets the item (state opening); after a failed build, the item (state failed).
         """
         match = EXPORT_ID_RE.fullmatch(export_id or '')
         entry = self.catalog.entry(match.group(1)) if match else None
         self._require_catalog()
         if entry is None:
             return None, None  # unknown, or no longer published
-        index = self.registry.get(export_id)
-        if index is None:
-            prep = self._prep(entry['id'])
+        deadline = time.monotonic() + wait_s
+        prep = self._ready_prep(entry, wait_s)
+        if prep is None:
+            return None, self._item(entry)
+        full = self.registry.get(export_id)
+        if full is None or export_id not in prep.export_ids:
+            return None, None  # ready, but no export root has this id
+        self.cache.touch(entry['sha256'], every_s=TOUCH_EVERY_S)
+        roots = self._roots(prep)
+        if not record_key(entry):
+            return Resolved(entry, full, full, None, None, roots), None
+        variant = self._variant(entry, prep)
+        if variant is None:
+            self._ensure_variant(entry['id']).wait(max(0.0, deadline - time.monotonic()))
+            entry = self.catalog.peek(entry['id'])
+            if entry is None:
+                return None, None
+            if not record_key(entry):
+                return Resolved(entry, full, full, None, None, roots), None
+            variant = self._variant(entry, prep)
+        if variant is None or variant.error is not None or export_id not in variant.views:
+            return None, self._item(entry)
+        return Resolved(entry, full, variant.views[export_id], variant.closure, entry['hidden'], roots), None
+
+    @staticmethod
+    def _is_ready(prep: Optional[_Prep], entry: dict) -> bool:
+        return prep is not None and prep.state == 'ready' and prep.entry['sha256'] == entry['sha256']
+
+    def _ready_prep(self, entry: dict, wait_s: float) -> Optional[_Prep]:
+        """The ready preparation of an entry, or None while it is not ready. A ZIP already in the shared cache is
+        opened here (waiting up to wait_s); a download is never started or waited for."""
+        prep = self._prep(entry['id'])
+        if not self._is_ready(prep, entry):
             present = self.cache.present(entry['sha256'])
             if prep is None and present:
                 prep = self._start(entry, retry=False)
             if prep is not None and present and prep.state not in ('failed', 'waiting', 'downloading'):
                 prep.finished.wait(wait_s)
-            index = self.registry.get(export_id)
-            if index is None:
-                if prep is not None and prep.state == 'ready':
-                    return None, None  # ready, but no export root has this id
-                return None, self._item(entry)
-        self.cache.touch(entry['sha256'], every_s=TOUCH_EVERY_S)
-        return index, None
+            prep = self._prep(entry['id'])
+        return prep if self._is_ready(prep, entry) else None
+
+    def full_indexes(self, catalog_id: str, wait_s: float):
+        """(the full index of every root, None) of an open entry, also while its hidden list is not applied or
+        failed to apply (hiding, showing again and the Hidden listing need only these); (None, item) while it is
+        not open; (None, None) for an unknown entry."""
+        entry = self.catalog.entry(catalog_id)
+        self._require_catalog()
+        if entry is None:
+            return None, None
+        prep = self._ready_prep(entry, wait_s)
+        roots = self._roots(prep) if prep is not None else []
+        if prep is None or len(roots) != len(prep.export_ids):
+            return None, self._item(entry)
+        return roots, None
 
     def _run(self, prep: _Prep) -> None:
         entry = prep.entry
@@ -1349,9 +1478,14 @@ class Published:
             indexes = self.registry.open(path, catalog={'id': entry['id'], 'name': entry['name'],
                                                         'label': entry['label']}, failures=prep.failed_roots)
             prep.export_ids = [index.id for index in indexes]
+            # The hidden list this instance knows now (and any newer one meanwhile) is applied before anyone is
+            # served; a build that fails leaves the export ready for its managers only.
+            variant = self._install_views(entry['id'], prep, indexes, [], quiet=True)
             prep.stage('ready')
-            self._log('opened %s: %d export root(s)%s' % (entry['id'], len(indexes), ''.join(
-                '; root %s could not be read' % problem['root'] for problem in prep.failed_roots)))
+            jobs, boards = _shown(variant)
+            self._log('opened %s: %d export root(s)%s%s' % (entry['id'], len(indexes), ''.join(
+                '; root %s could not be read' % problem['root'] for problem in prep.failed_roots),
+                '; hiding %d generations and %d moodboards' % (jobs, boards) if variant and variant.views else ''))
         except CatalogError as exc:
             self._fail(prep, exc.code, exc.message)
         except SourceError as exc:
@@ -1416,6 +1550,225 @@ class Published:
                 gone = [p for p in self._preps.values() if p.entry['sha256'] in shas and p.state not in BUSY]
             self._forget(gone)
 
+    # ------------------------------------------------------- hidden lists
+
+    def _install_views(self, catalog_id: str, prep: _Prep, indexes: list, reuse: list,
+                       quiet: bool) -> Optional[_Variant]:
+        """Apply the hidden list of the entry in use to an opened export: build the visible index of every root
+        (one build at a time in this process) and install them in one assignment, for exactly that list. When the
+        list changes meanwhile it goes on with the newer one; it never installs anything for a preparation that
+        was closed or replaced. reuse is [closure, views] of the list applied before, or []: those views serve the
+        new list as they are when its closure is the same (the same items left out); otherwise they are dropped
+        (reuse is emptied) before the new ones are built. A build that raises installs a failed variant: the
+        export is then served to its managers only (the full indexes stay). Returns what it installed."""
+        while True:
+            entry = self.catalog.peek(catalog_id)
+            key = record_key(entry)
+            if not key:  # nothing hidden (or no entry any more): the full indexes are served as they are
+                with self._lock:
+                    variant = self._variants.get(catalog_id)
+                    if variant is not None and variant.prep is prep:
+                        del self._variants[catalog_id]
+                return None
+            record, closure = entry['hidden'], None
+            try:
+                closure = hidden_closure(indexes, record['jobs'], record['moodboards'])
+                if reuse and reuse[0].key == closure.key:
+                    views = reuse[1]
+                else:
+                    reuse.clear()
+                    with self._view_builds:
+                        views = {index.id: index.without(index.hidden_view(closure)) for index in indexes}
+                    reuse[:] = [closure, views]
+            except Exception as exc:
+                name = type(exc).__name__
+                self._log(self.store.scrub(traceback.format_exc(limit=5)).rstrip())
+                self._log('could not apply the hidden list of %s (%s); it is not served on this instance until it '
+                          'is applied' % (catalog_id, name))
+                failed = _Variant(prep, key, closure, None, {
+                    'code': 'hidden_apply_failed', 'message': 'could not apply the list of hidden items (%s)' % name})
+                with self._lock:
+                    if self._preps.get(catalog_id) is not prep or prep.state not in ('opening', 'ready'):
+                        return None
+                    if record_key(self.catalog.peek(catalog_id)) == key:
+                        self._variants[catalog_id] = failed
+                        return failed
+                continue  # the list changed meanwhile: try the newer one
+            variant = _Variant(prep, key, closure, views, None)
+            with self._lock:
+                if self._preps.get(catalog_id) is not prep or prep.state not in ('opening', 'ready'):
+                    return None  # closed or replaced meanwhile: never resurrect it, never touch its successor
+                if record_key(self.catalog.peek(catalog_id)) == key:
+                    self._variants[catalog_id] = variant
+                    break
+        if not quiet:
+            self._log('applied the hidden list of %s (%d generations, %d moodboards hidden)'
+                      % ((catalog_id,) + _shown(variant)))
+        return variant
+
+    def _ensure_variant(self, catalog_id: str, retry: bool = False, quiet: bool = False) -> threading.Event:
+        """Make an open export apply the hidden list of its entry in use. Returns an event that is set once that
+        is done: the running rebuild's, or one already set when there is nothing to build (not open here, the list
+        applied already, nothing hidden, or a build that failed for this very list, which is built again only
+        with retry). Otherwise the variant in use stops being served at once and a rebuild starts."""
+        with self._lock:
+            running = self._rebuilds.get(catalog_id)
+            if running is not None:
+                return running
+            prep = self._preps.get(catalog_id)
+            entry = self.catalog.peek(catalog_id)
+            key = record_key(entry)
+            variant = self._variants.get(catalog_id)
+            if variant is not None and (variant.prep is not prep or not key):
+                del self._variants[catalog_id]  # of a closed preparation, or of a list removed since
+                variant = None
+            applied = variant is not None and variant.key == key and (variant.error is None or not retry)
+            if entry is None or not self._is_ready(prep, entry) or not key or applied or self._stop.is_set():
+                done = threading.Event()
+                done.set()
+                return done
+            if variant is not None:
+                del self._variants[catalog_id]  # another list, or a failed build: never served from now on
+            reuse = [variant.closure, variant.views] if variant is not None and variant.views is not None else []
+            event = self._rebuilds[catalog_id] = threading.Event()
+            thread = threading.Thread(target=self._rebuild, args=(catalog_id, prep, reuse, event, quiet),
+                                      name='mjv-hide-%s' % catalog_id, daemon=True)
+            self._threads.add(thread)
+        thread.start()
+        return event
+
+    def _rebuild(self, catalog_id: str, prep: _Prep, reuse: list, event: threading.Event, quiet: bool) -> None:
+        try:
+            indexes = [self.registry.get(export_id) for export_id in prep.export_ids]
+            if indexes and all(index is not None for index in indexes):  # else closed meanwhile: nothing to do
+                self._install_views(catalog_id, prep, indexes, reuse, quiet)
+        except Exception:  # never let a rebuild take anything else down
+            self._log(self.store.scrub(traceback.format_exc(limit=5)).rstrip())
+        finally:
+            with self._lock:
+                if self._rebuilds.get(catalog_id) is event:
+                    del self._rebuilds[catalog_id]
+                self._threads.discard(threading.current_thread())
+            event.set()
+
+    def _follow_hidden(self) -> None:
+        """Every open export whose entry in use names another hidden list than the one applied here (or a list
+        where none is applied, or none where one is) applies it now."""
+        entries, _ = self.catalog.snapshot()
+        keys = {entry['id']: record_key(entry) for entry in entries}
+        with self._lock:
+            due = [catalog_id for catalog_id, prep in self._preps.items() if prep.state == 'ready'
+                   and catalog_id in keys and keys[catalog_id] != (
+                       self._variants[catalog_id].key if catalog_id in self._variants else '')]
+        for catalog_id in due:
+            self._ensure_variant(catalog_id)
+
+    def _on_catalog_change(self) -> None:
+        """A changed catalog.json was read: follow its deletions and its hidden lists."""
+        try:
+            self.purge_deleted()
+        finally:
+            self._follow_hidden()
+
+    def change_hidden(self, catalog_id: str, user: str, admin: bool, kind: str, item_id: str, show: bool,
+                      roots: Optional[list], wait_s: float) -> dict:
+        """Hide one job or moodboard ('job' or 'moodboard') of a published export from everyone but its managers,
+        or (show) show it again, for its owner or an administrator. roots are the full indexes of every root of the
+        ZIP, which count what the list hides; None writes the list without counts (a show again of an export that
+        cannot be opened). The entry is rewritten through _rewrite like a deletion; a request that changes nothing
+        writes nothing. Then this instance serves the new catalog and applies the list before it answers (waiting
+        up to wait_s). Returns {changed, counts}. CatalogError codes: hide_disabled, unknown_catalog_entry,
+        not_owner, too_many_hidden, catalog_busy, storage_error, hide_unconfirmed."""
+        if not self.store.writable:
+            raise CatalogError('hide_disabled', 'hiding is not turned on for this viewer')
+        name = 'moodboards' if kind == 'moodboard' else 'jobs'
+        now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(self._wall()))
+
+        def this(item) -> bool:
+            return isinstance(item, dict) and item.get('id') == item_id
+
+        def change(data: dict, raw_entry: dict, entry: dict):
+            record = raw_entry.get('hidden')
+            record = record if isinstance(record, dict) else {}  # the raw record, edited in place: unknown keys stay
+            items = record.get(name) or []
+            if show:
+                if not any(this(item) for item in items):
+                    return UNCHANGED
+                items = [item for item in items if not this(item)]
+            else:
+                if any(this(item) for item in items):
+                    return UNCHANGED
+                if sum(len(record.get(key) or []) for key in HIDDEN_LISTS) >= MAX_HIDDEN_ITEMS:
+                    raise CatalogError('too_many_hidden', TOO_MANY_HIDDEN)
+                items = items + [{'id': item_id, 'hidden_at': now, 'hidden_by': user}]
+            record[name] = items
+            parsed, reason = _hidden_record(record)
+            if reason:
+                raise CatalogError('storage_error', UNREADABLE_CHANGE % reason)
+            if parsed is None:  # the last item shown again: nothing hidden, and nothing to count
+                counts = dict.fromkeys(HIDDEN_COUNTS, 0)
+                for key in HIDDEN_LISTS + ('counts',):
+                    record.pop(key, None)
+                if record:
+                    raw_entry['hidden'] = record
+                else:
+                    raw_entry.pop('hidden', None)
+            else:
+                counts = self._count_hidden(catalog_id, roots, parsed) if roots is not None else None
+                record.pop('counts', None)
+                record['counts'] = counts  # last, after the lists
+                raw_entry['hidden'] = record
+            checked, reason = _entry(raw_entry)
+            if checked is None:  # never write what every instance would then skip
+                raise CatalogError('storage_error', UNREADABLE_CHANGE % reason)
+            data['updated_at'] = now
+            return counts
+
+        def landed(data: dict, counts) -> bool:
+            found = next((n for n, entry in _usable(data['exports'])[0] if entry['id'] == catalog_id), None)
+            if found is None:
+                return False
+            record = data['exports'][found].get('hidden')
+            items = (record.get(name) or []) if isinstance(record, dict) else []
+            if show:
+                return not any(this(item) for item in items)
+            return any(this(item) and item.get('hidden_at') == now and item.get('hidden_by') == user for item in items)
+
+        result, body, tag, entry = self._rewrite(catalog_id, user, admin, 'hide', change, landed)
+        if result is UNCHANGED:  # the fresh copy is served already: apply its list here too
+            record = entry['hidden']
+            if record is None:
+                counts = dict.fromkeys(HIDDEN_COUNTS, 0)
+            else:
+                counts = dict(record['counts']) if record['counts'] else None
+            self._ensure_variant(catalog_id, quiet=True).wait(wait_s)
+            return {'changed': False, 'counts': counts}
+        what = 'generation' if kind == 'job' else 'moodboard'
+        self._log('%s in %s by %s; hidden now: %s' % (
+            ('showed a %s again' if show else 'hid a %s') % what, catalog_id, user,
+            '%d generations, %d moodboards' % (result['jobs'], result['moodboards']) if result else 'not counted'))
+        self._serve(body, tag, 'after changing what %s hides' % catalog_id)
+        self._ensure_variant(catalog_id, quiet=True).wait(wait_s)
+        return {'changed': True, 'counts': result}
+
+    def _count_hidden(self, catalog_id: str, roots: list, record: dict) -> Optional[dict]:
+        """What a hidden list leaves out of a ZIP, summed over its roots like the entry's summary: generations
+        (on their own or made with a hidden moodboard) and moodboards present, and image files only they use.
+        None (not counted) when counting fails: the counts only describe the list, so they never stop a change,
+        least of all a show again that undoes a list this instance cannot apply."""
+        try:
+            closure = hidden_closure(roots, record['jobs'], record['moodboards'])
+            totals = dict.fromkeys(HIDDEN_COUNTS, 0)
+            for index in roots:
+                present = index.hidden_view(closure).present
+                for key in HIDDEN_COUNTS:
+                    totals[key] += present[key]
+            return totals
+        except Exception as exc:
+            self._log(self.store.scrub(traceback.format_exc(limit=5)).rstrip())
+            self._log('could not count what %s hides (%s); written without counts' % (catalog_id, type(exc).__name__))
+            return None
+
     # ---------------------------------------------------------- deleting
 
     def delete(self, catalog_id: str, user: str, admin: bool = False) -> dict:
@@ -1468,7 +1821,7 @@ class Published:
         that got no answer, or a 5xx, may have been stored all the same: catalog.json is read again and
         landed(data, result) tells. Returns (result, body written, its ETag, the entry as read). action ('delete'
         or 'hide') words the errors; a delete's are the ones it always had."""
-        words = _ACTIONS[action]
+        words = ACTION_WORDS[action]
         match = EXPORT_ID_RE.fullmatch(catalog_id or '')
         if not match or match.group(2):
             raise CatalogError('unknown_catalog_entry', NOT_LISTED)
@@ -1675,6 +2028,7 @@ class Published:
         if not self.catalog.loaded:
             return
         self.purge_deleted()
+        self._follow_hidden()
         self._retry_blob_deletes()
         listed = {entry['id']: entry['sha256'] for entry in entries}
         with self._lock:
