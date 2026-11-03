@@ -64,6 +64,7 @@ CATALOG_NAME = 'catalog.json'
 MAX_CATALOG_BYTES = 16 * 1024 * 1024
 MAX_HIDDEN_ITEMS = 1000  # jobs and moodboards one entry's hidden list may name, together
 MAX_HIDDEN_ID = 200
+MAX_WRITE_BYTES = 12 * 1024 * 1024  # this server never grows catalog.json past this (it reads up to 16 MiB)
 HIDDEN_LISTS = ('jobs', 'moodboards')
 HIDDEN_COUNTS = ('jobs', 'moodboards', 'images')
 MAX_JSON_DEPTH = 64  # catalog.json nested deeper than this is refused: it could be read but not written back
@@ -97,6 +98,22 @@ EMAIL_RE = re.compile(r"[a-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}@(?:[a-z0-9](?:[a-z0-9
                       r"[a-z][a-z0-9-]{0,61}[a-z0-9]")
 NOT_LISTED = 'this export is not published any more; it may have been deleted already'
 CATALOG_UNAVAILABLE = "The viewer can't reach its list of exports right now. Try again in a few minutes."
+UNCHANGED = object()  # what a change to catalog.json returns when there is nothing to change: nothing is written
+# How each change written to catalog.json words its errors (Published._rewrite); a delete's are the ones it always had.
+_ACTIONS = {
+    'delete': {'nothing': 'nothing was deleted', 'unconfirmed': 'delete_unconfirmed',
+               'unclear': '%s; could not confirm whether the export was deleted (%s): reload the page to check',
+               'not_shown': 'catalog.json read again does not show the deletion',
+               'not_owner': 'only the owner of this export or an administrator can delete it',
+               'no_owner': 'this export has no owner recorded, so only an administrator can delete it'},
+    'hide': {'nothing': 'nothing was changed', 'unconfirmed': 'hide_unconfirmed',
+             'unclear': '%s; could not confirm whether it changed (%s): reload the page to check',
+             'not_shown': 'catalog.json read again does not show the change',
+             'not_owner': 'only the owner of this export or an administrator can hide or show its generations and '
+                          'moodboards',
+             'no_owner': 'this export has no owner recorded, so only an administrator can hide or show its '
+                         'generations and moodboards'},
+}
 STORAGE_CODE_RE = re.compile(r'[A-Za-z]{1,64}')  # storage's own name for an error (x-ms-error-code)
 _CONTROL = re.compile('[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]')
 
@@ -530,16 +547,22 @@ def dump_catalog(data: dict) -> bytes:
         return (json.dumps(data, indent=1, ensure_ascii=True, allow_nan=False) + '\n').encode('ascii')
 
 
-def _encode(data: dict) -> bytes:
+def _encode(data: dict, grow_from: Optional[int] = None, nothing: str = 'nothing was deleted') -> bytes:
     """data as the catalog.json to write, read back first as every instance will read it (this one included).
-    CatalogError storage_error when it cannot be written or read back: then nothing is written."""
+    CatalogError storage_error when it cannot be written or read back, or (with grow_from, the size read) when it
+    would grow past MAX_WRITE_BYTES: then nothing is written. nothing ends the message."""
     try:
         body = dump_catalog(data)
-        parse_catalog(body)
+        too_large = grow_from is not None and len(body) > max(grow_from, MAX_WRITE_BYTES)
+        if not too_large:
+            parse_catalog(body)
     except Exception as exc:  # whatever the reason, a catalog no instance could read is never written
         reason = exc.message if isinstance(exc, CatalogError) else type(exc).__name__
-        raise CatalogError('storage_error', 'catalog.json could not be written back (%s); nothing was deleted'
-                           % reason) from None
+        raise CatalogError('storage_error', 'catalog.json could not be written back (%s); %s'
+                           % (reason, nothing)) from None
+    if too_large:
+        raise CatalogError('storage_error', 'catalog.json would be %.1f MiB, more than this viewer writes (%d MiB); %s'
+                           % (len(body) / 1024 ** 2, MAX_WRITE_BYTES // 1024 ** 2, nothing))
     return body
 
 
@@ -1407,19 +1430,8 @@ class Published:
         delete_disabled, unknown_catalog_entry, not_owner, catalog_busy, storage_error, delete_unconfirmed."""
         if not self.store.writable:
             raise CatalogError('delete_disabled', 'deleting exports is not turned on for this viewer')
-        match = EXPORT_ID_RE.fullmatch(catalog_id or '')
-        if not match or match.group(2):
-            raise CatalogError('unknown_catalog_entry', NOT_LISTED)
-        for attempt in range(1, WRITE_ATTEMPTS + 1):
-            data, etag = self._fresh_catalog()
-            entry = next((e for e in _entries(data['exports'])[0] if e['id'] == catalog_id), None)
-            if entry is None:
-                raise CatalogError('unknown_catalog_entry', NOT_LISTED)
-            owner, sha = entry['owner'], entry['sha256']
-            if not admin and (owner is None or owner != user):
-                raise CatalogError('not_owner', 'only the owner of this export or an administrator can delete it'
-                                   if owner else 'this export has no owner recorded, so only an administrator '
-                                                 'can delete it')
+
+        def change(data: dict, raw_entry: dict, entry: dict) -> dict:
             stones = data.get('deleted')
             if stones is None:
                 stones = []
@@ -1427,13 +1439,53 @@ class Published:
                 raise CatalogError('storage_error', 'catalog.json has a deleted field that is not a list; '
                                                     'nothing was deleted')
             now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(self._wall()))
-            stone = {'id': catalog_id, 'sha256': sha, 'size': entry['size'], 'owner': owner, 'deleted_at': now,
-                     'deleted_by': user}
+            stone = {'id': catalog_id, 'sha256': entry['sha256'], 'size': entry['size'], 'owner': entry['owner'],
+                     'deleted_at': now, 'deleted_by': user}
             data['exports'] = [item for item in data['exports'] if not (
-                isinstance(item, dict) and (item.get('id') == catalog_id or item.get('sha256') == sha))]
+                isinstance(item, dict) and (item.get('id') == catalog_id or item.get('sha256') == entry['sha256']))]
             data['deleted'] = stones + [stone]
             data['updated_at'] = now
-            body = _encode(data)
+            return stone
+
+        def landed(data: dict, stone: dict) -> bool:  # this request's tombstone: the same id, deleted_at, deleted_by
+            stones = data.get('deleted')
+            return isinstance(stones, list) and any(isinstance(item, dict) and all(
+                item.get(key) == stone[key] for key in ('id', 'deleted_at', 'deleted_by')) for item in stones)
+
+        _, body, tag, entry = self._rewrite(catalog_id, user, admin, 'delete', change, landed)
+        self._finish(catalog_id, entry['sha256'], user, body, tag)
+        return entry
+
+    def _rewrite(self, catalog_id: str, user: str, admin: bool, action: str,
+                 change: Callable[[dict, dict, dict], object],
+                 landed: Callable[[dict, object], bool]) -> Tuple[object, Optional[bytes], Optional[str], dict]:
+        """The one way this server writes catalog.json (deleting, hiding and showing again): read it fresh with its
+        ETag (never the copy in use), find the entry, check the owner or an administrator on that copy, let change
+        edit the raw JSON of that copy in place (every field this server does not know survives), check that every
+        instance can read the result, and write it with If-Match on that ETag. When another writer got there
+        first, all of it starts over, WRITE_ATTEMPTS times at most. change(data, raw entry, entry) returns a result
+        for landed, or UNCHANGED: then nothing is written and the fresh copy is served at once instead. A write
+        that got no answer, or a 5xx, may have been stored all the same: catalog.json is read again and
+        landed(data, result) tells. Returns (result, body written, its ETag, the entry as read). action ('delete'
+        or 'hide') words the errors; a delete's are the ones it always had."""
+        words = _ACTIONS[action]
+        match = EXPORT_ID_RE.fullmatch(catalog_id or '')
+        if not match or match.group(2):
+            raise CatalogError('unknown_catalog_entry', NOT_LISTED)
+        for attempt in range(1, WRITE_ATTEMPTS + 1):
+            data, etag, raw = self._fresh_catalog(words['nothing'])
+            found = next(((n, entry) for n, entry in _usable(data['exports'])[0] if entry['id'] == catalog_id), None)
+            if found is None:
+                raise CatalogError('unknown_catalog_entry', NOT_LISTED)
+            position, entry = found
+            owner = entry['owner']
+            if not admin and (owner is None or owner != user):
+                raise CatalogError('not_owner', words['not_owner'] if owner else words['no_owner'])
+            result = change(data, data['exports'][position], entry)
+            if result is UNCHANGED:
+                self._serve(raw, etag, 'after an unchanged request on %s' % catalog_id)
+                return result, None, None, entry
+            body = _encode(data, grow_from=None if action == 'delete' else len(raw), nothing=words['nothing'])
             try:
                 tag = self.store.put(CATALOG_NAME, body, 'catalog.json', if_match=etag)
             except CatalogError as exc:
@@ -1442,31 +1494,39 @@ class Published:
                         time.sleep(random.uniform(0.05, 0.25) * attempt)
                     continue
                 if exc.code != 'unreachable' and (exc.status or 0) < 500:  # refused: certainly not stored
-                    raise CatalogError('storage_error', '%s; nothing was deleted' % exc.message) from None
-                body, tag = self._stored_anyway(stone, exc)
-            self._finish(catalog_id, sha, user, body, tag)
-            return entry
+                    raise CatalogError('storage_error', '%s; %s' % (exc.message, words['nothing'])) from None
+                body, tag = self._stored_anyway(lambda stored: landed(stored, result), exc, words)
+            return result, body, tag, entry
         raise CatalogError('catalog_busy', 'the list of exports kept changing while it was being updated; '
-                                           'nothing was deleted, try again')
+                                           '%s, try again' % words['nothing'])
 
-    def _stored_anyway(self, stone: dict, problem: CatalogError) -> Tuple[bytes, Optional[str]]:
+    def _serve(self, body: bytes, tag: Optional[str], when: str) -> None:
+        """Serve a catalog.json just written or read fresh at once; when that fails, read it again at the next
+        request instead (the copy in use may be older)."""
+        try:
+            self.catalog.adopt(body, tag)
+        except Exception as exc:
+            self.catalog.expire()
+            self._log('catalog: %s, serving the new catalog.json failed (%s)' % (when, type(exc).__name__))
+            self._log(self.store.scrub(traceback.format_exc(limit=5)).rstrip())
+
+    def _stored_anyway(self, landed: Callable[[dict], bool], problem: CatalogError,
+                       words: dict) -> Tuple[bytes, Optional[str]]:
         """After a write of catalog.json that got no answer or a 5xx: catalog.json as storage holds it now, when
-        it has this request's tombstone (the same id, deleted_at and deleted_by), so the write was stored.
-        Otherwise CatalogError delete_unconfirmed: from here, whether the export was deleted cannot be told."""
+        landed finds this request's change in it, so the write was stored. Otherwise CatalogError
+        delete_unconfirmed (hide_unconfirmed): from here, whether it changed cannot be told."""
         self._log('catalog: no clear answer to the write of catalog.json (%s); reading it again'
                   % self.store.scrub(problem.message))
         try:
             status, etag, raw = self.store.get(CATALOG_NAME, 'catalog.json', timeout=self.catalog.timeout)
-            stones = _load(raw).get('deleted') if status == 200 else None
-            unknown = 'catalog.json read again does not show the deletion'
+            stored = _load(raw) if status == 200 else None
+            unknown = words['not_shown']
         except CatalogError as exc:
-            stones, unknown = None, 'reading catalog.json again failed: %s' % exc.message
-        if isinstance(stones, list) and any(isinstance(item, dict) and all(
-                item.get(key) == stone[key] for key in ('id', 'deleted_at', 'deleted_by')) for item in stones):
+            stored, unknown = None, 'reading catalog.json again failed: %s' % exc.message
+        if stored is not None and landed(stored):
             self._log('catalog: the write of catalog.json was stored')
             return raw, etag
-        raise CatalogError('delete_unconfirmed', '%s; could not confirm whether the export was deleted (%s): '
-                                                 'reload the page to check' % (problem.message, unknown))
+        raise CatalogError(words['unconfirmed'], words['unclear'] % (problem.message, unknown))
 
     def _finish(self, catalog_id: str, sha: str, user: str, body: bytes, tag: Optional[str]) -> None:
         """What follows a catalog.json that no longer lists the export: serve it here at once, delete the ZIP from
@@ -1486,17 +1546,17 @@ class Published:
                 if n == 0:
                     self.catalog.expire()  # the copy in use still lists it: read the new one at the next request
 
-    def _fresh_catalog(self) -> Tuple[dict, str]:
-        """catalog.json as storage holds it right now (never the copy in use), with its ETag."""
+    def _fresh_catalog(self, nothing: str = 'nothing was deleted') -> Tuple[dict, str, bytes]:
+        """catalog.json as storage holds it right now (never the copy in use): (data, ETag, raw bytes)."""
         try:
             status, etag, raw = self.store.get(CATALOG_NAME, 'catalog.json', timeout=self.catalog.timeout)
             if status != 200 or not etag:
                 raise CatalogError('storage_error', 'catalog.json: storage answered HTTP %d without an ETag' % status)
-            return _load(raw), etag
+            return _load(raw), etag, raw
         except CatalogError as exc:
             if exc.code == 'not_found':
                 raise CatalogError('unknown_catalog_entry', NOT_LISTED) from None
-            raise CatalogError('storage_error', '%s; nothing was deleted' % exc.message) from None
+            raise CatalogError('storage_error', '%s; %s' % (exc.message, nothing)) from None
 
     def _delete_blob(self, catalog_id: str, sha: str, since: Optional[float] = None) -> None:
         """DELETE the ZIP of a deleted export, unless (with since) it was uploaded again after that time. A
