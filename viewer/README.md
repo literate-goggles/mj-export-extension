@@ -652,11 +652,20 @@ page, and put two instances behind a strict round-robin front end
 (`tests/hosted_harness.py`) to show that a failed export fails once.
 `tests/test_e2e_delete.py` deletes a published export through the dialog
 (cancelled with Esc and Cancel, a storage failure, then for real) and checks
-that local mode shows none of it. Both are skipped unless enabled:
+that local mode shows none of it. `tests/test_e2e_hide.py` signs in, each in
+a browser context of their own, as an export's owner, as an administrator and
+as someone else: the owner hides a generation and a moodboard through their
+dialogs (cancelled with Esc and Cancel, storage failures, then for real), and
+shows them again from the Hidden section of the overview and from a hidden
+item's banner; someone else sees no control and gets Not found for a hidden
+item's link and pictures, and "Parent not available" on what was made from
+it. It also covers a ZIP with two export roots, an instance with writes off,
+a hidden list that cannot be applied, and local mode. All three are skipped
+unless enabled:
 
 ```sh
 python3 -m pip install --user playwright && python3 -m playwright install chromium
-MJV_E2E=1 python3 -m unittest tests.test_e2e_browser tests.test_e2e_delete -v
+MJV_E2E=1 python3 -m unittest tests.test_e2e_browser tests.test_e2e_delete tests.test_e2e_hide -v
 ```
 
 `tests/test_e2e_selection.py`, opt-in the same way, opens a synthetic export
