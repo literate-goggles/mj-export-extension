@@ -1,4 +1,6 @@
 // Job detail: images, command, flags, references, links, lineage, raw record.
+// In hosted mode the export's managers can hide the job from everyone else, and
+// see a hidden job's page with a banner that can show it again.
 
 import {h, icon, fill, isTypingTarget} from './dom.js';
 import {hrefs} from './router.js';
@@ -9,6 +11,10 @@ import {
   kvList, dataTable, rawBlock, renderValue, callout, errorState, loadingState, miniJob, jobLink, safeFileUrl,
 } from './ui.js';
 import {openLightbox, lightboxOpen} from './lightbox.js';
+import {closeConfirm} from './confirm.js';
+import {
+  managerView, hideButton, hiddenBanner, confirmHide, confirmShow, confirmHideOnItsOwn, runChange,
+} from './hide.js';
 
 const UNAVAILABLE_PARENT = 'The generation this one was made from is not available here';
 
@@ -49,9 +55,12 @@ export function renderJob(root, route, ctx) {
 
   let prevHref = null;
   let nextHref = null;
+  let banner = null;
 
-  async function load() {
-    fill(body, loadingState('Loading job…'));
+  /** Load and draw the job. After a hide or show again: quiet keeps the page until the new answer is drawn, and
+   * focus names what takes focus then ('banner' or 'heading'). */
+  async function load({quiet = false, focus = ''} = {}) {
+    if (!quiet) fill(body, loadingState('Loading job…'));
     try {
       const data = obj(await getJSON(paths.job(exportId, jobId), {signal: ctx.signal}));
       if (!ctx.isActive()) return;
@@ -61,8 +70,17 @@ export function renderJob(root, route, ctx) {
     } catch (err) {
       if (isAbort(err)) return;
       head.heading.textContent = err && err.status === 404 ? 'Job not found' : 'Job';
+      setActions(null);
       fill(body, errorState(err, {retry: load, title: 'Could not load this job'}));
     }
+    if (focus === 'banner' && banner && banner.heading.isConnected) banner.heading.focus();
+    else if (focus === 'heading' || focus === 'banner') head.heading.focus();
+  }
+
+  function setActions(content) {
+    const old = head.el.querySelector('.page-head__actions');
+    if (old) old.remove();
+    if (content) head.el.append(h('div', {class: 'page-head__actions'}, content));
   }
 
   function draw(data) {
@@ -78,8 +96,16 @@ export function renderJob(root, route, ctx) {
       job.video ? badge('Video', {tone: 'warn', iconName: 'video', title: 'Video media is not exported'}) : null,
       timeEl(job.created_at, {cls: 'eyebrow__date'})));
 
+    // Hosted mode, the export's managers only: Hide… on a job everyone sees, the banner on a hidden one.
+    const managed = managerView(data);
+    setActions(managed === 'visible' ? hideButton('job', () => hide(data)) : null);
+    banner = managed === 'hidden'
+      ? hiddenBanner({exportId, kind: 'job', data, onShow: () => show(data), onHideOwn: () => hideOnItsOwn(data)})
+      : null;
+
     const images = arr(data.images).length ? arr(data.images) : arr(job.images);
     fill(body,
+      banner ? banner.el : null,
       h('div', {class: 'job-layout'},
         h('div', {class: 'job-media'}, imagesBlock(images, job), filesBlock(images)),
         h('div', {class: 'job-side'}, commandBlock(job), detailsBlock(job, images, data), relationsBlock(data, job))),
@@ -89,6 +115,26 @@ export function renderJob(root, route, ctx) {
       likesSection(job, arr(data.likes)),
       unknownSection(arr(data.unknown_fields)),
       rawSection(data.raw, data.raw_withheld === true));
+  }
+
+  // After a hide the page stays where it is, now with the banner (Show again… is one click away); after a show
+  // again it is drawn as everyone sees it.
+  function hide(data) {
+    runChange(ctx, () => confirmHide({exportId, kind: 'job', id: jobId, data}), 'hide', 'Hidden from everyone else',
+      () => load({quiet: true, focus: 'banner'}));
+  }
+
+  function hideOnItsOwn(data) {
+    runChange(ctx, () => confirmHideOnItsOwn({exportId, id: jobId, data}), 'hide', 'Hidden on its own',
+      () => load({quiet: true, focus: 'banner'}));
+  }
+
+  function show(data) {
+    const note = obj(data.hidden);
+    runChange(ctx, () => confirmShow({exportId, kind: 'job', id: jobId,
+      name: str(obj(data.job).prompt).trim() || 'No prompt text',
+      withBoards: arr(note.with_moodboards).map(obj).filter((b) => str(b.id))}),
+    'show', 'Shown to everyone again', () => load({quiet: true, focus: 'heading'}));
   }
 
   function imagesBlock(images, job) {
@@ -475,7 +521,10 @@ export function renderJob(root, route, ctx) {
 
   load();
   loadNeighbours();
-  return () => document.removeEventListener('keydown', onKey);
+  return () => {
+    document.removeEventListener('keydown', onKey);
+    closeConfirm();  // a hide or show-again dialog goes with its view (one that is working stays until it ends)
+  };
 }
 
 function flagValue(value) {

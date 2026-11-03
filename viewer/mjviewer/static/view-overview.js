@@ -1,4 +1,5 @@
-// Overview: what was exported and how complete it is.
+// Overview: what was exported and how complete it is. In hosted mode the
+// export's managers also see what is hidden from everyone else.
 
 import {h, icon, fill, append} from './dom.js';
 import {hrefs} from './router.js';
@@ -8,6 +9,8 @@ import {
   pageHead, section, statusBadge, supportBadge, badge, errorState, loadingState, callout, timeEl, kvList, dataTable,
   rawBlock, renderValue, jobLink, emptyState, linkChip,
 } from './ui.js';
+import {canHide, hiddenSection} from './hide.js';
+import {closeConfirm} from './confirm.js';
 
 const EXPORT_TIME_HELP = 'export_time: when export_meta.json was last written, at the end or stop of the latest run.';
 
@@ -24,9 +27,12 @@ export function renderOverview(root, route, ctx) {
   const head = pageHead({eyebrow: 'Export overview', title: 'Loading export…'});
   const body = h('div', {class: 'overview'}, loadingState('Reading the export summary…'));
   root.append(h('div', {class: 'page'}, head.el, body));
+  let hidden = null;
 
-  async function load() {
+  /** Load and draw the overview; focusHidden: then focus the Hidden section's heading (after a show again). */
+  async function load({focusHidden = false} = {}) {
     fill(body, loadingState('Reading the export summary…'));
+    hidden = null;
     try {
       const data = await loadOverview(exportId, {signal: ctx.signal});
       if (!ctx.isActive()) return;
@@ -35,7 +41,19 @@ export function renderOverview(root, route, ctx) {
       if (isAbort(err)) return;
       head.heading.textContent = 'Export overview';
       fill(body, errorState(err, {retry: load, title: 'Could not read this export', home: true}));
+      // A hidden list that cannot be applied keeps the export closed to everyone else; its managers can still
+      // show items again from here, and the export opens once the list that is left applies.
+      if (err && err.code === 'hidden_apply_failed' && canHide(exportId)) {
+        hidden = hiddenPart();
+        body.append(hidden.el);
+      }
     }
+    if (focusHidden && hidden && hidden.heading.isConnected) hidden.heading.focus();
+  }
+
+  /** The Hidden section (the export's managers only); after a show again the overview is read anew. */
+  function hiddenPart() {
+    return hiddenSection(exportId, ctx, {onChanged: () => load({focusHidden: true})});
   }
 
   function draw(data) {
@@ -57,10 +75,12 @@ export function renderOverview(root, route, ctx) {
     const counts = obj(d.counts);
     const observed = obj(counts.observed);
     const facets = obj(d.facets);
+    hidden = canHide(exportId) ? hiddenPart() : null;
 
     fill(body,
       versionNotice(summary),
       statTiles(exportId, summary, observed, facets),
+      hidden ? hidden.el : null,
       h('div', {class: 'overview__cols'},
         h('div', {class: 'overview__main'}, checksSection(checks, exportId).el),
         h('div', {class: 'overview__side'}, detailsSection(d, summary).el)),
@@ -75,6 +95,7 @@ export function renderOverview(root, route, ctx) {
   }
 
   load();
+  return closeConfirm;  // a show-again dialog goes with its view (one that is working stays until it ends)
 }
 
 function versionNotice(summary) {

@@ -1,5 +1,7 @@
 // Moodboards: the board list, and one board with its REFERENCE images (the
 // board's own inputs) kept visibly apart from GENERATIONS (jobs made using it).
+// In hosted mode the export's managers can hide a board, with its generations,
+// from everyone else, and see a hidden board's page with a banner.
 
 import {h, icon, fill} from './dom.js';
 import {hrefs} from './router.js';
@@ -10,6 +12,8 @@ import {
   callout, emptyState, errorState, loadingState, safeFileUrl,
 } from './ui.js';
 import {openLightbox} from './lightbox.js';
+import {closeConfirm} from './confirm.js';
+import {managerView, hideButton, hiddenBanner, confirmHide, confirmShow, runChange} from './hide.js';
 
 const LINK_ORDER = ['exporter', 'derived', 'inferred_code'];
 // generated_left_out is one number for both causes: generations left out, and generations made after choosing.
@@ -113,9 +117,12 @@ export function renderMoodboard(root, route, ctx) {
   const head = pageHead({eyebrow: 'Moodboard', title: 'Loading moodboard…'});
   const body = h('div', null, loadingState('Loading moodboard…'));
   root.append(h('div', {class: 'page'}, nav, head.el, body));
+  let banner = null;
 
-  async function load() {
-    fill(body, loadingState('Loading moodboard…'));
+  /** Load and draw the board. After a hide or show again: quiet keeps the page until the new answer is drawn, and
+   * focus names what takes focus then ('banner' or 'heading'). */
+  async function load({quiet = false, focus = ''} = {}) {
+    if (!quiet) fill(body, loadingState('Loading moodboard…'));
     try {
       const data = obj(await getJSON(paths.moodboard(exportId, boardId), {signal: ctx.signal}));
       if (!ctx.isActive()) return;
@@ -127,8 +134,33 @@ export function renderMoodboard(root, route, ctx) {
     } catch (err) {
       if (isAbort(err)) return;
       head.heading.textContent = err && err.status === 404 ? 'Moodboard not found' : 'Moodboard';
+      setActions([]);
       fill(body, errorState(err, {retry: load, title: 'Could not load this moodboard'}));
     }
+    if (focus === 'banner' && banner && banner.heading.isConnected) banner.heading.focus();
+    else if (focus === 'heading' || focus === 'banner') head.heading.focus();
+  }
+
+  function setActions(content) {
+    const old = head.el.querySelector('.page-head__actions');
+    if (old) old.remove();
+    if (content.length) head.el.append(h('div', {class: 'page-head__actions'}, content));
+  }
+
+  // After a hide the page stays where it is, now with the banner (Show again… is one click away); after a show
+  // again it is drawn as everyone sees it.
+  function hide(data) {
+    runChange(ctx, () => confirmHide({exportId, kind: 'moodboard', id: boardId, data}), 'hide',
+      'Hidden from everyone else', () => load({quiet: true, focus: 'banner'}));
+  }
+
+  function show(data) {
+    const note = obj(data.hidden);
+    runChange(ctx, () => confirmShow({exportId, kind: 'moodboard', id: boardId,
+      name: str(obj(data.moodboard).name) || 'Untitled moodboard',
+      generations: isNum(note.generations) ? note.generations : null,
+      stayHidden: isNum(note.stay_hidden) ? note.stay_hidden : null}),
+    'show', 'Shown to everyone again', () => load({quiet: true, focus: 'heading'}));
   }
 
   function draw(data) {
@@ -150,12 +182,18 @@ export function renderMoodboard(root, route, ctx) {
     const oldSub = textBox.querySelector('.page-sub');
     if (oldSub) oldSub.replaceWith(subItems);
     else textBox.append(subItems);
-    if (!head.el.querySelector('.page-head__actions')) {
-      head.el.append(h('div', {class: 'page-head__actions'},
-        h('a', {class: 'btn', href: hrefs.gallery(exportId, {moodboard: board.id || boardId})}, icon('grid', {size: 15}), 'Show in gallery')));
-    }
+    // Hosted mode, the export's managers only: Hide… on a board everyone sees, the banner on a hidden one. The
+    // gallery is what everyone sees, so a hidden board has nothing to show there.
+    const managed = managerView(data);
+    setActions([
+      managed === 'hidden' ? null
+        : h('a', {class: 'btn', href: hrefs.gallery(exportId, {moodboard: board.id || boardId})}, icon('grid', {size: 15}), 'Show in gallery'),
+      managed === 'visible' ? hideButton('moodboard', () => hide(data)) : null,
+    ].filter(Boolean));
+    banner = managed === 'hidden' ? hiddenBanner({exportId, kind: 'moodboard', data, onShow: () => show(data)}) : null;
 
     fill(body,
+      banner ? banner.el : null,
       legend(references.length, generations.length),
       referencesSection(references, name),
       generationsSection(generations, isNum(board.generated_left_out) ? board.generated_left_out : 0),
@@ -288,4 +326,5 @@ export function renderMoodboard(root, route, ctx) {
   }
 
   load();
+  return closeConfirm;  // a hide or show-again dialog goes with its view (one that is working stays until it ends)
 }

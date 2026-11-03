@@ -1,7 +1,8 @@
 // Hosted start page: the exports published for this deployment. Opening one
 // downloads and checks it on the server (with progress), then shows its overview.
 // Its owner, or an administrator, can delete it from here after confirming; a
-// failed deletion is always shown, in the dialog or else on the page.
+// failed deletion is always shown, in the dialog or else on the page. Their
+// cards also say how much of the export is hidden from everyone else.
 
 import {h, icon, fill} from './dom.js';
 import {hrefs, parseHash} from './router.js';
@@ -113,7 +114,7 @@ export function renderHostedHome(root, route, ctx) {
         : null,
       skipped.length
         ? callout('info', h('p', null, `${skipped.length === 1 ? 'One published entry is' : `${fmtInt(skipped.length)} published entries are`} `,
-          'not valid and hidden. Whoever publishes exports can check the server log.'))
+          'not valid and not shown. Whoever publishes exports can check the server log.'))
         : null);
     cards.clear();
     if (!items.length) {
@@ -225,6 +226,28 @@ function deleteFailure(err) {
   return writeFailure(err, DELETE_WORDS);
 }
 
+/**
+ * For an export's managers (item.hidden is theirs only): how many of its generations and moodboards are hidden
+ * from everyone else, as in '13 generations and 1 moodboard' (adjective 'hidden ': '13 hidden generations and 1
+ * hidden moodboard'); '' when the list counts nothing in this export, null when it was not counted.
+ */
+function hiddenAmount(hidden, adjective = '') {
+  const jobs = hidden.jobs;
+  const boards = hidden.moodboards;
+  if (!isNum(jobs) || !isNum(boards)) return null;
+  return [jobs ? plural(jobs, `${adjective}generation`) : '', boards ? plural(boards, `${adjective}moodboard`) : '']
+    .filter(Boolean).join(' and ');
+}
+
+/** The managers' line on a card: what is hidden from everyone else; null when nothing is. */
+function hiddenNote(it) {
+  if (!it.hidden || typeof it.hidden !== 'object') return null;
+  const amount = hiddenAmount(it.hidden);
+  if (amount === '') return null;
+  return h('p', {class: 'xcard__hidden'}, icon('eye-off', {size: 14}),
+    h('span', null, amount === null ? 'Some generations or moodboards are hidden from others' : `${amount} hidden from others`));
+}
+
 /** MJV_SOFT_DELETE_DAYS as /api/health reports it: a whole number of days, or null when not set or unknown. */
 async function softDeleteDays() {
   try {
@@ -250,12 +273,15 @@ function deleteSummary(item, days) {
     ['moodboard', counts ? counts.moodboards : summary.moodboards],
     ['profile', counts ? counts.profiles : summary.profiles],
   ].filter(([, n]) => isNum(n)).map(([one, n]) => plural(n, one));
+  // The counts are those everyone sees; its managers (only they get item.hidden) also learn what is hidden.
+  const amount = it.hidden && typeof it.hidden === 'object' ? hiddenAmount(it.hidden, 'hidden ') : '';
+  const plus = amount === null ? ' (plus some hidden generations or moodboards)' : amount ? ` (plus ${amount})` : '';
   const fact = (label, value) => [h('dt', null, label), h('dd', null, value)];
   return [
     h('dl', {class: 'confirm__facts'},
       fact('Export', itemLabel(it)),
       fact('File', `${str(it.name) || '—'}${isNum(it.size) ? ` (${fmtBytes(it.size)})` : ''}`),
-      fact('Contents', contents.length ? contents.join(' · ') : 'Not recorded'),
+      fact('Contents', `${contents.length ? contents.join(' · ') : 'Not recorded'}${plus}`),
       fact('Owner', str(it.owner) || 'No owner recorded')),
     h('p', null, 'It disappears from this viewer within about a minute. You cannot undo this here.'),
     h('p', null, days
@@ -312,6 +338,7 @@ function catalogCard(initial, open, remove) {
         countItem('Images', images),
         countItem('Boards', fmtInt(single ? counts.moodboards : summary.moodboards)),
         countItem('Profiles', fmtInt(single ? counts.profiles : summary.profiles))),
+      hiddenNote(it),
       stateRow(it, single, exports),
       failedRoots(it),
       it.can_delete === true

@@ -61,6 +61,9 @@ export const paths = {
   catalogItem: (c) => `/api/catalog/${enc(c)}`,
   catalogOpen: (c) => `/api/catalog/${enc(c)}/open`,
   catalogDelete: (c) => `/api/catalog/${enc(c)}/delete`,
+  catalogHide: (c) => `/api/catalog/${enc(c)}/hide`,
+  catalogUnhide: (c) => `/api/catalog/${enc(c)}/unhide`,
+  hidden: (x) => `/api/exports/${enc(x)}/hidden`,
 };
 
 function errorFrom(status, body) {
@@ -69,7 +72,10 @@ function errorFrom(status, body) {
   const message = err && typeof err.message === 'string' && err.message
     ? err.message
     : STATUS_TEXT[status] || `Request failed (HTTP ${status}).`;
-  return new ApiError(status, code, message);
+  const error = new ApiError(status, code, message);
+  // Hosted mode: an export that is not open yet comes with its catalog item, which can open it.
+  if (body && typeof body === 'object' && body.catalog && typeof body.catalog === 'object') error.catalog = body.catalog;
+  return error;
 }
 
 function parseBody(text) {
@@ -296,6 +302,19 @@ export function fromCatalogItem(exportId, catalogId) {
   return Boolean(catalogId) && (x === catalogId || x.startsWith(`${catalogId}-`));
 }
 
+/** The catalog id of a published export id: the whole id, or the part before -<n> for one root of several. */
+export function catalogIdOf(exportId) {
+  return String(exportId || '').split('-')[0];
+}
+
+/** The catalog item (hosted mode) an export id was opened from, as this page last read it, or null. */
+export function catalogItemOf(exportId) {
+  const catalog = knownCatalog();
+  const id = catalogIdOf(exportId);
+  const items = catalog && Array.isArray(catalog.items) ? catalog.items : [];
+  return (id && items.find((i) => i && typeof i === 'object' && i.id === id)) || null;
+}
+
 /**
  * Delete a published export (its owner or an administrator only). The id is
  * sent again as confirmation. Never repeated on its own, and what this page
@@ -305,6 +324,34 @@ export async function deleteExport(id) {
   const result = await postJSON(paths.catalogDelete(id), {confirm: id});
   forgetCatalogItem(id);
   return result;
+}
+
+/**
+ * Hide one generation or moodboard of a published export from everyone but its owner and the administrators,
+ * or show it again (hidden false). kind is 'job' or 'moodboard'. When the server has not opened the export yet
+ * (409 export_not_ready), it is opened and the request is sent once more; never otherwise. On success this page
+ * forgets the export's overviews and keeps the catalog item the server answered, with the summaries of what
+ * everyone sees now (the header's tab counts). Resolves with {changed, catalog}.
+ */
+export async function setHidden(exportId, kind, id, hidden) {
+  const catalogId = catalogIdOf(exportId);
+  const path = hidden ? paths.catalogHide(catalogId) : paths.catalogUnhide(catalogId);
+  const body = {kind, id: String(id)};
+  let result;
+  try {
+    result = await postJSON(path, body);
+  } catch (err) {
+    if (!(err instanceof ApiError) || err.code !== 'export_not_ready' || !err.catalog) throw err;
+    await prepareExport(err.catalog);
+    result = await postJSON(path, body);
+  }
+  rememberCatalogItem(catalogId, result.catalog);
+  return result;
+}
+
+/** GET /api/exports/{id}/hidden: what a published export hides, for its managers. Never cached. */
+export function loadHidden(exportId, {signal} = {}) {
+  return getJSON(paths.hidden(exportId), {signal});
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +412,20 @@ export function knownSummary(id) {
   const summary = item.summary && typeof item.summary === 'object' ? item.summary : {};
   return {id, label: item.label || String(item.name || '').replace(/\.zip$/i, '') || id,
     counts: {jobs: summary.jobs, moodboards: summary.moodboards, profiles: summary.profiles}};
+}
+
+/**
+ * After a change to what a catalog entry hides: drop its overviews, keep the item the server answered, and take
+ * the summaries of its roots as everyone sees them now.
+ */
+function rememberCatalogItem(id, item) {
+  for (const key of [...overviews.keys()]) if (fromCatalogItem(key, id)) overviews.delete(key);
+  const catalog = exportsState ? exportsState.catalog : null;
+  if (item && typeof item === 'object' && item.id === id && catalog && Array.isArray(catalog.items)) {
+    exportsState.catalog = {...catalog, items: catalog.items.map((i) => (i && i.id === id ? item : i))};
+  }
+  rememberSummaries(item && typeof item === 'object' ? item.exports : null);
+  notify();
 }
 
 /** Drop a deleted catalog entry and the exports opened from it from the caches. */
