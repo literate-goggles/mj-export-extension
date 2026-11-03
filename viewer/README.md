@@ -472,8 +472,10 @@ characters, not only spaces) or the lists hold more than 1,000 items together;
 such an entry also keeps its id, so a later entry with the same id is skipped
 too. A `hidden_at` that is not a date, a `hidden_by` that is not an address or
 `counts` that are not three whole numbers are only shown as not recorded, and
-an id listed twice counts once. An id that names nothing in the export hides
-nothing (it is listed as "Not in this export"). Removing an item, or the whole
+an id listed twice counts once. A job id that no export root has hides
+nothing, but a moodboard id that no root has still hides the generations that
+reference it by that id (a selection can leave a moodboard out and keep them);
+both are listed as "Not in this export". Removing an item, or the whole
 `hidden` key, by hand shows it again within a catalog read; drop `counts` when
 editing items rather than leave wrong numbers (cards then show no counts until
 the app writes the list again). The app never grows `catalog.json` past
@@ -548,8 +550,9 @@ What differs from [local mode](#security-model):
   written the same way. Every export route and every image goes through one
   check that serves everyone but the export's owner and administrators an
   index built without the hidden items, from the start, so hidden ids, files
-  and thumbnails answer exactly like ones that never existed, and no list,
-  search, count, check or raw record can mention them.
+  and thumbnails answer exactly like ones that never existed, and lists,
+  search, counts, checks and raw records leave them out, apart from what
+  "What hiding leaves in place" (in Hosted mode) lists.
 - **Secrets stay on the server.** The storage query strings, the OAuth client
   secret and `MJV_AUTH_SECRET` never appear in a log line, a page, an API answer
   or an error message.
@@ -707,7 +710,7 @@ viewer/
   the one it filters under.
 - Gallery cards stay in the page as you scroll (only their images load
   lazily); exports with tens of thousands of jobs work but are slower. A
-  synthetic 60,000-job export loaded in about 9 seconds and 650 MB.
+  synthetic 60,000-job export loaded in about 7 seconds and took about 600 MB.
 - In exports with more than 50,000 files, image types are checked when an image
   is first requested rather than at load time.
 - ZIP entry names must use `/` and UTF-8, as the exporter's do; archives made by
