@@ -313,6 +313,59 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
   storage's own settings decide. The dialog also says that copies shared in
   other ways (the ZIP that was sent to publish it, for example) are not
   affected.
+- **Hiding generations and moodboards.** While deleting is turned on
+  (`MJV_CATALOG_WRITE_URL`), an export's owner and the administrators in
+  `MJV_ADMIN_EMAILS` see **Hide…** on the page of each generation and
+  moodboard. Hiding a generation hides that one generation. Hiding a moodboard
+  also hides its reference images and every generation its page lists,
+  whatever the link (from `generated_job_ids`, derived from a reference, or
+  inferred from a code), in every export root of the ZIP, plus the generations
+  in other roots of the ZIP that reference it by its id. Before anything is
+  hidden, a dialog says what stays: how many generations made from it
+  (upscales, variations and the like) stay visible, and for a moodboard how
+  many generations it hides. Everyone else then sees the export as if those
+  items had never been exported: they are gone from the gallery, search,
+  filters, counts, checks, the overview and the moodboard, profile and likes
+  pages; their links and image addresses answer Not found, exactly like ids
+  that never existed; a generation made from a hidden one shows "Parent not
+  available"; a moodboard reference picture that is a hidden generation's
+  picture shows "Not available". The owner and the administrators browse the
+  same views, plus a **Hidden** section on the export's overview that lists
+  what is hidden (who hid it and when; a moodboard with how many generations
+  went with it), the hidden items' own pages, reached from there or by their
+  links, with a "Hidden from everyone else" banner, and **Show again…**. The
+  list belongs to the export's entry in `catalog.json` (see
+  [Catalog](#catalog)), so it holds on every instance: the instance that
+  changed it applies it before it answers, the others when they next read
+  `catalog.json` (within about a minute, `MJV_CATALOG_TTL_S`); without sticky
+  sessions a page reloaded right after a change may reach an instance that has
+  not read it yet and show the old state until it has. Turning writes off keeps
+  hidden items hidden from everyone, owners and administrators included, and
+  nobody can show them again until writes are back. When an instance cannot
+  apply a list (building the filtered index fails), everyone else sees "could
+  not prepare this export" with Try again, while the owner and the
+  administrators still see the Hidden section and can show items again.
+- **What hiding leaves in place.** Hiding changes what this viewer shows, not
+  the export. The stored ZIP still holds every hidden prompt and image, and so
+  do other copies: the file that was published, downloads, backups and the
+  storage's own recoverable copies. Generations made from a hidden one
+  (upscales, variations, pans, zooms, remixes) stay visible, usually with the
+  same prompt; an upscale shows one of the hidden grid's pictures, and a hidden
+  upscale's picture stays visible in its grid. Prompts and flags of visible
+  generations that use a hidden picture by its address (image prompts,
+  `--sref`, `--cref`) keep that address, which names the hidden generation and
+  opens its picture at Midjourney. In a ZIP with several export roots, a
+  generation in another root that names a hidden moodboard only by its code
+  keeps showing that code. Fields this viewer does not know are shown as
+  written. Browsers may keep images they already showed for up to 10 minutes,
+  and a page that is open keeps what it showed until it is reloaded. The list
+  goes with the export's catalog entry: once the export is deleted (or
+  unpublished), publishing the same ZIP again, like publishing a new one,
+  starts with nothing hidden. To remove something for real, delete the export
+  and publish one without it.
+- **Versions.** A viewer older than this one ignores hidden lists and shows
+  everything to everyone. `/healthz` lists `hide` in `features`: check it
+  before rolling back, and while instances are upgraded.
 - **Opening a published export** downloads its ZIP in the background into the
   cache, checks its size and SHA-256 against the catalog, makes it read-only,
   and then reads it like a local ZIP. The start page shows the progress; with a
@@ -336,9 +389,9 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
 | `MJV_ALLOWED_DOMAIN` | required | Your Workspace domain, such as `example.com`. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | required | A Google OAuth client of type "Web application". |
 | `MJV_CATALOG_URL` | required | The container URL with its read-only query string, such as `https://<account>.blob.core.windows.net/<container>?sv=...&sp=rl&sig=...`. https only. A SAS whose `sp` allows more than read and list is refused. Treat it like a password. |
-| `MJV_CATALOG_WRITE_URL` | none | Turns deleting on. The same container as `MJV_CATALOG_URL` (the same scheme, host and path) with a query string of its own that may also write and delete: a SAS whose `sp` contains `w` and `d` and nothing but `r`, `w`, `d` and `l`, such as `sp=rwdl`. https only. It is used only to rewrite `catalog.json` and to delete the ZIPs of deleted exports; everything is still read with `MJV_CATALOG_URL`. Treat it like a password. Without it the viewer never writes to the container and nobody can delete. |
+| `MJV_CATALOG_WRITE_URL` | none | Turns deleting and hiding on. The same container as `MJV_CATALOG_URL` (the same scheme, host and path) with a query string of its own that may also write and delete: a SAS whose `sp` contains `w` and `d` and nothing but `r`, `w`, `d` and `l`, such as `sp=rwdl`. https only. It is used only to rewrite `catalog.json` and to delete the ZIPs of deleted exports; everything is still read with `MJV_CATALOG_URL`. Treat it like a password. Without it the viewer never writes to the container and nobody can delete, hide or show again (lists hidden before still apply to everyone). |
 | `MJV_SOFT_DELETE_DAYS` | none | How many days the container keeps a deleted file recoverable (its soft-delete setting), a whole number from 1 to 365. The delete dialog states it. The viewer cannot check it, so set it to what the container really keeps; without it the dialog says that the storage's own settings decide whether a recoverable copy is kept. |
-| `MJV_ADMIN_EMAILS` | none | Administrators: email addresses, separated by commas and/or spaces, who may delete any export, also one without an owner. Each must be an address at `MJV_ALLOWED_DOMAIN`; they are compared in lower case. They can delete only while deleting is turned on. |
+| `MJV_ADMIN_EMAILS` | none | Administrators: email addresses, separated by commas and/or spaces, who may delete any export, also one without an owner, and hide its generations and moodboards or show them again. Each must be an address at `MJV_ALLOWED_DOMAIN`; they are compared in lower case. They can do so only while deleting is turned on. |
 | `PORT` | 8000 | Port to listen on; hosted mode binds all interfaces. |
 | `MJV_CACHE_DIR` | `/home/mjv-cache`, else `~/.cache/mj-export-viewer` | Downloaded ZIPs and thumbnails. The first default is used when that folder exists and accepts writes, or when `/home` accepts writes to create it (a shared, persistent mount on some platforms); otherwise the second (under `$XDG_CACHE_HOME` when that is set) is used and the log says so. Whichever folder is used is checked for writes at start and every minute; `/healthz` reports the result as `cache.ok`. |
 | `MJV_CACHE_MAX_GB` | 50 | The cache never grows past this size (in GiB). Before a download, the least recently used ZIPs that no instance used in the last 10 minutes are deleted to make room; when that is not enough, opening fails with "the cache is full" until some of them have not been used for 10 minutes. |
@@ -376,7 +429,12 @@ It never prints a secret value.
       "published_by": "someone@example.com",
       "owner": "designer@example.com",
       "summary": {"jobs": 120, "moodboards": 4, "profiles": 2, "images": 480,
-                  "export_time": "2026-03-31T18:00:00Z", "extension_version": "0.3.1", "status": "complete"}
+                  "export_time": "2026-03-31T18:00:00Z", "extension_version": "0.3.1", "status": "complete"},
+      "hidden": {
+        "jobs": [{"id": "<job id>", "hidden_at": "2026-04-02T08:00:00Z", "hidden_by": "designer@example.com"}],
+        "moodboards": [{"id": "<moodboard id>", "hidden_at": "2026-04-02T08:05:00Z", "hidden_by": "admin@example.com"}],
+        "counts": {"jobs": 13, "moodboards": 1, "images": 50}
+      }
     }
   ],
   "deleted": [
@@ -400,6 +458,28 @@ Every minute, also while nobody uses the viewer, each instance re-reads the
 catalog, closes the exports it no longer lists and deletes their thumbnails;
 their cached ZIPs are deleted once no instance has used them for 10 minutes.
 
+`hidden` (optional) is what the app hides in that export: the ids of the jobs
+and moodboards hidden from everyone but the owner and the administrators, each
+with who hid it and when, and `counts`, which the app writes at every change
+(generations and moodboards hidden in the ZIP, a moodboard's generations
+included, and the image files only they use, summed over its export roots).
+The cards subtract `counts` from `summary` before an export is opened. Which
+ids an export hides must be read with certainty, so the whole entry is skipped
+like any invalid one (never served without its list) when `hidden` is not an
+object, `jobs` or `moodboards` is not a list (absent or `null` is empty), an
+item has no usable `id` (a string of 1 to 200 characters, no control
+characters, not only spaces) or the lists hold more than 1,000 items together;
+such an entry also keeps its id, so a later entry with the same id is skipped
+too. A `hidden_at` that is not a date, a `hidden_by` that is not an address or
+`counts` that are not three whole numbers are only shown as not recorded, and
+an id listed twice counts once. An id that names nothing in the export hides
+nothing (it is listed as "Not in this export"). Removing an item, or the whole
+`hidden` key, by hand shows it again within a catalog read; drop `counts` when
+editing items rather than leave wrong numbers (cards then show no counts until
+the app writes the list again). The app never grows `catalog.json` past
+12 MiB (the server reads up to 16 MiB): a hide that would is refused, while
+showing again and deleting, which make it smaller, still work.
+
 `deleted` holds one record per deleted export (no name, label or summary). An
 instance that reads one closes that export and deletes its cached ZIP and
 thumbnails at once, without the 10-minute wait, unless the export is listed
@@ -415,8 +495,11 @@ write the same way.
 ### Health and start probe
 
 - `GET /healthz` answers without sign-in and for any `Host`:
-  `{"ok": true, "mode": "hosted", "commit": "...", "catalog": {"exports": 2, "ok": true, "age_s": 12.5, "delete_enabled": false, "zip_deletes_pending": 0, "soft_delete_days": null}, "cache": {"ok": true}}`.
-  It names no export, user, path or secret. `catalog.ok` is false while the
+  `{"ok": true, "mode": "hosted", "commit": "...", "features": ["hide"], "catalog": {"exports": 2, "ok": true, "age_s": 12.5, "delete_enabled": false, "zip_deletes_pending": 0, "soft_delete_days": null}, "cache": {"ok": true}}`.
+  It names no export, user, path or secret. `features` lists what this
+  version does that older ones did not: `hide` means it applies hidden lists
+  (an instance without it would show every hidden item to everyone).
+  `catalog.ok` is false while the
   catalog cannot be read; `age_s` is the age of the copy in use;
   `delete_enabled` says whether `MJV_CATALOG_WRITE_URL` is set;
   `zip_deletes_pending` counts the ZIPs of deleted exports that the instance
@@ -461,6 +544,12 @@ What differs from [local mode](#security-model):
   decided on `catalog.json` as read from the storage at that moment: the owner
   recorded there, or an administrator. Nothing is ever written to the
   container without `MJV_CATALOG_WRITE_URL`, and reading never uses it.
+- **Hiding** is a POST of one generation or moodboard, checked the same way and
+  written the same way. Every export route and every image goes through one
+  check that serves everyone but the export's owner and administrators an
+  index built without the hidden items, from the start, so hidden ids, files
+  and thumbnails answer exactly like ones that never existed, and no list,
+  search, count, check or raw record can mention them.
 - **Secrets stay on the server.** The storage query strings, the OAuth client
   secret and `MJV_AUTH_SECRET` never appear in a log line, a page, an API answer
   or an error message.
@@ -469,12 +558,15 @@ What differs from [local mode](#security-model):
 - **Signing out** clears the cookies in that browser. Sessions are not stored on
   the server, so to end every session at once, change `MJV_AUTH_SECRET`.
 - **Logs** record sign-ins (with the email address), refused sign-ins (with the
-  reason), failed requests (paths only), catalog problems, download results and
-  deletions (one line each: the export id and who deleted it).
+  reason), failed requests (paths only), catalog problems, download results,
+  deletions (one line each: the export id and who deleted it) and every hide
+  or show again (one line each: the export id, who, and how many generations
+  and moodboards it hides now; never an item's id, prompt or name).
 
-Everyone who can sign in with your domain sees every published export; only its
-owner or an administrator can delete one. The cache holds the downloaded ZIPs
-(`zips/`) and the thumbnails viewed (`thumbs/`).
+Everyone who can sign in with your domain sees every published export, except
+what its owner or an administrator hid; only they can delete one or hide parts
+of it. The cache holds the downloaded ZIPs (`zips/`) and the thumbnails viewed
+(`thumbs/`).
 
 ### Container image
 
@@ -509,7 +601,7 @@ account, `--chooser` for an account page first, as Google shows). Ctrl+C stops
 it and deletes its temporary folder; a `--store` folder is only read. In the
 temporary container deleting is on and the signed-in account owns the ZIPs it
 publishes (and the first invented export; the second has no owner), so
-**Delete…** can be tried there.
+**Delete…** and **Hide…** can be tried there.
 
 ## Tests
 
@@ -534,13 +626,21 @@ conditional writes and deletes as the storage does, and can inject 403, 404,
 concurrent writer). `tests/test_hosted.py` covers the settings, signing,
 sign-in and every id-token rejection, sessions, the Host, Origin and token
 rules on every route, request bodies on GET, who may delete what and the
-checks on that request, and `python3 -m mjviewer --hosted` as a process
-(start-up, every address, a clean stop during a download);
+checks on that request, who may hide what, a crawl of every route, page,
+filter, search term, detail, file and thumbnail as someone who manages
+nothing that must never meet a hidden item, and `python3 -m mjviewer --hosted`
+as a process (start-up, every address, a clean stop during a download);
 `tests/test_catalog.py` covers catalog validation and refresh, downloads and
 their failures, explicit retries, two instances sharing one cache, eviction,
 unpublishing, deleting (a concurrent writer, fields the viewer does not know,
-storage failures, ZIPs already gone or kept, and every instance's copies), and
-that the storage query strings never leak. `tests/test_check.py` covers
+storage failures, ZIPs already gone or kept, and every instance's copies),
+hiding (hidden lists that cannot be read, the conditional rewrite, applying a
+list before answering and on other instances, lists that change while an
+export opens, builds that fail or outlive their export, and the limits), and
+that the storage query strings never leak. `tests/test_hidden.py` covers what
+a hidden list hides in a ZIP with one or two export roots and what the index
+built without it leaves out, on a synthetic export whose hidden items carry a
+marker in every id, name, code and file name. `tests/test_check.py` covers
 `--check`.
 
 An end-to-end browser test drives the real UI in Chromium on a synthetic
@@ -581,7 +681,7 @@ viewer/
   mjviewer/
     __main__.py        command line
     sources.py         read-only, size-capped access to ZIPs and folders
-    model.py           parsing, checks, links, lineage, facets and queries
+    model.py           parsing, checks, links, lineage, facets, queries and hidden items
     server.py          HTTP server, security checks, files and thumbnails
     hosted.py          hosted mode: settings, sign-in, sessions, routes
     catalog.py         hosted mode: the published catalog and the verified ZIP cache
@@ -613,9 +713,10 @@ viewer/
 - A job or moodboard whose id is `.` or `..` is listed but cannot be opened in
   the browser (it shows Not found), because browsers resolve those path
   segments before the request is sent.
-- What the exporter does not export cannot be shown: videos, deleted or hidden
-  jobs, earlier versions of a board, deleted boards, a board's full usage
-  history, individual profile ratings, and likes of other creators' work.
+- What the exporter does not export cannot be shown: videos, jobs deleted or
+  hidden in Midjourney, earlier versions of a board, deleted boards, a board's
+  full usage history, individual profile ratings, and likes of other creators'
+  work.
 - Tested in Chromium only.
 - Hosted mode: a published export is downloaded whole before its first view
   (reading the ZIP from storage piece by piece was left out to keep the tested
@@ -628,3 +729,14 @@ viewer/
   `MJV_CATALOG_TTL_S`, while its reads fail). A download that stalls inside a
   network read when the server stops leaves its temporary file and lock to the
   stale-file rules (another instance takes over after a minute).
+- Hosted mode, hiding: an export that hides something is held twice in memory
+  on each instance where it is open (the whole export, which its owner and the
+  administrators need, and the copy without the hidden items that everyone
+  else is served), so it takes about twice the memory: the synthetic
+  60,000-job export took about 600 MB, and about 1.1 GB with a moodboard and
+  100 generations hidden. Each hide or show again builds that copy anew on
+  every instance where the export is open, about as long as opening it (about
+  7 seconds for that export), unless what everyone else sees does not change
+  (hiding on its own a generation already hidden with its moodboard); requests
+  for that export wait meanwhile, and builds of several exports run one after
+  another.
