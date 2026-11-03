@@ -216,6 +216,8 @@ export const IMAGE_STATUS = {
   not_exported: {label: 'Image not exported (metadata only)', short: 'Not exported', icon: 'image'},
   unsupported: {label: 'Unsupported image format', short: 'Unsupported', icon: 'file'},
   failed: {label: 'The image could not be loaded', short: 'Load failed', icon: 'image-off'},
+  // Hosted mode: a moodboard reference picture of a generation hidden in this viewer.
+  unavailable: {label: 'Not available here', short: 'Not available', icon: 'image-off'},
 };
 
 export function imageStatusInfo(status) {

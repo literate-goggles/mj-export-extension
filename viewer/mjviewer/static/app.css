@@ -2028,6 +2028,15 @@ a.mini:hover .mini__title {
   color: var(--muted);
 }
 
+/* Hosted mode: a parent that is not available here is a neutral gap, not a warning. */
+.mini--unavailable {
+  border-color: var(--line-2);
+}
+
+.mini--unavailable .mini__thumb {
+  color: var(--muted);
+}
+
 .mini__thumb {
   position: relative;
   flex: none;

@@ -243,7 +243,9 @@ export function resetLazyImages() {
 
 export function placeholder(status, {compact = false, file = '', reason = ''} = {}) {
   const info = imageStatusInfo(status);
-  const title = [info.label, reason ? str(reason) : '', file ? str(file) : ''].filter(Boolean).join(' · ');
+  // A picture that is not available here is named by nothing: no file, no reason.
+  const shown = status === 'unavailable' ? [info.label] : [info.label, reason ? str(reason) : '', file ? str(file) : ''];
+  const title = shown.filter(Boolean).join(' · ');
   return h('div', {class: ['ph', `ph--${str(status) || 'unknown'}`, compact && 'ph--compact'], role: 'img', 'aria-label': title, title},
     icon(info.icon, {size: compact ? 18 : 22}),
     h('span', {class: 'ph__label'}, info.short));
@@ -401,6 +403,9 @@ export function jobCard(job, {exportId, href = '', top = null, footer = null, cl
   } else if (j.parent_status === 'left_out') {
     lineage.push(h('span', {class: 'hint', title: 'The designer chose not to export the parent job'},
       icon('unlink', {size: 13}), 'Parent left out'));
+  } else if (j.parent_status === 'unavailable') {
+    lineage.push(h('span', {class: 'hint', title: 'The generation this one was made from is not available here'},
+      icon('unlink', {size: 13}), 'Parent not available'));
   }
   if (isNum(j.child_count) && j.child_count > 0) {
     lineage.push(h('span', {class: 'hint', title: 'Jobs in this export made from this one'},

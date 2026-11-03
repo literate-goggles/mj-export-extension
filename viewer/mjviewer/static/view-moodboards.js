@@ -162,7 +162,7 @@ export function renderMoodboard(root, route, ctx) {
       unresolvedSection(unresolved),
       notesBlock(data.notes),
       unknownSection(arr(data.unknown_fields)),
-      rawSection(data.raw));
+      rawSection(data.raw, data.raw_withheld === true));
   }
 
   function legend(refCount, genCount) {
@@ -205,12 +205,14 @@ export function renderMoodboard(root, route, ctx) {
       } else {
         frame.append(placeholder(r.status, {file: str(r.file)}));
       }
+      // A picture that is not available here (hosted mode: a hidden generation's) has no size or address to show.
+      const unavailable = r.status === 'unavailable';
       return h('li', {class: 'ref'},
         frame,
         h('div', {class: 'ref__cap'},
           h('span', {class: 'ref__label'}, `Reference ${n}`),
-          isNum(r.width) && isNum(r.height) ? h('span', {class: 'ref__dims'}, `${r.width} × ${r.height}`) : null,
-          r.source_url ? copyButton(str(r.source_url), {what: `source URL of reference ${n}`, iconOnly: true}) : null));
+          !unavailable && isNum(r.width) && isNum(r.height) ? h('span', {class: 'ref__dims'}, `${r.width} × ${r.height}`) : null,
+          !unavailable && r.source_url ? copyButton(str(r.source_url), {what: `source URL of reference ${n}`, iconOnly: true}) : null));
     })));
     return sec.el;
   }
@@ -277,8 +279,10 @@ export function renderMoodboard(root, route, ctx) {
     return sec.el;
   }
 
-  function rawSection(raw) {
-    const sec = section('Raw record', {iconName: 'file', intro: 'The original moodboards.jsonl row, unchanged.'});
+  function rawSection(raw, withheld) {
+    const sec = section('Raw record', {iconName: 'file', intro: withheld
+      ? 'The original moodboards.jsonl row; ids and pictures of items not available here are left out.'
+      : 'The original moodboards.jsonl row, unchanged.'});
     sec.body.append(rawBlock(raw === undefined ? null : raw, {summary: 'Show moodboards.jsonl row'}));
     return sec.el;
   }

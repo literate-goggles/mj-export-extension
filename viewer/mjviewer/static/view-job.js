@@ -10,6 +10,8 @@ import {
 } from './ui.js';
 import {openLightbox, lightboxOpen} from './lightbox.js';
 
+const UNAVAILABLE_PARENT = 'The generation this one was made from is not available here';
+
 const FLAG_ORDER = ['ar', 'v', 'niji', 'stylize', 'chaos', 'weird', 'raw', 'tile', 'iw', 'sref', 'profile'];
 const FLAG_HELP = {
   ar: 'Aspect ratio',
@@ -86,7 +88,7 @@ export function renderJob(root, route, ctx) {
       flagsSection(job),
       likesSection(job, arr(data.likes)),
       unknownSection(arr(data.unknown_fields)),
-      rawSection(data.raw));
+      rawSection(data.raw, data.raw_withheld === true));
   }
 
   function imagesBlock(images, job) {
@@ -166,8 +168,11 @@ export function renderJob(root, route, ctx) {
     const parent = obj(lineage.parent);
     const parentId = str(parent.id || job.parent_id);
     const parentStatus = parent.status || job.parent_status;
+    // Hosted mode: a parent that is not available here (hidden) is named nowhere, and is not a gap.
+    const unavailable = parentStatus === 'unavailable';
     let parentValue = null;
-    if (parentId && parentStatus === 'in_export') parentValue = jobLink(exportId, parentId);
+    if (unavailable) parentValue = badge('Not available', {iconName: 'unlink', title: UNAVAILABLE_PARENT});
+    else if (parentId && parentStatus === 'in_export') parentValue = jobLink(exportId, parentId);
     else if (parentId && parentStatus === 'left_out') parentValue = h('span', {class: 'stack'}, h('span', {class: 'mono break'}, parentId), badge('Left out by the designer', {iconName: 'unlink'}));
     else if (parentId) parentValue = h('span', {class: 'stack'}, h('span', {class: 'mono break'}, parentId), badge('Not in this export', {tone: 'warn', iconName: 'unlink'}));
     const parentIndex = isNum(parent.index) ? parent.index : isNum(job.parent_index) ? job.parent_index : null;
@@ -186,7 +191,8 @@ export function renderJob(root, route, ctx) {
         ['Job type', job.job_type ? h('span', {class: 'mono'}, str(job.job_type)) : null],
         ['Event type', job.event_type ? h('span', {class: 'mono'}, str(job.event_type)) : null],
         ['Parent', parentValue],
-        parentId ? ['From image', parentIndex !== null ? `Image ${parentIndex + 1} of the parent (index ${parentIndex})` : 'Not recorded'] : null,
+        unavailable ? ['From image', parentIndex !== null ? `Image ${parentIndex + 1} of the parent` : 'Not recorded'] : null,
+        parentId && !unavailable ? ['From image', parentIndex !== null ? `Image ${parentIndex + 1} of the parent (index ${parentIndex})` : 'Not recorded'] : null,
         job.parent_grid !== undefined && job.parent_grid !== null && !isNum(job.parent_grid)
           ? ['parent_grid', h('span', {class: 'mono break'}, JSON.stringify(job.parent_grid)), 'Unrecognised parent_grid structure, kept as recorded'] : null,
         job.video ? ['Video', h('span', {class: 'is-warn'}, 'Video job; the exporter does not export video media.')] : null,
@@ -254,7 +260,11 @@ export function renderJob(root, route, ctx) {
     }
     if (ancestors.length || parentStatus !== 'none') {
       const trail = h('ol', {class: 'trail', 'aria-label': 'Ancestors, root first'});
-      if ((parentStatus === 'missing' || parentStatus === 'left_out') && !ancestors.length) {
+      if (parentStatus === 'unavailable') {
+        trail.append(h('li', {class: 'trail__item'}, h('span', {class: 'mini mini--gap mini--unavailable', title: UNAVAILABLE_PARENT},
+          h('span', {class: 'mini__thumb'}, icon('unlink', {size: 18})),
+          h('span', {class: 'mini__text'}, h('span', {class: 'mini__title'}, 'Parent not available')))));
+      } else if ((parentStatus === 'missing' || parentStatus === 'left_out') && !ancestors.length) {
         const leftOut = parentStatus === 'left_out';
         trail.append(h('li', {class: 'trail__item'}, h('span', {class: ['mini', 'mini--gap', leftOut && 'mini--left-out']},
           h('span', {class: 'mini__thumb'}, icon('unlink', {size: 18})),
@@ -289,6 +299,8 @@ export function renderJob(root, route, ctx) {
     } else if (parentStatus === 'left_out') {
       facts.append(callout('info', h('p', null, 'The designer left the parent job ', h('span', {class: 'mono break'}, parentId),
         ' out of this export, so the chain stops here.')));
+    } else if (parentStatus === 'unavailable') {
+      facts.append(h('p', null, icon('unlink', {size: 15}), `${UNAVAILABLE_PARENT}, so the chain stops here.`));
     }
     const descendants = isNum(lineage.descendant_count) ? lineage.descendant_count : null;
     if (descendants !== null && descendants > children.length) {
@@ -407,8 +419,10 @@ export function renderJob(root, route, ctx) {
     return sec.el;
   }
 
-  function rawSection(raw) {
-    const sec = section('Raw record', {iconName: 'file', intro: 'The original jobs.jsonl row, unchanged.'});
+  function rawSection(raw, withheld) {
+    const sec = section('Raw record', {iconName: 'file', intro: withheld
+      ? 'The original jobs.jsonl row; ids of items not available here are left out.'
+      : 'The original jobs.jsonl row, unchanged.'});
     sec.body.append(rawBlock(raw === undefined ? null : raw, {summary: 'Show jobs.jsonl row'}));
     return sec.el;
   }
