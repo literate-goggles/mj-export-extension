@@ -1,6 +1,6 @@
 // Shared UI pieces. Every value that comes from an export is rendered as text.
 
-import {h, icon, nextId} from './dom.js';
+import {h, icon, nextId, fill} from './dom.js';
 import {hrefs} from './router.js';
 import {
   arr, str, obj, isNum, fmtInt, formatDate, dateTitle, dateAttr, kindLabel, statusInfo, supportInfo,
@@ -497,6 +497,46 @@ export function errorState(err, {retry = null, title = 'Could not load this view
         retry();
       }}, icon('refresh', {size: 14}), 'Retry') : null,
       home || notFound ? h('a', {class: 'btn btn--ghost', href: hrefs.home()}, 'All exports') : null));
+}
+
+/** An error callout above whatever view is open, until the reader dismisses it. */
+export function pageNotice(text) {
+  const notices = document.getElementById('notices');
+  if (!notices) return;
+  const box = h('div', {class: 'page-notice'});
+  fill(box, callout('err', h('p', null, text),
+    h('p', null, h('button', {type: 'button', class: 'btn btn--sm', onclick: () => box.remove()}, 'Dismiss'))));
+  notices.append(box);
+}
+
+const SIGNED_IN_AGAIN = 'Your sign-in changed. Reload the page and try again.';
+const SIGNED_OUT = 'Your sign-in has ended. Signing in again…';
+
+/**
+ * What a dialog says when a change to the published list failed (deleting an export, hiding, showing again): a
+ * plain sentence for each error code. Only the refusals the server words for people (words.own) show its own
+ * message, after words.refused; technical details stay in the server log. words: notUpdated (storage refused the
+ * write or kept changing), unconfirmed (no clear answer, also for the code words.unconfirmedCode), gone (no longer
+ * published), refused, own, more ({code: sentence}, the codes of this change only) and otherwise.
+ */
+export function writeFailure(err, words) {
+  const code = str(err && err.code);
+  if (words.own.includes(code)) return `${words.refused}: ${str(err.message)}`;
+  const table = {
+    forbidden: SIGNED_IN_AGAIN,
+    forbidden_origin: SIGNED_IN_AGAIN,
+    unauthenticated: SIGNED_OUT,
+    http_401: SIGNED_OUT,  // api.js starts the sign-in
+    storage_error: words.notUpdated,
+    catalog_busy: words.notUpdated,
+    [words.unconfirmedCode]: words.unconfirmed,
+    network: words.unconfirmed,  // the request may have reached the server
+    internal: words.unconfirmed,
+    unknown_catalog_entry: words.gone,
+    ...(words.more || {}),
+  };
+  if (Object.prototype.hasOwnProperty.call(table, code)) return table[code];
+  return /^http_5\d\d$/.test(code) ? words.unconfirmed : words.otherwise;
 }
 
 export function loadingState(text = 'Loading…') {

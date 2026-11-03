@@ -1,8 +1,9 @@
-// A small modal dialog that asks before an action that cannot be undone. Focus
-// starts on Cancel; Esc and Cancel close it without acting. While the action
-// runs the buttons are disabled and the dialog stays open, whatever tries to
-// close it (a repeated Esc, its view going away); when the action fails, the
-// failure is shown and the dialog stays open.
+// A small modal dialog that asks before an action: one that cannot be undone,
+// or one that changes what other people see. Focus starts on Cancel; Esc and
+// Cancel close it without acting. While the action runs the buttons are
+// disabled and the dialog stays open, whatever tries to close it (a repeated
+// Esc, its view going away); when the action fails, the failure is shown and
+// the dialog stays open.
 
 import {h, nextId} from './dom.js';
 import {str} from './format.js';
@@ -10,16 +11,18 @@ import {str} from './format.js';
 let current = null;
 
 /**
- * Show the dialog; action() runs when the danger button is pressed, and the
+ * Show the dialog; action() runs when the confirm button is pressed, and the
  * dialog closes once it has succeeded. Resolves true when it succeeded, false
  * when the dialog was cancelled. A failure is never dropped: failure(err) is
  * shown in the dialog, and should the dialog be gone from the page by then,
  * the promise rejects with the error so that the caller can say so on the
  * page. returnFocus() names where focus goes back to on cancel when the
- * element that opened the dialog is gone.
+ * element that opened the dialog is gone. tone colours the confirm button:
+ * 'danger' (the default) or 'primary'.
  */
 export function confirmAction({title, body = null, confirmLabel, busyLabel = 'Working…',
-  failure = (err) => `Could not finish: ${str(err && err.message) || 'unknown error'}`, action, returnFocus = null}) {
+  failure = (err) => `Could not finish: ${str(err && err.message) || 'unknown error'}`, action, returnFocus = null,
+  tone = 'danger'}) {
   closeConfirm();
   const opener = document.activeElement;
   return new Promise((resolve, reject) => {
@@ -27,7 +30,8 @@ export function confirmAction({title, body = null, confirmLabel, busyLabel = 'Wo
     const bodyId = nextId('confirm-body');
     const error = h('p', {class: 'confirm__error', role: 'alert', hidden: true});
     const cancel = h('button', {type: 'button', class: 'btn', autofocus: true}, 'Cancel');
-    const go = h('button', {type: 'button', class: 'btn btn--danger'}, confirmLabel);
+    const go = h('button', {type: 'button', class: ['btn', tone === 'primary' ? 'btn--primary' : 'btn--danger']},
+      confirmLabel);
     const dialog = h('dialog', {class: 'confirm', 'aria-labelledby': titleId, 'aria-describedby': bodyId},
       h('h2', {class: 'confirm__title', id: titleId}, title),
       h('div', {class: 'confirm__body', id: bodyId}, body),

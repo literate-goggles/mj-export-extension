@@ -9,6 +9,7 @@ import {loadExports, loadHealth, prepareExport, onPrepare, isAbort, deleteExport
 import {arr, str, obj, isNum, fmtInt, fmtBytes, plural} from './format.js';
 import {
   pageHead, section, statusBadge, supportBadge, badge, emptyState, errorState, loadingState, callout, timeEl, announce,
+  pageNotice, writeFailure,
 } from './ui.js';
 import {confirmAction, closeConfirm, confirmOpen} from './confirm.js';
 
@@ -209,42 +210,19 @@ export function renderHostedHome(root, route, ctx) {
   };
 }
 
-const SIGNED_IN_AGAIN = 'Your sign-in changed. Reload the page and try again.';
-const SIGNED_OUT = 'Your sign-in has ended. Signing in again…';
-const NOT_UPDATED = 'The viewer could not update its list right now. Nothing was deleted. Try again in a few minutes.';
-const UNCONFIRMED = 'The viewer could not confirm whether the export was deleted. Reload the page to check.';
-const DELETE_FAILURES = {
-  forbidden: SIGNED_IN_AGAIN,
-  forbidden_origin: SIGNED_IN_AGAIN,
-  unauthenticated: SIGNED_OUT,
-  http_401: SIGNED_OUT,  // api.js starts the sign-in
-  storage_error: NOT_UPDATED,
-  catalog_busy: NOT_UPDATED,
-  delete_unconfirmed: UNCONFIRMED,
-  network: UNCONFIRMED,  // the request may have reached the server
-  internal: UNCONFIRMED,
-  unknown_catalog_entry: 'This export is not published any more. It may have been deleted already.',
+const DELETE_WORDS = {
+  notUpdated: 'The viewer could not update its list right now. Nothing was deleted. Try again in a few minutes.',
+  unconfirmed: 'The viewer could not confirm whether the export was deleted. Reload the page to check.',
+  unconfirmedCode: 'delete_unconfirmed',
+  gone: 'This export is not published any more. It may have been deleted already.',
+  refused: 'Could not delete',
+  own: ['not_owner', 'delete_disabled'],
+  otherwise: 'Could not delete this export. Reload the page and try again.',
 };
 
-/**
- * What the delete dialog says when deleting failed: a plain sentence for each error code. Only the refusals the
- * server words for people show its own message; technical details stay in the server log.
- */
+/** What the delete dialog says when deleting failed: a plain sentence for each error code (see writeFailure). */
 function deleteFailure(err) {
-  const code = str(err && err.code);
-  if (code === 'not_owner' || code === 'delete_disabled') return `Could not delete: ${str(err.message)}`;
-  if (DELETE_FAILURES[code]) return DELETE_FAILURES[code];
-  return /^http_5\d\d$/.test(code) ? UNCONFIRMED : 'Could not delete this export. Reload the page and try again.';
-}
-
-/** An error callout above whatever view is open, until the reader dismisses it. */
-function pageNotice(text) {
-  const notices = document.getElementById('notices');
-  if (!notices) return;
-  const box = h('div', {class: 'page-notice'});
-  fill(box, callout('err', h('p', null, text),
-    h('p', null, h('button', {type: 'button', class: 'btn btn--sm', onclick: () => box.remove()}, 'Dismiss'))));
-  notices.append(box);
+  return writeFailure(err, DELETE_WORDS);
 }
 
 /** MJV_SOFT_DELETE_DAYS as /api/health reports it: a whole number of days, or null when not set or unknown. */
