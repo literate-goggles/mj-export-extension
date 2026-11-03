@@ -57,11 +57,15 @@ import urllib.request
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from . import __version__
-from .model import iso_utc, parse_date
+from .model import MAX_COUNT, iso_utc, parse_date
 from .sources import CHUNK_SIZE, SourceError
 
 CATALOG_NAME = 'catalog.json'
 MAX_CATALOG_BYTES = 16 * 1024 * 1024
+MAX_HIDDEN_ITEMS = 1000  # jobs and moodboards one entry's hidden list may name, together
+MAX_HIDDEN_ID = 200
+HIDDEN_LISTS = ('jobs', 'moodboards')
+HIDDEN_COUNTS = ('jobs', 'moodboards', 'images')
 MAX_JSON_DEPTH = 64  # catalog.json nested deeper than this is refused: it could be read but not written back
 MAX_ENTRIES = 10_000
 MAX_EXPORT_BYTES = 256 * 1024 ** 3
@@ -328,6 +332,70 @@ def email_address(value) -> Optional[str]:
     return value if EMAIL_RE.fullmatch(value) else None
 
 
+def hidden_id(value) -> Optional[str]:
+    """value when it can name a hidden job or moodboard: 1-200 characters, no control characters, not only
+    whitespace (the viewer reads an integer id as its decimal string, so a record holds strings only)."""
+    value = _plain(value, MAX_HIDDEN_ID)
+    return value if value is not None and value.strip() else None
+
+
+def _stamp(value) -> Optional[str]:
+    """A date as YYYY-MM-DDTHH:MM:SSZ (UTC), or None when it is not one."""
+    moment = parse_date(value) if _plain(value, 64) else None
+    return None if moment is None else moment.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _hidden_counts(value) -> Optional[dict]:
+    """{jobs, moodboards, images} when all three are whole numbers from 0 to 2^53, else None (not counted)."""
+    if not isinstance(value, dict):
+        return None
+    counts = {key: value.get(key) for key in HIDDEN_COUNTS}
+    if all(isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= MAX_COUNT for n in counts.values()):
+        return counts
+    return None
+
+
+def _hidden_record(raw) -> Tuple[Optional[dict], str]:
+    """The hidden list of one catalog entry, normalized, or (None, '') when it hides nothing; (None, reason) when
+    which ids it hides cannot be read with certainty (the entry is then not valid). Reasons never quote a value.
+    What only describes an item is tolerated: a hidden_at that is not a date or a hidden_by that is not an
+    address becomes None, and counts that are not three counts become None (the next write fixes them); an id
+    listed twice counts once (its first who and when). key changes exactly when the listed ids change."""
+    if raw is None:
+        return None, ''
+    if not isinstance(raw, dict):
+        return None, 'hidden is not an object'
+    lists = {}
+    for name in HIDDEN_LISTS:
+        items = raw.get(name)
+        if items is not None and not isinstance(items, list):
+            return None, 'hidden.%s is not a list' % name
+        lists[name] = items or []
+    if sum(len(items) for items in lists.values()) > MAX_HIDDEN_ITEMS:
+        return None, 'hidden lists more than %d items' % MAX_HIDDEN_ITEMS
+    found: Dict[str, dict] = {}
+    for name, items in lists.items():
+        found[name] = {}
+        for n, item in enumerate(items):
+            item_id = hidden_id(item.get('id')) if isinstance(item, dict) else None
+            if item_id is None:
+                return None, 'hidden.%s[%d] has no usable id' % (name, n)
+            if item_id not in found[name]:
+                found[name][item_id] = {'hidden_at': _stamp(item.get('hidden_at')),
+                                        'hidden_by': email_address(item.get('hidden_by'))}
+    if not found['jobs'] and not found['moodboards']:
+        return None, ''
+    key = hashlib.sha256(json.dumps([sorted(found['jobs']), sorted(found['moodboards'])]).encode('ascii')).hexdigest()
+    return {'jobs': found['jobs'], 'moodboards': found['moodboards'], 'counts': _hidden_counts(raw.get('counts')),
+            'key': key}, ''
+
+
+def record_key(entry: Optional[dict]) -> str:
+    """Which hidden list an entry applies: '' when it hides nothing (or there is no entry)."""
+    record = entry.get('hidden') if entry else None
+    return record['key'] if record else ''
+
+
 def _entry(item) -> Tuple[Optional[dict], str]:
     """A validated catalog entry, or (None, reason). Reasons never quote the entry."""
     if not isinstance(item, dict):
@@ -367,6 +435,9 @@ def _entry(item) -> Tuple[Optional[dict], str]:
         owner = email_address(owner)
         if owner is None:
             return None, 'owner is not an email address'
+    hidden, reason = _hidden_record(item.get('hidden'))
+    if reason:  # never served unfiltered: an entry whose hidden ids cannot be read is not valid at all
+        return None, reason
     raw_summary = item.get('summary')
     if raw_summary is None:
         raw_summary = {}
@@ -387,7 +458,7 @@ def _entry(item) -> Tuple[Optional[dict], str]:
         and not isinstance(export_time, bool) else None
     return {'id': sha[:16], 'sha256': sha, 'blob': 'exports/%s.zip' % sha, 'size': size, 'name': name,
             'label': label, 'published_at': published_at, 'published_by': published_by, 'owner': owner,
-            'summary': summary}, ''
+            'summary': summary, 'hidden': hidden}, ''
 
 
 def _tombstone(item) -> Optional[dict]:
@@ -490,11 +561,23 @@ def parse_catalog(raw: bytes, deleted: Optional[List[dict]] = None) -> Tuple[Lis
     return entries, skipped, iso_utc(parse_date(updated)) if _plain(updated, 64) else None
 
 
-def _entries(items: list) -> Tuple[List[dict], List[dict]]:
-    """The usable entries of an exports list, and the skipped ones as {index, reason}."""
-    entries: List[dict] = []
+def _reserved_id(item) -> Optional[str]:
+    """The id a skipped entry keeps for itself because it carries a hidden list: a later entry with that id (a
+    hand edit, a bad merge) must not be served without it. Only an id that goes with a valid sha256 counts."""
+    if not isinstance(item, dict) or item.get('hidden') is None:
+        return None
+    sha = item.get('sha256')
+    if isinstance(sha, str) and SHA_RE.fullmatch(sha) and item.get('id') == sha[:16]:
+        return sha[:16]
+    return None
+
+
+def _usable(items: list) -> Tuple[List[Tuple[int, dict]], List[dict]]:
+    """(position, entry) of the usable entries of an exports list, and the skipped ones as {index, reason}."""
+    usable: List[Tuple[int, dict]] = []
     skipped: List[dict] = []
     seen: Set[str] = set()
+    reserved: Set[str] = set()
     for n, item in enumerate(items[:MAX_ENTRIES]):
         try:
             entry, reason = _entry(item)
@@ -502,14 +585,25 @@ def _entries(items: list) -> Tuple[List[dict], List[dict]]:
             entry, reason = None, 'unreadable entry (%s)' % type(exc).__name__
         if entry is not None and entry['id'] in seen:
             entry, reason = None, 'duplicate id; the first entry is used'
+        elif entry is not None and entry['id'] in reserved:
+            entry, reason = None, 'duplicate id; an earlier entry with this id is not valid'
         if entry is None:
             skipped.append({'index': n, 'reason': reason})
+            claimed = _reserved_id(item)
+            if claimed is not None:
+                reserved.add(claimed)
             continue
         seen.add(entry['id'])
-        entries.append(entry)
+        usable.append((n, entry))
     if len(items) > MAX_ENTRIES:
         skipped.append({'index': MAX_ENTRIES, 'reason': 'more than %d entries; the rest are ignored' % MAX_ENTRIES})
-    return entries, skipped
+    return usable, skipped
+
+
+def _entries(items: list) -> Tuple[List[dict], List[dict]]:
+    """The usable entries of an exports list, and the skipped ones as {index, reason}."""
+    usable, skipped = _usable(items)
+    return [entry for _, entry in usable], skipped
 
 
 class Catalog:
@@ -648,6 +742,12 @@ class Catalog:
 
     def entry(self, catalog_id: str) -> Optional[dict]:
         self.refresh()
+        with self._lock:
+            return self._by_id.get(catalog_id)
+
+    def peek(self, catalog_id: str) -> Optional[dict]:
+        """The entry in use, without refreshing. Safe under Published's lock: this class never calls into
+        Published while it holds its own lock (the lock order is always Published's, then this one)."""
         with self._lock:
             return self._by_id.get(catalog_id)
 

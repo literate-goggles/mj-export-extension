@@ -174,6 +174,92 @@ class ParseCatalogTests(unittest.TestCase):
         self.assertEqual(entries, [])
         self.assertEqual([s['reason'] for s in skipped], ['owner is not an email address'] * len(bad))
 
+    def test_hidden_records_are_validated_and_fail_closed(self):
+        """Which ids an entry hides must be read with certainty: anything else makes the whole entry invalid (it is
+        skipped like any invalid entry, never served unfiltered). What only describes an item is tolerated."""
+        item = lambda value, **more: dict({'id': value}, **more)  # noqa: E731
+        bad = [([], 'hidden is not an object'), ('leakcheck', 'hidden is not an object'), (5, 'hidden is not an object'),
+               ({'jobs': {'id': 'leakcheck'}}, 'hidden.jobs is not a list'),
+               ({'moodboards': 'leakcheck'}, 'hidden.moodboards is not a list'),
+               ({'jobs': ['leakcheck']}, 'hidden.jobs[0] has no usable id'),
+               ({'jobs': [{}]}, 'hidden.jobs[0] has no usable id'),
+               ({'jobs': [item(12345)]}, 'hidden.jobs[0] has no usable id'),
+               ({'jobs': [item('')]}, 'hidden.jobs[0] has no usable id'),
+               ({'jobs': [item('   ')]}, 'hidden.jobs[0] has no usable id'),
+               ({'jobs': [item('leakcheck' * 23)]}, 'hidden.jobs[0] has no usable id'),
+               ({'jobs': [item('leak\ncheck')]}, 'hidden.jobs[0] has no usable id'),
+               ({'jobs': [item('leak check')]}, 'hidden.jobs[0] has no usable id'),
+               ({'jobs': [item('ok')], 'moodboards': [item('fine'), None]}, 'hidden.moodboards[1] has no usable id'),
+               ({'jobs': [item('j%d' % n) for n in range(600)], 'moodboards': [item('b%d' % n) for n in range(401)]},
+                'hidden lists more than 1000 items')]
+        entries, skipped, _ = parse_catalog(catalog_bytes([good_entry(hidden=value) for value, _ in bad]))
+        self.assertEqual(entries, [])
+        self.assertEqual([s['reason'] for s in skipped], [reason for _, reason in bad])
+        for s in skipped:
+            self.assertNotIn('leak', s['reason'])
+        # Tolerated: the entry stays, and every listed id stays hidden.
+        cases = [(None, None), ({}, None), ({'jobs': [], 'moodboards': None}, None), ({'x_unknown': [1]}, None)]
+        for value, expect in cases:
+            with self.subTest(hidden=value):
+                entries, skipped, _ = parse_catalog(catalog_bytes([good_entry(hidden=value)]))
+                self.assertEqual((skipped, entries[0]['hidden']), ([], expect))
+        value = {'jobs': [item('job-1', hidden_at='2026-11-03T10:15:00Z', hidden_by='Alice@Example.com', x_more=1),
+                          item('job-2', hidden_at='yesterday', hidden_by='not an address'),
+                          item('job-1', hidden_at='2026-11-04T10:00:00Z', hidden_by='bob@example.com'),
+                          item('12345', hidden_at='2026-11-03 10:15:00')],
+                 'moodboards': [item('board-1', hidden_at=None)], 'counts': {'jobs': 13, 'moodboards': 1, 'images': 50},
+                 'x_unknown': {'kept': True}}
+        entries, skipped, _ = parse_catalog(catalog_bytes([good_entry(hidden=value)]))
+        record = entries[0]['hidden']
+        self.assertEqual(skipped, [])
+        self.assertEqual(record['jobs'], {'job-1': {'hidden_at': '2026-11-03T10:15:00Z', 'hidden_by': 'alice@example.com'},
+                                          'job-2': {'hidden_at': None, 'hidden_by': None},
+                                          '12345': {'hidden_at': '2026-11-03T10:15:00Z', 'hidden_by': None}})
+        self.assertEqual(list(record['jobs']), ['job-1', 'job-2', '12345'])  # the file's order
+        self.assertEqual(record['moodboards'], {'board-1': {'hidden_at': None, 'hidden_by': None}})
+        self.assertEqual(record['counts'], {'jobs': 13, 'moodboards': 1, 'images': 50})
+        for counts in (None, {'jobs': 1, 'moodboards': 1}, {'jobs': -1, 'moodboards': 0, 'images': 0},
+                       {'jobs': True, 'moodboards': 0, 'images': 0}, {'jobs': 2 ** 53 + 1, 'moodboards': 0, 'images': 0},
+                       {'jobs': 1.0, 'moodboards': 0, 'images': 0}, [1, 1, 1], 'x'):
+            with self.subTest(counts=counts):
+                entries, _, _ = parse_catalog(catalog_bytes([good_entry(hidden=dict(value, counts=counts))]))
+                self.assertIsNone(entries[0]['hidden']['counts'])
+        exactly = {'jobs': [item('j%d' % n) for n in range(999)], 'moodboards': [item('b')]}
+        self.assertEqual(len(parse_catalog(catalog_bytes([good_entry(hidden=exactly)]))[0][0]['hidden']['jobs']), 999)
+        # The key follows the listed ids only: not who, when, counts or order.
+        key = lambda value: parse_catalog(catalog_bytes([good_entry(hidden=value)]))[0][0]['hidden']['key']  # noqa: E731
+        base = key({'jobs': [item('a'), item('b')], 'moodboards': [item('m')]})
+        self.assertEqual(key({'jobs': [item('b', hidden_by='x@example.com'), item('a', hidden_at='2026-01-01T00:00:00Z')],
+                              'moodboards': [item('m')], 'counts': {'jobs': 1, 'moodboards': 1, 'images': 1}}), base)
+        self.assertEqual(key({'jobs': [item('a'), item('b'), item('a')], 'moodboards': [item('m')]}), base)
+        for other in ({'jobs': [item('a')], 'moodboards': [item('m')]}, {'jobs': [item('a'), item('b')]},
+                      {'jobs': [item('a'), item('b'), item('m')]}, {'moodboards': [item('a'), item('b'), item('m')]}):
+            self.assertNotEqual(key(other), base)
+        self.assertEqual(catalog_module.record_key(entries[0]), entries[0]['hidden']['key'])
+        self.assertEqual(catalog_module.record_key(dict(entries[0], hidden=None)), '')
+        self.assertEqual(catalog_module.record_key(None), '')
+
+    def test_a_skipped_entry_with_a_record_reserves_its_id(self):
+        """A later entry with the id of an entry skipped for its hidden list (a hand edit, a bad merge) must not be
+        served without that list. Entries without a list keep the rule that only a valid entry reserves its id."""
+        broken = good_entry(hidden={'jobs': 'not a list'})
+        entries, skipped, _ = parse_catalog(catalog_bytes([broken, good_entry(name='again.zip')]))
+        self.assertEqual(entries, [])
+        self.assertEqual([s['reason'] for s in skipped], ['hidden.jobs is not a list',
+                                                          'duplicate id; an earlier entry with this id is not valid'])
+        # Reserved only by an entry that names a valid sha256 and its id; a valid first entry is still used.
+        for first in (good_entry(hidden=[], size=-1), dict(good_entry(hidden=[]), sha256='0' * 63)):
+            with self.subTest(first=str(first)[:60]):
+                entries, skipped, _ = parse_catalog(catalog_bytes([first, good_entry(name='again.zip')]))
+                reserved = first.get('sha256') == SHA
+                self.assertEqual([e['name'] for e in entries], [] if reserved else ['again.zip'])
+        entries, skipped, _ = parse_catalog(catalog_bytes([good_entry(), broken]))
+        self.assertEqual(([e['name'] for e in entries], skipped[0]['reason']),
+                         (['mj_export_x.zip'], 'hidden.jobs is not a list'))
+        # Without a hidden list a skipped entry reserves nothing, as before.
+        entries, skipped, _ = parse_catalog(catalog_bytes([good_entry(size=-1), good_entry(name='again.zip')]))
+        self.assertEqual([e['name'] for e in entries], ['again.zip'])
+
     def test_tombstones_are_validated_and_never_hide_an_entry(self):
         other = hashlib.sha256(b'y').hexdigest()
         stones = [{'id': SHA[:16], 'sha256': SHA, 'size': 1000, 'owner': 'p@example.com',
