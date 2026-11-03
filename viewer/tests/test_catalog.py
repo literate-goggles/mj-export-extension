@@ -1994,6 +1994,47 @@ class HideFlowTests(FlowTestCase):
         self.assertEqual(self.code(hosted, bob, base + '/jobs/job-zq-solo'), (404, 'unknown_job'))
         self.assertEqual(self.code(hosted, bob, base + '/moodboards/board-zq'), (404, 'unknown_moodboard'))
 
+    def test_a_request_waiting_for_the_opening_gets_the_list_read_meanwhile(self):
+        """A hidden list this instance reads while a request waits for the export to open decides what that request
+        is served: never the hidden item."""
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        first, at_first = self.start()
+        second, _ = self.start(MJV_CATALOG_TTL_S='600')  # the same cache folder
+        self.ready(first, at_first, mine)
+        bob = self.bob(second)
+        self.assertEqual(self.item(second, bob, mine['id'])['state'], 'cached')  # read before the hide
+        self.assertEqual(self.change(first, at_first, mine, 'job', 'job-zq-solo')[1]['changed'], True)
+        real, opening, release, answers = second.app.registry.open, threading.Event(), threading.Event(), {}
+
+        def slow_open(*args, **kwargs):
+            opening.set()
+            release.wait(10)
+            return real(*args, **kwargs)
+
+        def ask(name, path):
+            answers[name] = second.get(path, bob)
+
+        base = '/api/exports/%s' % mine['id']
+        asking = [threading.Thread(target=ask, args=('detail', base + '/jobs/job-zq-solo')),
+                  threading.Thread(target=ask, args=('list', base + '/jobs?limit=500'))]
+        with mock.patch.object(second.app.registry, 'open', side_effect=slow_open):
+            asking[0].start()
+            self.assertTrue(opening.wait(10))  # that request opens the export, and waits
+            asking[1].start()
+            second.app.catalog.expire()
+            self.assertTrue(second.app.catalog.entry(mine['id'])['hidden'])  # the list, read meanwhile
+            release.set()
+            for thread in asking:
+                thread.join(30)
+        status, _, body = answers['detail']
+        self.assertEqual((status, json.loads(body)['error']['code']), (404, 'unknown_job'))
+        status, _, body = answers['list']
+        self.assertEqual(status, 200)
+        self.assertNotIn(b'job-zq-solo', body)
+        self.assertIn('opened %s: 1 export root(s); hiding 1 generations and 0 moodboards' % mine['id'],
+                      second.log.getvalue())
+
     def test_an_unchanged_closure_is_not_rebuilt(self):
         """Hiding on its own a job that a hidden moodboard already hides changes the list, not what everyone else
         sees: the visible indexes are kept under the new list."""

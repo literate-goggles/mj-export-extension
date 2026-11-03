@@ -1440,6 +1440,12 @@ class Published:
             return None, None  # unknown, or no longer published
         deadline = time.monotonic() + wait_s
         prep = self._ready_prep(entry, wait_s)
+        if prep is not None:  # it may have waited for the opening: decide by the entry in use now, not the one before
+            entry = self.catalog.peek(entry['id'])
+            if entry is None:
+                return None, None
+            if not self._is_ready(prep, entry):
+                prep = None
         if prep is None:
             return None, self._item(entry)
         full = self.registry.get(export_id)
