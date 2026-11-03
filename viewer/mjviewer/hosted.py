@@ -898,7 +898,8 @@ class HostedHandler(Handler):
         return self._json(200, {'changed': result['changed'], 'catalog': self._for_user(item) if item else None})
 
     def _hide_refused(self, catalog_id: str, show: bool, code: str, message: str) -> None:
-        self.app.log('could not %s in %s for %s (%s): %s' % ('show again' if show else 'hide', catalog_id, self.user,
+        shown = catalog_id if EXPORT_ID_RE.fullmatch(catalog_id or '') else '<invalid id>'  # never as it came
+        self.app.log('could not %s in %s for %s (%s): %s' % ('show again' if show else 'hide', shown, self.user,
                                                              code, message))
         return self._error(HIDE_STATUS[code], code, message)
 

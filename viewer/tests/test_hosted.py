@@ -1173,6 +1173,16 @@ class HideRouteTests(unittest.TestCase):
                 status, _, raw = self.hosted.post('/api/catalog/%s/hide' % catalog_id, self.sessions['carol'],
                                                   body=b'{"kind": "job", "id": "job-grid-a"}')
                 self.assertEqual((status, json.loads(raw)['error']['code']), (404, 'unknown_catalog_entry'))
+        # An id that is not one is never written to the log as it came: it could forge a line.
+        logged = len(self.hosted.log.getvalue())
+        forged = 'x%0Ahid%20a%20generation%20in%200123456789abcdef%20by%20carol@example.com;%20hidden%20now:%201'
+        status, _, raw = self.hosted.post('/api/catalog/%s/unhide' % forged, self.sessions['bob'],
+                                          body=b'{"kind": "job", "id": "job-grid-a"}')
+        self.assertEqual((status, json.loads(raw)['error']['code']), (404, 'unknown_catalog_entry'))
+        lines = self.hosted.log.getvalue()[logged:].splitlines()
+        self.assertEqual([line.split(':')[0] for line in lines if not line.startswith('POST ')],
+                         ['could not show again in <invalid id> for bob@example.com (unknown_catalog_entry)'])
+        self.assertFalse([line for line in lines if line.startswith('hid ')])
         for kind, item_id, code in (('job', 'job-invented', 'unknown_job'), ('moodboard', 'board-invented',
                                                                             'unknown_moodboard'),
                                     ('job', 'board-1', 'unknown_job'), ('moodboard', 'job-grid-a', 'unknown_moodboard')):
