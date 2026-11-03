@@ -1273,7 +1273,8 @@ class HideRouteTests(unittest.TestCase):
         self.assertEqual(listing['jobs'][0]['job']['job_id'], 'job-zq-solo')
         detail = json.loads(self.answer(base + '/jobs/job-zq-exp', 'alice')[2])
         self.assertEqual(detail['hidden'], {'on_its_own': None, 'with_moodboards': [
-            {'id': 'board-zq', 'name': 'Zqboard', 'hidden_at': '2026-11-03T10:20:00Z', 'hidden_by': 'carol@example.com'}]})
+            {'id': 'board-zq', 'name': 'Zqboard', 'export_id': self.single['id'], 'hidden_at': '2026-11-03T10:20:00Z',
+             'hidden_by': 'carol@example.com'}]})
         self.assertNotIn('hide_preview', detail)
         board = json.loads(self.answer(base + '/moodboards/board-zq', 'alice')[2])
         self.assertEqual(board['hidden'], {'hidden_at': '2026-11-03T10:20:00Z', 'hidden_by': 'carol@example.com',

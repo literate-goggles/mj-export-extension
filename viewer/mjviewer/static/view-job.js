@@ -100,7 +100,7 @@ export function renderJob(root, route, ctx) {
     const managed = managerView(data);
     setActions(managed === 'visible' ? hideButton('job', () => hide(data)) : null);
     banner = managed === 'hidden'
-      ? hiddenBanner({exportId, kind: 'job', data, onShow: () => show(data), onHideOwn: () => hideOnItsOwn(data)})
+      ? hiddenBanner({kind: 'job', data, onShow: () => show(data), onHideOwn: () => hideOnItsOwn(data)})
       : null;
 
     const images = arr(data.images).length ? arr(data.images) : arr(job.images);

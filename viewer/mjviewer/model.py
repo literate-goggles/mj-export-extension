@@ -2249,6 +2249,11 @@ def _board_name(roots: List['ExportIndex'], board_id: str) -> Optional[str]:
     return None
 
 
+def _board_root(roots: List['ExportIndex'], board_id: str) -> Optional[str]:
+    """The id of the first root that has the moodboard, else None."""
+    return next((index.id for index in roots if board_id in index.boards), None)
+
+
 def _made_from(roots: List['ExportIndex'], start: Iterable[str], hidden) -> int:
     """How many distinct jobs made from start (children, their children and so on, in any root) are not in
     hidden. A job id names the same generation in every root."""
@@ -2287,7 +2292,8 @@ def hide_preview(roots: List['ExportIndex'], closure: Optional[Closure], kind: s
 def hidden_note(roots: List['ExportIndex'], closure: Optional[Closure], record: Optional[dict], kind: str,
                 item_id: str) -> dict:
     """Why a hidden item is hidden, for its managers' page. A job: {on_its_own: {hidden_at, hidden_by} or None,
-    with_moodboards: [{id, name, hidden_at, hidden_by}]}. A moodboard: {hidden_at, hidden_by, generations,
+    with_moodboards: [{id, name, export_id, hidden_at, hidden_by}]}, export_id being the first root that has the
+    moodboard (None when none has it). A moodboard: {hidden_at, hidden_by, generations,
     stay_hidden}: how many generations present in the ZIP it hides, and how many of those stay hidden when it is
     shown again (listed on their own or with another hidden moodboard)."""
     record, closure = record or _NO_RECORD, closure or EMPTY_CLOSURE
@@ -2295,6 +2301,7 @@ def hidden_note(roots: List['ExportIndex'], closure: Optional[Closure], record: 
         own = record['jobs'].get(item_id)
         return {'on_its_own': dict(own) if own else None,
                 'with_moodboards': [{'id': board_id, 'name': _board_name(roots, board_id),
+                                     'export_id': _board_root(roots, board_id),
                                      'hidden_at': who['hidden_at'], 'hidden_by': who['hidden_by']}
                                     for board_id, who in record['moodboards'].items()
                                     if item_id in closure.by_board.get(board_id, ())]}

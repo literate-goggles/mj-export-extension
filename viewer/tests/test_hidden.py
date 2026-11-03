@@ -477,16 +477,26 @@ class ManagerViewTests(HidingTestCase):
         # Notes on a hidden item's own page.
         self.assertEqual(hidden_note(roots, closure, listed, 'job', 'job-zq-exp'),
                          {'on_its_own': {'hidden_at': '2026-11-03T10:30:00Z', 'hidden_by': 'carol@example.com'},
-                          'with_moodboards': [{'id': 'board-zq', 'name': 'Zqboard', 'hidden_at': '2026-11-03T10:20:00Z',
-                                               'hidden_by': 'alice@example.com'}]})
+                          'with_moodboards': [{'id': 'board-zq', 'name': 'Zqboard', 'export_id': CID,
+                                               'hidden_at': '2026-11-03T10:20:00Z', 'hidden_by': 'alice@example.com'}]})
         self.assertEqual(hidden_note(roots, closure, listed, 'job', 'job-zq-derived'),
                          {'on_its_own': None, 'with_moodboards': [
-                             {'id': 'board-zq', 'name': 'Zqboard', 'hidden_at': '2026-11-03T10:20:00Z',
-                              'hidden_by': 'alice@example.com'}]})
+                             {'id': 'board-zq', 'name': 'Zqboard', 'export_id': CID,
+                              'hidden_at': '2026-11-03T10:20:00Z', 'hidden_by': 'alice@example.com'}]})
         self.assertEqual(hidden_note(roots, closure, listed, 'moodboard', 'board-zq'),
                          {'hidden_at': '2026-11-03T10:20:00Z', 'hidden_by': 'alice@example.com', 'generations': 4,
                           'stay_hidden': 1})
         self.assertEqual(json.loads(dump_json(listing)), listing)  # plain JSON: no sets
+        # A job hidden with a moodboard that its own root left out names the first root that has it, else none.
+        two = self.multi[0]
+        board = record(boards=[('board-zq', None, None)])
+        note = hidden_note(two, hidden_closure(two, [], ['board-zq']), board, 'job', 'job-zq-r2')
+        self.assertEqual([(b['id'], b['name'], b['export_id']) for b in note['with_moodboards']],
+                         [('board-zq', 'Zqboard', CID + '-1')])
+        alone = two[1:]
+        note = hidden_note(alone, hidden_closure(alone, [], ['board-zq']), board, 'job', 'job-zq-r2')
+        self.assertEqual([(b['id'], b['name'], b['export_id']) for b in note['with_moodboards']],
+                         [('board-zq', None, None)])
         # Without a record the listing is empty.
         self.assertEqual(hidden_listing(roots, None, None), {'counts': None, 'moodboards': [], 'jobs': []})
 

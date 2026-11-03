@@ -247,7 +247,7 @@ function whoWhen(at, by) {
  * do: Show again…, or for a generation hidden only with a moodboard, Open the moodboard and Hide on its own….
  * Returns {el, heading}; the heading takes focus after a change.
  */
-export function hiddenBanner({exportId, kind, data, onShow, onHideOwn}) {
+export function hiddenBanner({kind, data, onShow, onHideOwn}) {
   const note = obj(obj(data).hidden);
   const headingId = nextId('hidden-banner');
   const heading = h('h2', {class: 'hidden-banner__title', id: headingId, tabindex: '-1'}, 'Hidden from everyone else');
@@ -281,7 +281,8 @@ export function hiddenBanner({exportId, kind, data, onShow, onHideOwn}) {
           '. It comes back when the moodboard is shown again.']
         : [`It is hidden with ${boardsPhrase(boards)}. It comes back when they are all shown again.`];
       actions = [
-        str(first.id) ? h('a', {class: 'btn btn--sm', href: hrefs.moodboard(exportId, first.id)},
+        // In the first export root that has it; none has it when a selection left it out of every root.
+        str(first.export_id) ? h('a', {class: 'btn btn--sm', href: hrefs.moodboard(first.export_id, first.id)},
           icon('board', {size: 14}), 'Open the moodboard') : null,
         h('button', {type: 'button', class: 'btn btn--sm', onclick: onHideOwn}, icon('eye-off', {size: 14}),
           'Hide on its own…'),

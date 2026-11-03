@@ -190,7 +190,7 @@ export function renderMoodboard(root, route, ctx) {
         : h('a', {class: 'btn', href: hrefs.gallery(exportId, {moodboard: board.id || boardId})}, icon('grid', {size: 15}), 'Show in gallery'),
       managed === 'visible' ? hideButton('moodboard', () => hide(data)) : null,
     ].filter(Boolean));
-    banner = managed === 'hidden' ? hiddenBanner({exportId, kind: 'moodboard', data, onShow: () => show(data)}) : null;
+    banner = managed === 'hidden' ? hiddenBanner({kind: 'moodboard', data, onShow: () => show(data)}) : null;
 
     fill(body,
       banner ? banner.el : null,

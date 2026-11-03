@@ -668,6 +668,14 @@ class HideBrowserTests(_BrowserCase):
                                 ".textContent === '2'", timeout=30000)
         entry = next(e for e in self.blob.read_json('catalog.json')['exports'] if e['id'] == both['id'])
         self.assertEqual([item['id'] for item in entry['hidden']['jobs']], ['job-zq-solo'])
+        # A generation of root 2 hidden with board-zq, which only root 1 has: its banner opens the moodboard there.
+        self.open_job(alice, 'job-zq-r2', export_id=second)
+        link = alice.locator('.hidden-banner a', has_text='Open the moodboard')
+        self.assertTrue(link.get_attribute('href').endswith('#/x/%s/moodboard/board-zq' % first))
+        link.click()
+        alice.wait_for_function("() => (document.querySelector('.page-title') || {}).textContent === 'Zqboard'",
+                                timeout=30000)
+        self.assertTrue(alice.evaluate('location.hash').endswith('/x/%s/moodboard/board-zq' % first))
 
         bob = self.sign_in(BOB)
         self.open_job(bob, 'job-r2-child', export_id=second)  # made from job-zq-solo, which is in the other root
