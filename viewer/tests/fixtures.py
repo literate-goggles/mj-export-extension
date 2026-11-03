@@ -365,6 +365,155 @@ def gallery_export(n_jobs: int = 150) -> Export:
     return export.sync_counts()
 
 
+# ------------------------------------------------------------- hidden items
+#
+# Hiding (hosted mode) is tested on standard_export() plus items whose every id, name, code, file name and unknown
+# field contains MARKER, which nothing visible contains (file ids and export ids are hex and cannot). The prompt of
+# the hidden job-zq-solo carries COPY instead: its upscale job-child-up repeats it, as Midjourney writes an
+# upscale's prompt, so COPY may show only where job-child-up does.
+
+MARKER = 'zq'
+COPY = 'qx'
+COPY_PROMPT = 'qxsolo lantern'
+HIDE = {'jobs': ['job-zq-solo'], 'moodboards': ['board-zq']}
+HIDING_ROOTS = ('mj_export_hiding_first', 'mj_export_hiding_second')
+
+
+def hiding_export() -> Export:
+    """standard_export() as a 0.4.0 export with a selection, plus what HIDE hides and what refers to it.
+
+    job-zq-solo (hidden on its own): the earliest job, the only --v 5.2 and the only zoom, an unmatched code
+    zqcodeu, liked, with a parent outside the export (job-zq-outside, in parent_gaps), named by two failures,
+    in board-1's generated_job_ids, and its first picture pinned to board-1 as reference image 2. Made from it:
+    job-child-v (a remix with its own prompt and a non-integer parent_grid) and job-child-up (an upscale that
+    repeats its prompt). board-zq "Zqboard" (code zqmb) is hidden with its generations: job-zq-exp (in its
+    generated_job_ids, duplicated in jobs.jsonl; job-exp-var is a visible variation of it), job-zq-derived
+    (references it, missing from generated_job_ids), job-zq-inferred (a video, only --profile zqmb, an
+    unreadable date) and job-zq-shared (references board-zq and board-1); its generated_job_ids also name
+    job-zq-gone, which is in no export root. Files named for hidden items are left unreferenced under images/.
+    """
+    export = standard_export()
+    export.meta['extension_version'] = '0.4.0'
+    export.meta['status'] = 'completed_with_failures'
+    solo = make_job('job-zq-solo', '2026-03-01T08:00:00+00:00', COPY_PROMPT, v='5.2', kind='zoom',
+                    event_type='zoom', parent_id='job-zq-outside', parent_index=0, parent_grid=0,
+                    refs=[ref('user', None, 'zqcodeu')], image_likes=[2])
+    solo['image_files'] = solo['image_files'][:3]  # the fourth picture failed to download
+    solo['zq_extra'] = 'zq unknown field'
+    pinned = {'source_url': 'https://cdn.example.invalid/job-zq-solo/0_0.png',
+              'file': 'images/moodboard_board-1_2.png', 'width': 4, 'height': 4, 'zq_pin_note': 'zq'}
+    export.boards[0]['images'].append(pinned)
+    export.boards[0]['generated_job_ids'] += ['job-zq-solo', 'job-zq-shared']
+    exp = make_job('job-zq-exp', '2026-03-04T10:00:00+00:00', 'zqexp harbor', profile=['zqmb'],
+                   refs=[ref('moodboard', 'board-zq', 'zqmb')])
+    export.jobs += [
+        solo,
+        make_job('job-child-v', '2026-03-02T10:00:00+00:00', 'paper boat remix', kind='remix', event_type='remix',
+                 parent_id='job-zq-solo', parent_index=1, parent_grid='zqgrid-1'),
+        make_job('job-child-up', '2026-03-03T10:00:00+00:00', COPY_PROMPT, kind='upscale', event_type='upscale',
+                 images=1, parent_id='job-zq-solo', parent_index=2, parent_grid=2),
+        exp,
+        make_job('job-exp-var', '2026-03-07T10:00:00+00:00', 'harbor variation', kind='variation',
+                 event_type='variation', parent_id='job-zq-exp', parent_index=0, parent_grid=0),
+        make_job('job-zq-derived', '2026-03-05T10:00:00+00:00', 'zqderived kite', profile=['zqmb'],
+                 refs=[ref('moodboard', 'board-zq', 'zqmb')]),
+        make_job('job-zq-inferred', 'zq-not-a-date', 'zqinferred cello', profile=['zqmb'], images=1,
+                 video=True, with_files=False),
+        make_job('job-zq-shared', '2026-03-06T10:00:00+00:00', 'zqshared meadow', profile=['zqmb'],
+                 refs=[ref('moodboard', 'board-zq', 'zqmb'), ref('moodboard', 'board-1', 'mbcodeA')]),
+    ]
+    board = make_board('board-zq', 'Zqboard', 'zqmb', generated=['job-zq-exp', 'job-zq-shared', 'job-zq-gone'])
+    board['zq_board_note'] = 'zq'
+    board['images'][0]['zq_image_note'] = 'zq'
+    export.boards.append(board)
+    export.likes.append({'job_id': 'job-zq-solo', 'image_likes': [2]})
+    export.meta['parent_gaps'].append({'job_id': 'job-zq-solo', 'parent_id': 'job-zq-outside',
+                                       'reason': 'Parent is outside the selected subset or unavailable in the own feed'})
+    export.meta['failures'] = [
+        {'kind': 'job', 'id': 'job-zq-solo', 'reason': 'Synthetic failure'},
+        {'kind': 'image', 'id': 'images/job-zq-solo_3.jpeg',
+         'reason': 'Source is outside the two permitted hosts; not downloaded'},
+        {'kind': 'job', 'id': 'job-zq-gone', 'reason': 'Synthetic failure'},
+        {'kind': 'job', 'id': 'job-grid-d', 'reason': 'Synthetic failure'},
+    ]
+    export.meta['selection'] = {
+        'chosen_at': '2026-03-19T09:00:00.000Z',
+        'moodboards': {'available': 4, 'exported': 3, 'left_out': 1},
+        'jobs': {'available': 21, 'exported': 17, 'left_out': 3, 'not_reviewed': 1},
+        'left_out_moodboard_ids': ['board-gone'],
+    }
+    export.meta['limitations'].append(SELECTION_LIMITATION)
+    export.files['images/job-zq-solo_7.png'] = png_bytes(4, 4, (10, 20, 30))
+    export.files['images/moodboard_board-zq_9.png'] = png_bytes(4, 4, (30, 20, 10))
+    export.sync_counts()
+    export.meta['counts']['completed_jobs'] = sum(1 for job in export.jobs if not job['video'])
+    export.jobs.append(dict(exp, prompt='zqexp duplicate row'))  # a duplicate: the first row is used
+    return export
+
+
+ENCRYPTED_HIDDEN = 'images/job-zq-exp_9.png'
+
+
+def hiding_zip_bytes(export: Optional[Export] = None, root: str = ROOT) -> bytes:
+    """hiding_export() as a ZIP that also holds an encrypted member named for a hidden job (never readable)."""
+    name = (root + '/' if root else '') + ENCRYPTED_HIDDEN
+    data = export_zip_bytes(export or hiding_export(), root, extra=[(name, png_bytes(4, 4, (1, 2, 3)))])
+    return patch_central_directory(data, name, flag_bits=0x1)
+
+
+def second_hiding_root() -> Export:
+    """The second root of two_root_hiding_zip(): a selection run that left board-zq out but kept job-zq-r2,
+    which references it by id, and job-r2-child, made from job-zq-solo (not in this root)."""
+    jobs = [
+        make_job('job-zq-r2', '2026-03-21T10:00:00+00:00', 'zqroot two canyon', profile=['zqmb'],
+                 refs=[ref('moodboard', 'board-zq', 'zqmb')]),
+        make_job('job-r2-child', '2026-03-22T10:00:00+00:00', 'second root detail', kind='upscale',
+                 event_type='upscale', images=1, parent_id='job-zq-solo', parent_index=3, parent_grid=3),
+        make_job('job-r2-plain', '2026-03-23T10:00:00+00:00', 'second root orchard'),
+    ]
+    boards = [make_board('board-r2', 'Second root board', 'rtwocode', generated=[])]
+    meta = make_meta(version='0.4.0', parent_gaps=[
+        {'job_id': 'job-r2-child', 'parent_id': 'job-zq-solo',
+         'reason': 'Parent is outside the selected subset or unavailable in the own feed'}])
+    meta['selection'] = {'chosen_at': '2026-03-24T09:00:00.000Z',
+                         'moodboards': {'available': 2, 'exported': 1, 'left_out': 1},
+                         'jobs': {'available': 5, 'exported': 3, 'left_out': 2, 'not_reviewed': 0},
+                         'left_out_moodboard_ids': ['board-zq']}
+    meta['limitations'].append(SELECTION_LIMITATION)
+    return Export(meta, jobs, boards, [], []).sync_counts()
+
+
+def two_root_hiding_zip() -> bytes:
+    """A ZIP with two export roots: HIDING_ROOTS[0] is hiding_export() (with the encrypted member), [1] is
+    second_hiding_root()."""
+    members = {}
+    for root, export in zip(HIDING_ROOTS, (hiding_export(), second_hiding_root())):
+        for name, data in export.members().items():
+            members['%s/%s' % (root, name)] = data
+    name = '%s/%s' % (HIDING_ROOTS[0], ENCRYPTED_HIDDEN)
+    data = zip_bytes(members, extra=[(name, png_bytes(4, 4, (1, 2, 3)))])
+    return patch_central_directory(data, name, flag_bits=0x1)
+
+
+def unreadable_selection_variant() -> Export:
+    """hiding_export() with selection.jobs.left_out unreadable, so the bound on board-2's generated_left_out is
+    selection.jobs.available alone; generated_left_out lies between that number less the hidden jobs and the
+    number as written."""
+    export = hiding_export()
+    export.meta['selection']['jobs']['left_out'] = 'several'
+    export.boards[1]['generated_left_out'] = 17
+    return export
+
+
+def shared_file_export() -> Export:
+    """standard_export() plus a hidden job (job-zq-sharer) whose only file is board-2's reference image."""
+    export = standard_export()
+    sharer = make_job('job-zq-sharer', '2026-03-09T10:00:00+00:00', 'zqsharer tram', images=1)
+    sharer['image_files'] = ['images/moodboard_board-2_0.png']
+    export.jobs.append(sharer)
+    return export.sync_counts()
+
+
 # ------------------------------------------------------------------ writers
 
 def write_folder(export: Export, base: str, root: str = ROOT) -> str:

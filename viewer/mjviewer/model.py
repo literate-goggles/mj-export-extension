@@ -20,6 +20,13 @@ Relationship rules (the viewer never invents a relationship):
 * Lineage uses parent_id only. parent_index comes from parent_index, else an
   integer parent_grid. Walks are guarded against cycles. A parent that
   export_meta.parent_gaps marks left_out is 'left_out' rather than 'missing'.
+
+Hidden items (hosted mode): an index built with hidden= (a Hidden, from
+hidden_view of the full index) reads the same root as if the hidden jobs and
+moodboards had never been exported: their rows, likes and files are left out
+while it loads, and what visible data says about them (a child's parent id, a
+board's generated_job_ids, a reference picture of a hidden job, export_meta.json)
+is withheld, so no answer built from it can mention them.
 """
 from __future__ import annotations
 
@@ -30,7 +37,8 @@ import json
 import math
 import re
 import threading
-from collections import Counter, defaultdict
+import urllib.parse
+from collections import Counter, defaultdict, namedtuple
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -79,6 +87,11 @@ KNOWN_STATUS = ('reading', 'exporting', 'complete', 'completed_with_failures', '
 PARTIAL_STATUS = ('paused', 'stopped')
 # In-memory run states of the exporter; export_meta.json is only written after a run ends.
 RUN_STATES = ('reading', 'exporting')
+# The reason of a moodboard reference picture withheld because it is a hidden job's picture (ImageRef status
+# 'unavailable'); only an index built with hidden items has such slots.
+UNAVAILABLE = 'not available here'
+# export_meta.counts values that lose what the hidden items account for, each by its Hidden.delta amount.
+HIDDEN_META_COUNTS = ('jobs', 'moodboards', 'likes', 'files', 'download_bytes', 'completed_jobs')
 
 
 _GC_LOCK = threading.Lock()
@@ -414,13 +427,13 @@ class _Job:
                  'kind_source', 'version', 'width', 'height', 'parent_id', 'parent_index', 'parent_grid',
                  'job_type', 'event_type', 'references', 'flag_codes', 'image_likes', 'video', 'slots',
                  'unknown_fields', 'board_links', 'profile_links', 'resolved_refs', 'codes', 'unmatched_codes',
-                 'liked', 'children', 'parent_status')
+                 'liked', 'children', 'parent_status', 'parent_hidden')
 
 
 class _Board:
     __slots__ = ('id', 'line', 'raw', 'name', 'code', 'codes', 'version', 'created_iso', 'created_raw',
                  'generated', 'generated_state', 'generated_left_out', 'slots', 'unknown_fields', 'links',
-                 'unresolved_generated', 'omitted')
+                 'unresolved_generated', 'omitted', 'raw_withheld')
 
 
 class _Profile:
@@ -445,14 +458,24 @@ def _reference(raw: Any) -> Optional[dict]:
 # ------------------------------------------------------------------- index
 
 class ExportIndex:
-    """Everything the API serves for one export root, built once at load."""
+    """Everything the API serves for one export root, built once at load.
 
-    def __init__(self, view: RootView, export_id: str, source: dict, limits: Limits = Limits()):
+    hidden (hosted mode only): what to leave out, from hidden_view() of the full index of the same root. None
+    reads everything, as local mode always does.
+    """
+
+    def __init__(self, view: RootView, export_id: str, source: dict, limits: Limits = Limits(),
+                 hidden: Optional['Hidden'] = None):
         self.id = export_id
         self.view = view
         self.root = view.root
         self.source = source
         self.limits = limits
+        self.hidden = hidden
+        # What each export_meta.selection pair (available, exported) lost to hidden items: the numbers as
+        # written are these plus the ones shown.
+        self.selection_reduced = {'jobs': 0, 'moodboards': 0}
+        self._offspring: Optional[Dict[str, List[str]]] = None
         self.meta: Optional[dict] = None
         self.file_states: Dict[str, dict] = {}
         self.parse_errors: List[dict] = []
@@ -504,6 +527,8 @@ class ExportIndex:
         if not isinstance(value, dict):
             state.update(state='invalid', detail='top level is %s, not an object' % _json_type(value))
             return
+        if self.hidden is not None:  # what the overview, the counts, the selection and the checks read
+            value, self.selection_reduced = _redact_meta(value, self.hidden)
         self.meta = value
 
     def _contradiction(self, item: dict) -> None:
@@ -578,7 +603,9 @@ class ExportIndex:
                            'generations not exported because of the selection '
                            '(selection.jobs left_out + not_reviewed)'))
         if jobs['available'] is not None:
-            bounds.append((jobs['available'], 'generations in scope (selection.jobs.available)'))
+            # The number as written: hidden items were in scope as well, so the bound is the full index's.
+            bounds.append((jobs['available'] + self.selection_reduced['jobs'],
+                           'generations in scope (selection.jobs.available)'))
         return min(bounds, key=lambda bound: bound[0]) if bounds else None
 
     def _iter_lines(self, name: str):
@@ -739,7 +766,7 @@ class ExportIndex:
         index, rec, file_value, source_url, width, height, reason = slot
         url = None
         if rec is None:
-            status = 'not_exported'
+            status = 'unavailable' if reason is UNAVAILABLE and self.hidden is not None else 'not_exported'
         else:
             status, reason = rec.status, rec.reason
             if status == 'present':
@@ -777,12 +804,15 @@ class ExportIndex:
         self._build_summary()
 
     def _build_jobs(self, rows) -> None:
+        hidden = self.hidden
         for line, row in rows:
             try:
                 job_id = _as_id(row.get('job_id'))
                 if job_id is None:
                     self.row_problems.append({'file': JOBS, 'line': line, 'message': 'row has no job_id; skipped'})
                     continue
+                if hidden is not None and job_id in hidden.jobs:
+                    continue  # as if never exported: no duplicate, date, unknown-field or row problem either
                 if job_id in self.jobs:
                     self.duplicates.append({'file': JOBS, 'line': line, 'id': job_id, 'first_line': self.jobs[job_id].line})
                     continue
@@ -852,6 +882,18 @@ class ExportIndex:
                 if isinstance(refs, list):
                     unknown += ['personalization_codes[].' + k for r in refs if isinstance(r, dict) for k in r if k not in KNOWN_REFERENCE]
                 job.unknown_fields = self._note_unknown(JOBS, unknown)
+                job.parent_hidden = False
+                if hidden is not None and job.parent_id is not None and job.parent_id in hidden.jobs:
+                    # Made from a hidden job: kept, with its kind (computed above from the real parent), but no
+                    # trace of the parent's id anywhere, the raw row included.
+                    job.parent_hidden = True
+                    job.parent_id = None
+                    raw = dict(row, parent_id=None)
+                    if not _is_int(job.parent_grid):
+                        job.parent_grid = None
+                        if 'parent_grid' in raw:
+                            raw['parent_grid'] = None
+                    job.raw = raw
                 job.board_links, job.profile_links = {}, {}
                 self.jobs[job_id] = job
             except Exception as exc:  # a value nothing anticipated skips its row, not the export root
@@ -897,17 +939,22 @@ class ExportIndex:
 
     def _build_boards(self, rows) -> None:
         bound = self._not_exported() if self.selection is not None else None
+        hidden = self.hidden
         for line, row in rows:
             try:
                 board_id = _as_id(row.get('id'))
                 if board_id is None:
                     self.row_problems.append({'file': BOARDS, 'line': line, 'message': 'row has no id; skipped'})
                     continue
+                if hidden is not None and board_id in hidden.moodboards:
+                    continue  # as if never exported
                 if board_id in self.boards:
                     self.duplicates.append({'file': BOARDS, 'line': line, 'id': board_id, 'first_line': self.boards[board_id].line})
                     continue
                 board = _Board()
                 board.id, board.line, board.raw = board_id, line, row
+                board.raw_withheld = False
+                withheld = None  # the copy of the row that the API shows, once something in it is withheld
                 board.name = row.get('name') if isinstance(row.get('name'), str) else None
                 board.code = _text(row.get('code'))
                 board.codes = _dedupe(([board.code] if board.code else []) + _str_list(row.get('codes')))
@@ -922,6 +969,11 @@ class ExportIndex:
                 elif isinstance(row['generated_job_ids'], list):
                     board.generated = _dedupe(x for x in (_as_id(v) for v in row['generated_job_ids']) if x)
                     board.generated_state = 'present'
+                    if hidden is not None and any(x in hidden.jobs for x in board.generated):
+                        # Hidden jobs leave the list quietly: never 'not in this export', never in the raw row.
+                        board.generated = [x for x in board.generated if x not in hidden.jobs]
+                        withheld = dict(row, generated_job_ids=[v for v in row['generated_job_ids']
+                                                                if _as_id(v) not in hidden.jobs])
                 else:
                     board.generated, board.generated_state = None, 'invalid'
                 # Written only when the designer chose what to export: the board's generations in scope that the
@@ -930,9 +982,20 @@ class ExportIndex:
                 board.generated_left_out = _count(left_out)
                 images = row.get('images') if isinstance(row.get('images'), list) else []
                 board.slots = []
+                shown = images  # the image entries whose fields count as this board's (unknown fields)
                 for index, image in enumerate(images):
                     if not isinstance(image, dict):
                         board.slots.append((index, None, None, None, None, None, 'image entry is not an object'))
+                        continue
+                    if hidden is not None and (board_id, index) in hidden.withheld:
+                        # A picture of a hidden job pinned to this board: its address names the job, so neither
+                        # it, its file nor its size is shown, and the file is never registered.
+                        board.slots.append((index, None, None, None, None, None, UNAVAILABLE))
+                        if withheld is None:
+                            withheld = dict(row)
+                        if shown is images:
+                            withheld['images'] = shown = list(images)
+                        shown[index] = None
                         continue
                     value = image.get('file')
                     rec = None
@@ -947,8 +1010,10 @@ class ExportIndex:
                                         _text(image.get('source_url')), _int_or_none(image.get('width')),
                                         _int_or_none(image.get('height')), reason))
                 unknown = [k for k in row if k not in KNOWN_BOARD]
-                unknown += ['images[].' + k for im in images if isinstance(im, dict) for k in im if k not in KNOWN_BOARD_IMAGE]
+                unknown += ['images[].' + k for im in shown if isinstance(im, dict) for k in im if k not in KNOWN_BOARD_IMAGE]
                 board.unknown_fields = self._note_unknown(BOARDS, unknown)
+                if withheld is not None:
+                    board.raw, board.raw_withheld = withheld, True
                 self.boards[board_id] = board
                 if 'generated_left_out' in row:
                     where = {'file': BOARDS, 'line': line, 'id': board_id, 'field': 'generated_left_out'}
@@ -996,10 +1061,13 @@ class ExportIndex:
                                           'message': 'row could not be read (%s); skipped' % type(exc).__name__})
 
     def _build_likes(self, rows) -> None:
+        hidden = self.hidden
         for line, row in rows:
             job_id = _as_id(row.get('job_id'))
             if job_id is None:
                 self.row_problems.append({'file': LIKES, 'line': line, 'message': 'row has no job_id; skipped'})
+                continue
+            if hidden is not None and job_id in hidden.jobs:
                 continue
             self.likes.append({'job_id': job_id, 'image_likes': row.get('image_likes'), 'line': line})
             self._note_unknown(LIKES, [k for k in row if k not in KNOWN_LIKE])
@@ -1009,6 +1077,9 @@ class ExportIndex:
 
     def _scan_files(self) -> None:
         listing, issues = self.view.list_files('images')
+        if self.hidden is not None:  # a file named for a hidden item, or only it uses, is never listed
+            issues = [issue for issue in issues if not self._hidden_file(issue.raw)]
+            listing = {rel: info for rel, info in listing.items() if not self._hidden_file(rel)}
         self.listing_issues = issues
         self.unreferenced = sorted(rel for rel in listing if rel not in self.files)
         present = [rec for rec in self.files.values() if rec.status == 'present']
@@ -1206,7 +1277,9 @@ class ExportIndex:
     def _lineage(self) -> None:
         children: Dict[str, List[str]] = defaultdict(list)
         for job in self.jobs.values():
-            if job.parent_id is None:
+            if job.parent_hidden:  # neither a gap nor a missing parent: nothing about it is shown
+                job.parent_status = 'unavailable'
+            elif job.parent_id is None:
                 job.parent_status = 'none'
             elif job.parent_id in self.jobs:
                 job.parent_status = 'in_export'
@@ -1656,6 +1729,8 @@ class ExportIndex:
             out.append({'path': ref['path'], 'reason': ref['reason']})
         seen = {item['path'] for item in out}
         for issue in list(self.view.archive_issues()) + list(self.listing_issues):
+            if self.hidden is not None and self._hidden_file(issue.raw):
+                continue
             if issue.path not in seen:
                 out.append({'path': issue.path, 'reason': issue.reason})
                 seen.add(issue.path)
@@ -1807,7 +1882,7 @@ class ExportIndex:
             child = self._card(self.jobs[child_id])
             child['parent_index'] = self.jobs[child_id].parent_index
             children.append(child)
-        return {
+        detail = {
             'job': card,
             'raw': job.raw,
             'unknown_fields': job.unknown_fields,
@@ -1827,6 +1902,9 @@ class ExportIndex:
             'likes': [{'image_likes': like['image_likes'], 'line': like['line']}
                       for like in self.likes if like['job_id'] == job.id],
         }
+        if job.parent_hidden:
+            detail['raw_withheld'] = True  # the raw row lost the id of a job that is not available here
+        return detail
 
     def _generation_counts(self, board: _Board) -> dict:
         counts = Counter(link for link, _ in board.links.values())
@@ -1883,7 +1961,7 @@ class ExportIndex:
                      'version': board.version, 'created_at': board.created_iso, 'created_at_raw': board.created_raw}
         if board.generated_left_out is not None:
             moodboard['generated_left_out'] = board.generated_left_out
-        return {
+        detail = {
             'moodboard': moodboard,
             'raw': board.raw,
             'unknown_fields': board.unknown_fields,
@@ -1892,6 +1970,9 @@ class ExportIndex:
             'unresolved_generated_job_ids': board.unresolved_generated,
             'notes': notes,
         }
+        if board.raw_withheld:
+            detail['raw_withheld'] = True  # ids or pictures of items not available here left the raw row
+        return detail
 
     def profiles_list(self) -> dict:
         items = []
@@ -1930,6 +2011,58 @@ class ExportIndex:
             if job.image_likes and job.id not in listed:
                 items.append({'job_id': job.id, 'job': self._card(job), 'image_likes': job.image_likes, 'source': JOBS})
         return {'items': items, 'note': note}
+
+    # ---------------------------------------------------- hidden items
+
+    def _hidden_file(self, rel: Any) -> bool:
+        """A path that only hidden items (or withheld pictures) use, or that the exporter named for a hidden item."""
+        return rel in self.hidden.files or _named_for(rel, self.hidden)
+
+    def hidden_view(self, closure: 'Closure') -> 'Hidden':
+        """What this root leaves out for a closure (call it on the full index): the hidden jobs and moodboards, the
+        reference pictures of visible boards that are hidden jobs' pictures, the files only those use, and the
+        amounts export_meta.json counted for them."""
+        jobs, boards = closure.jobs, closure.moodboards
+        withheld = frozenset((board.id, slot[0]) for board in self.boards.values() if board.id not in boards
+                             for slot in board.slots if _url_names(slot[3], jobs))
+
+        def hidden_owner(kind: str, owner_id: str, index: int) -> bool:
+            if kind == 'job':
+                return owner_id in jobs
+            return owner_id in boards or (owner_id, index) in withheld
+
+        files = frozenset(rec.rel for rec in self.files.values()
+                          if rec.referenced_by and all(hidden_owner(*owner) for owner in rec.referenced_by))
+        present = [self.files[rel] for rel in files if self.files[rel].status == 'present']
+        here = [self.jobs[job_id] for job_id in jobs if job_id in self.jobs]
+        n_boards = sum(1 for board_id in boards if board_id in self.boards)
+        return Hidden(jobs=jobs, moodboards=boards, files=files, withheld=withheld,
+                      present={'jobs': len(here), 'moodboards': n_boards, 'images': len(present)},
+                      delta={'jobs': len(here), 'moodboards': n_boards,
+                             'completed_jobs': sum(1 for job in here if not job.video),
+                             'likes': sum(1 for like in self.likes if like['job_id'] in jobs),
+                             'files': len(present), 'download_bytes': sum(rec.stat.size for rec in present)})
+
+    def without(self, hidden: 'Hidden') -> 'ExportIndex':
+        """This root built again from the same view with the hidden items left out: the same id, file ids and
+        label (Registry.open sets the label after building)."""
+        index = ExportIndex(self.view, self.id, self.source, self.limits, hidden=hidden)
+        index.summary['label'] = self.summary['label']
+        if hasattr(self, 'source_real'):
+            index.source_real = self.source_real
+        return index
+
+    def offspring(self) -> Dict[str, List[str]]:
+        """parent id -> the ids of this root's jobs made from it, also when the parent is not in this root.
+        Built once, on first use (the index does not change after loading)."""
+        found = self._offspring
+        if found is None:
+            built: Dict[str, List[str]] = defaultdict(list)
+            for job in self.jobs.values():
+                if job.parent_id is not None and job.parent_id != job.id:
+                    built[job.parent_id].append(job.id)
+            self._offspring = found = dict(built)
+        return found
 
 
 def _owner(owner: tuple) -> dict:
@@ -1977,3 +2110,225 @@ def _json_type(value: Any) -> str:
     if value is None:
         return 'null'
     return 'a number'
+
+
+# ------------------------------------------------------------ hidden items
+#
+# Hosted mode can hide jobs and moodboards of a published ZIP from everyone but the export's managers. The record
+# keeps only ids; everything below is recomputed from the immutable full indexes of every export root of the ZIP.
+
+Closure = namedtuple('Closure', 'job_ids board_ids jobs moodboards by_board key')
+Closure.__doc__ = """What a hidden list hides in one ZIP. job_ids and board_ids are the listed ids; jobs adds every job
+made with a listed moodboard, in any root (by_board: moodboard id -> those jobs); moodboards is board_ids. key
+changes only when jobs or moodboards change, so two closures with one key leave out exactly the same."""
+
+Hidden = namedtuple('Hidden', 'jobs moodboards files withheld present delta')
+Hidden.__doc__ = """What one root leaves out (ExportIndex.hidden_view): the closure's jobs and moodboards, the files
+(paths) only those use, the withheld (board id, slot index) reference pictures, what of it is present in this root
+({jobs, moodboards, images}), and the amounts export_meta.json counted for it."""
+
+_NO_RECORD = {'jobs': {}, 'moodboards': {}, 'counts': None, 'key': ''}
+_BOARD_FILE = 'moodboard_'
+
+
+def _closure_key(jobs: Iterable[str], boards: Iterable[str]) -> str:
+    return hashlib.sha256(json.dumps([sorted(jobs), sorted(boards)]).encode('ascii')).hexdigest()
+
+
+def hidden_closure(roots: List['ExportIndex'], job_ids: Iterable[str], board_ids: Iterable[str]) -> Closure:
+    """The closure of a hidden list over the full indexes of every root of one ZIP. A moodboard takes (a) every
+    generation its page lists in each root that has it, all link kinds, (b) the ids of its generated_job_ids,
+    which may name jobs of another root, and (c) in every root, the jobs whose reference id is its id (the
+    exporter's own rule), which matters in a root that does not have the moodboard. Pure, no I/O."""
+    job_ids, board_ids = frozenset(job_ids), frozenset(board_ids)
+    by_board = {board_id: set() for board_id in board_ids}
+    if by_board:
+        for index in roots:
+            for board_id, found in by_board.items():
+                board = index.boards.get(board_id)
+                if board is not None:
+                    found.update(board.links)
+                    found.update(board.generated or ())
+            for job in index.jobs.values():
+                for ref in job.references:
+                    if ref['id'] in by_board:
+                        by_board[ref['id']].add(job.id)
+    jobs = frozenset(job_ids.union(*by_board.values()))
+    by_board = {board_id: frozenset(found) for board_id, found in by_board.items()}
+    return Closure(job_ids, board_ids, jobs, board_ids, by_board, _closure_key(jobs, board_ids))
+
+
+EMPTY_CLOSURE = hidden_closure((), (), ())
+
+
+def _url_names(url: Any, ids) -> bool:
+    """Whether the first path segment of an address (on any host), as written or percent-decoded, is one of ids:
+    the exporter keeps Midjourney's https://cdn.midjourney.com/<job id>/0_<i>.<ext>."""
+    if not isinstance(url, str):
+        return False
+    try:
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:
+        return False
+    segment = (path[1:] if path.startswith('/') else path).split('/', 1)[0]
+    return bool(segment) and (segment in ids or urllib.parse.unquote(segment) in ids)
+
+
+def _named_for(rel: Any, hidden: Hidden) -> bool:
+    """Whether rel is a file name the exporter gives a hidden item's picture: images/<job id>_<i>.<ext> or
+    images/moodboard_<moodboard id>_<i>.<ext> (written or not, as a failure names the file it could not write)."""
+    match = _IMAGE_NAME.match(rel) if isinstance(rel, str) else None
+    if match is None:
+        return False
+    stem = match.group(1)
+    return stem in hidden.jobs or (stem.startswith(_BOARD_FILE) and stem[len(_BOARD_FILE):] in hidden.moodboards)
+
+
+def _names_hidden(value: Any, hidden: Hidden) -> bool:
+    """Whether an id or path names a hidden job or moodboard, a file only they use, or one named for them."""
+    found = _as_id(value)
+    return found is not None and (found in hidden.jobs or found in hidden.moodboards or found in hidden.files
+                                  or _named_for(found, hidden))
+
+
+def _redact_meta(meta: dict, hidden: Hidden) -> Tuple[dict, dict]:
+    """A copy of export_meta.json as if the hidden items had never been exported, and what each selection pair
+    lost: parent gaps and failures that name them go, counts lose what they counted (only whole numbers, never
+    below 0), each selection pair (available, exported) loses them when both are readable counts that stay 0 or
+    more (so its difference and its checks are unchanged), and left_out_moodboard_ids loses hidden moodboards.
+    Everything else, unknown keys included, is kept as written; meta itself is never changed."""
+    out = dict(meta)
+    reduced = {'jobs': 0, 'moodboards': 0}
+    if isinstance(meta.get('parent_gaps'), list):
+        out['parent_gaps'] = [gap for gap in meta['parent_gaps'] if not (isinstance(gap, dict) and (
+            _as_id(gap.get('job_id')) in hidden.jobs or _as_id(gap.get('parent_id')) in hidden.jobs))]
+    if isinstance(meta.get('failures'), list):
+        out['failures'] = [item for item in meta['failures']
+                           if not (isinstance(item, dict) and _names_hidden(item.get('id'), hidden))]
+    if isinstance(meta.get('counts'), dict):
+        counts = dict(meta['counts'])
+        for key in HIDDEN_META_COUNTS:
+            value, less = counts.get(key), hidden.delta[key]
+            if less and _is_int(value) and value >= 0:
+                counts[key] = max(0, value - less)
+        out['counts'] = counts
+    if isinstance(meta.get('selection'), dict):
+        selection = dict(meta['selection'])
+        for group in ('jobs', 'moodboards'):
+            block, less = selection.get(group), hidden.delta[group]
+            if not less or not isinstance(block, dict):
+                continue
+            available, exported = _count(block.get('available')), _count(block.get('exported'))
+            if available is not None and exported is not None and available >= less and exported >= less:
+                selection[group] = dict(block, available=available - less, exported=exported - less)
+                reduced[group] = less
+        if isinstance(selection.get('left_out_moodboard_ids'), list):
+            selection['left_out_moodboard_ids'] = [value for value in selection['left_out_moodboard_ids']
+                                                   if _as_id(value) not in hidden.moodboards]
+        out['selection'] = selection
+    return out, reduced
+
+
+def _present(roots: List['ExportIndex'], job_id: str) -> bool:
+    return any(job_id in index.jobs for index in roots)
+
+
+def _board_name(roots: List['ExportIndex'], board_id: str) -> Optional[str]:
+    """The moodboard's name in the first root that has it, else None."""
+    for index in roots:
+        board = index.boards.get(board_id)
+        if board is not None:
+            return board.name
+    return None
+
+
+def _made_from(roots: List['ExportIndex'], start: Iterable[str], hidden) -> int:
+    """How many distinct jobs made from start (children, their children and so on, in any root) are not in
+    hidden. A job id names the same generation in every root."""
+    seen = set(start)
+    queue = list(seen)
+    count = 0
+    while queue:
+        parent = queue.pop()
+        for index in roots:
+            for child in index.offspring().get(parent, ()):
+                if child not in seen:
+                    seen.add(child)
+                    queue.append(child)
+                    if child not in hidden:
+                        count += 1
+    return count
+
+
+def hide_preview(roots: List['ExportIndex'], closure: Optional[Closure], kind: str, item_id: str) -> dict:
+    """What hiding one visible item would change, over every root of the ZIP and against the current list, for
+    the dialogs. A job: {made_from_it}, the generations made from it that stay visible. A moodboard:
+    {generations, made_from_them}, how many generations it would hide that are not hidden already, and how many
+    generations made from those stay visible."""
+    closure = closure or EMPTY_CLOSURE
+    if kind == 'job':
+        after = closure.jobs | {item_id}
+    else:
+        after = hidden_closure(roots, closure.job_ids, closure.board_ids | {item_id}).jobs
+    new = [job_id for job_id in after - closure.jobs if _present(roots, job_id)]
+    made_from = _made_from(roots, new, after)
+    if kind == 'job':
+        return {'made_from_it': made_from}
+    return {'generations': len(new), 'made_from_them': made_from}
+
+
+def hidden_note(roots: List['ExportIndex'], closure: Optional[Closure], record: Optional[dict], kind: str,
+                item_id: str) -> dict:
+    """Why a hidden item is hidden, for its managers' page. A job: {on_its_own: {hidden_at, hidden_by} or None,
+    with_moodboards: [{id, name, hidden_at, hidden_by}]}. A moodboard: {hidden_at, hidden_by, generations,
+    stay_hidden}: how many generations present in the ZIP it hides, and how many of those stay hidden when it is
+    shown again (listed on their own or with another hidden moodboard)."""
+    record, closure = record or _NO_RECORD, closure or EMPTY_CLOSURE
+    if kind == 'job':
+        own = record['jobs'].get(item_id)
+        return {'on_its_own': dict(own) if own else None,
+                'with_moodboards': [{'id': board_id, 'name': _board_name(roots, board_id),
+                                     'hidden_at': who['hidden_at'], 'hidden_by': who['hidden_by']}
+                                    for board_id, who in record['moodboards'].items()
+                                    if item_id in closure.by_board.get(board_id, ())]}
+    who = record['moodboards'].get(item_id) or {'hidden_at': None, 'hidden_by': None}
+    present = [job_id for job_id in closure.by_board.get(item_id, ()) if _present(roots, job_id)]
+    others = set(record['jobs']).union(*(found for board_id, found in closure.by_board.items() if board_id != item_id))
+    return {'hidden_at': who['hidden_at'], 'hidden_by': who['hidden_by'], 'generations': len(present),
+            'stay_hidden': sum(1 for job_id in present if job_id in others)}
+
+
+def _newest_first(rows: List[dict]) -> List[dict]:
+    """Newest hidden_at first, unknown last, then by id (the sort is stable)."""
+    return sorted(sorted(rows, key=lambda row: row['id']), key=lambda row: row['hidden_at'] or '', reverse=True)
+
+
+def hidden_listing(roots: List['ExportIndex'], closure: Optional[Closure], record: Optional[dict]) -> dict:
+    """The Hidden section of the overview, over every root of the ZIP: the listed moodboards (each with how many
+    generations present in the ZIP it hides) and the jobs hidden on their own. export_id is the first root that
+    has the item, None when no root has it; such a row has no card or picture."""
+    record, closure = record or _NO_RECORD, closure or EMPTY_CLOSURE
+    boards = []
+    for board_id, who in record['moodboards'].items():
+        home = next((index for index in roots if board_id in index.boards), None)
+        made_with = sum(1 for job_id in closure.by_board.get(board_id, ()) if _present(roots, job_id))
+        row = {'id': board_id, 'export_id': None, 'name': None, 'code': None, 'codes': [], 'reference_count': 0,
+               'cover': [], 'generations': made_with, 'hidden_at': who['hidden_at'], 'hidden_by': who['hidden_by']}
+        if home is not None:
+            board = home.boards[board_id]
+            refs = [home._image_ref(slot) for slot in board.slots]
+            row.update(export_id=home.id, name=board.name, code=board.code, codes=list(board.codes),
+                       reference_count=len(refs), cover=[ref for ref in refs if ref['status'] == 'present'][:4])
+        boards.append(row)
+    jobs = []
+    for job_id, who in record['jobs'].items():
+        home = next((index for index in roots if job_id in index.jobs), None)
+        jobs.append({'id': job_id, 'export_id': home.id if home is not None else None,
+                     'job': home.card(job_id) if home is not None else None,
+                     'hidden_at': who['hidden_at'], 'hidden_by': who['hidden_by'],
+                     'with_moodboards': [{'id': board_id, 'name': _board_name(roots, board_id)}
+                                         for board_id in record['moodboards']
+                                         if job_id in closure.by_board.get(board_id, ())]})
+    counts = record.get('counts')
+    return {'counts': dict(counts) if counts else None, 'moodboards': _newest_first(boards),
+            'jobs': _newest_first(jobs)}
