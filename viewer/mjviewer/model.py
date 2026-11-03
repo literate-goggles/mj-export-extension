@@ -2174,14 +2174,21 @@ def _url_names(url: Any, ids) -> bool:
     return bool(segment) and (segment in ids or urllib.parse.unquote(segment) in ids)
 
 
+_NAMED_INDEX = re.compile(r'_\d{1,3}\.')
+
+
 def _named_for(rel: Any, hidden: Hidden) -> bool:
-    """Whether rel is a file name the exporter gives a hidden item's picture: images/<job id>_<i>.<ext> or
-    images/moodboard_<moodboard id>_<i>.<ext> (written or not, as a failure names the file it could not write)."""
-    match = _IMAGE_NAME.match(rel) if isinstance(rel, str) else None
-    if match is None:
+    """Whether rel is a file named for a hidden item: its last path segment starts with <job id>_<i>. or
+    moodboard_<moodboard id>_<i>., the names the exporter gives their pictures (written or not, as a failure names
+    the file it could not write), whatever follows: a partial download (.crdownload) or a second extension too."""
+    if not isinstance(rel, str):
         return False
-    stem = match.group(1)
-    return stem in hidden.jobs or (stem.startswith(_BOARD_FILE) and stem[len(_BOARD_FILE):] in hidden.moodboards)
+    name = rel.rsplit('/', 1)[-1]
+    for match in _NAMED_INDEX.finditer(name):
+        stem = name[:match.start()]
+        if stem in hidden.jobs or (stem.startswith(_BOARD_FILE) and stem[len(_BOARD_FILE):] in hidden.moodboards):
+            return True
+    return False
 
 
 def _names_hidden(value: Any, hidden: Hidden) -> bool:

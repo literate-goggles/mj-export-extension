@@ -304,7 +304,9 @@ class VisibleIndexTests(HidingTestCase):
                     self.assertNotIn(MARKER, dump_json(files).lower())
                     self.assertEqual(files['missing'], [])
         full_files = self.full.overview()['files']
-        self.assertEqual(full_files['unreferenced'], ['images/job-zq-solo_7.png', 'images/moodboard_board-zq_9.png'])
+        self.assertEqual(full_files['unreferenced'], ['images/job-zq-solo_3.jpeg.crdownload',
+                                                      'images/job-zq-solo_7.png', 'images/moodboard_board-zq_1.png.png',
+                                                      'images/moodboard_board-zq_9.png'])
         self.assertEqual([item['path'] for item in full_files['unreadable']], [fx.ENCRYPTED_HIDDEN])
         self.assertEqual(self.visible.overview()['files'], {'missing': [], 'unreferenced': [], 'unreadable': []})
         self.assertEqual(self.visible.overview()['counts']['observed']['images_unreferenced'], 0)

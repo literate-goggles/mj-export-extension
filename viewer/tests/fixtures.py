@@ -390,7 +390,8 @@ def hiding_export() -> Export:
     generated_job_ids, duplicated in jobs.jsonl; job-exp-var is a visible variation of it), job-zq-derived
     (references it, missing from generated_job_ids), job-zq-inferred (a video, only --profile zqmb, an
     unreadable date) and job-zq-shared (references board-zq and board-1); its generated_job_ids also name
-    job-zq-gone, which is in no export root. Files named for hidden items are left unreferenced under images/.
+    job-zq-gone, which is in no export root. Files named for hidden items are left unreferenced under images/,
+    among them the partial download of job-zq-solo's failed fourth picture and a name with a second extension.
     """
     export = standard_export()
     export.meta['extension_version'] = '0.4.0'
@@ -445,13 +446,15 @@ def hiding_export() -> Export:
     export.meta['limitations'].append(SELECTION_LIMITATION)
     export.files['images/job-zq-solo_7.png'] = png_bytes(4, 4, (10, 20, 30))
     export.files['images/moodboard_board-zq_9.png'] = png_bytes(4, 4, (30, 20, 10))
+    export.files['images/job-zq-solo_3.jpeg.crdownload'] = b'partial download'
+    export.files['images/moodboard_board-zq_1.png.png'] = png_bytes(4, 4, (30, 20, 11))
     export.sync_counts()
     export.meta['counts']['completed_jobs'] = sum(1 for job in export.jobs if not job['video'])
     export.jobs.append(dict(exp, prompt='zqexp duplicate row'))  # a duplicate: the first row is used
     return export
 
 
-ENCRYPTED_HIDDEN = 'images/job-zq-exp_9.png'
+ENCRYPTED_HIDDEN = 'images/job-zq-exp_9.png.crdownload'  # an encrypted partial download
 
 
 def hiding_zip_bytes(export: Optional[Export] = None, root: str = ROOT) -> bytes:
