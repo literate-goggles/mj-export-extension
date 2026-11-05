@@ -22,7 +22,7 @@
     if(path==='/api/moodboards'){
       if(!Array.isArray(data))throw new Error('Unexpected moodboards response');
       return data.filter(b=>b.user_id===ownId).map(b=>{
-        const images=(b.images||[]).map(i=>{try{if(new URL(i.url).origin==='https://cdn.midjourney.com')allowedImages.add(i.url);}catch{}return pick(i,['url','width','height','created']);});
+        const images=(b.images||[]).map(i=>{try{if(new URL(i.url).origin==='https://cdn.midjourney.com'||/^https:\/\/s\.mj\.run\/[A-Za-z0-9_-]{1,64}$/.test(i.url))allowedImages.add(i.url);}catch{}return pick(i,['url','width','height','created']);}); // CDN pictures, and the Midjourney short links of older boards (the pattern of isShortLink in lib/transport.js)
         return {...pick(b,['moodboard_id','title','created','user_id','version','code']),images};
       });
     }

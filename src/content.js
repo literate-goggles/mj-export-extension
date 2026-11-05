@@ -71,12 +71,12 @@
   status(`Saved. ${summaryText(choiceCounts(selection))}. `+(saved?'Use New export to export with this choice.':'Export uses this choice.'));
   await showSelection(stored);
  }
- async function image(url,file){
+ async function image(url,file){ // file: the planned name, which keys done_files. Returns {file: the name Chrome saved, url, final_url?}, or null after a failure of this picture alone; throws to stop the run.
   verifyPage();const prior=run.done_files[file];
-  if(prior&&(await worker({type:'check-file',id:prior.id})).complete)return {file:prior.file||file,url:prior.source_url||url};
-  if(!url.startsWith('https://cdn.midjourney.com/')){failure('image',file,'Source is outside the two permitted hosts; not downloaded');return null;}
+  if(prior&&(prior.source_url===url||/\/0_\d\.jpeg$/.test(url)&&prior.source_url===url.replace(/\.jpeg$/,'.png'))){const check=await worker({type:'check-file',id:prior.id}),name=check.complete&&savedName(`${run.folder}/${file}`,check.filename);if(name){prior.file=file.replace(/[^/]+$/,name);return {file:prior.file,url:prior.source_url,...(prior.final_url?{final_url:prior.final_url}:{})};}} // only for the same address (or its .png fallback): a board may have changed since
+  const short=isShortLink(url);if(!short&&!url.startsWith('https://cdn.midjourney.com/')){delete run.done_files[file];failure('image',file,'Source is neither the Midjourney image CDN nor a Midjourney short link; not downloaded');return null;}
   let source=url,actualFile=file;
-  const suffix=new URL(url).pathname.match(/\.(png|jpe?g|webp)$/i)?.[1];if(suffix)actualFile=file.replace(/\.(jpeg|png|webp)$/,'.'+suffix.toLowerCase());
+  const suffix=!short&&new URL(url).pathname.match(/\.(png|jpe?g|webp)$/i)?.[1];if(suffix)actualFile=file.replace(/\.(jpeg|png|webp)$/,'.'+suffix.toLowerCase());
   const response=await scheduler.attempt(async()=>{
    const permitted=await rpc('authorize-image',{url:source});if(permitted.status!==200)return permitted;
    let result=await worker({type:'cdn-file',url:source,filename:`${run.folder}/${actualFile}`});
@@ -85,9 +85,9 @@
     const allowed=await rpc('authorize-image',{url:source});if(allowed.status!==200)return allowed;
     result=await worker({type:'cdn-file',url:source,filename:`${run.folder}/${actualFile}`});
    }
-   if(result.status===0)throw new Error(result.error_detail||'Download failed');return result;
+   if(result.status===0&&!result.item)throw new Error(result.error_detail||'Download failed');if(result.status===200&&!savedName(`${run.folder}/${actualFile}`,result.filename))throw new Error(`Chrome saved ${actualFile} under another name or folder`);return result;
   });
-  run.done_files[file]={...response,file:actualFile,source_url:source};run.lastDownloadId=response.id;await save();return {file:actualFile,url:source};
+  if(response.status!==200){delete run.done_files[file];failure('image',file,response.error_detail||`Download failed with status ${response.status}`);return null;}actualFile=actualFile.replace(/[^/]+$/,savedName(`${run.folder}/${actualFile}`,response.filename));run.done_files[file]={...response,file:actualFile,source_url:source};run.lastDownloadId=response.id;await save();return {file:actualFile,url:source,...(response.final_url?{final_url:response.final_url}:{})};
  }
  async function writeMetadata(){
   if(!run)return;
@@ -136,7 +136,7 @@
    }
    if(options.images)for(const board of run.boards){
     const results=await mapImages(board.images,async(img,i)=>image(img.source_url,`images/moodboard_${board.id}_${i}.jpeg`),()=>paused||scheduler.stopped);
-    results.forEach((r,i)=>{if(r)board.images[i].file=r.file;});await save();verifyPage();
+    results.forEach((r,i)=>{if(r){board.images[i].file=r.file;if(r.final_url)board.images[i].final_url=r.final_url;}});await save();verifyPage();
    }
    run.status=run.failures.length?'completed_with_failures':'complete';await save();await writeMetadata();
   }catch(error){

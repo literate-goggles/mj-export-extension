@@ -17,10 +17,12 @@ function fakeClock() {
 }
 
 // Simulated Chrome, page bridge and panel DOM: these tests never access Midjourney.
-function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, stored = {}, chooser = null, clock = null } = {}) {
+// Download ids are unique across harnesses, as Chrome's are across a resume.
+let downloadId = 0;
+function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, stored = {}, chooser = null, clock = null, cdn = null } = {}) {
   const options = { mode: 'max', max: 20, since: '', images: true, testSubset: true };
   const state = structuredClone({ ...stored, ...(savedRun ? { run: savedRun } : {}) });
-  const ops = [], downloads = [], files = {}, statuses = [], lines = [], created = [];
+  const ops = [], downloads = [], requests = [], files = {}, statuses = [], lines = [], created = [];
   const data = {
     identity: { user_id: 'self', username_v2: 'synthetic' },
     jobs: { data: [], cursor: null, checkpoint: null },
@@ -29,7 +31,6 @@ function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, sto
     ...feed,
   };
   let messageHandler;
-  let downloadId = 0;
   let waiters = [];
   const listeners = [];
   const window = {
@@ -65,14 +66,18 @@ function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, sto
         if (message.type === 'release') { const ready = waiters; waiters = []; ready.forEach(resolve => resolve()); }
         if (message.type === 'cdn-file') {
           downloads.push(message.url);
+          requests.push([message.url, message.filename]);
           if (pauseOnDownload) messageHandler({ type: 'command', command: 'pause', options }, {}, () => {});
-          return { status: 200, id: ++downloadId, bytes: 10, filename: message.filename };
+          // cdn(message): the service worker's answer when it has a status; fields to add to the default success when it has none.
+          const answer = cdn?.(message);
+          if (answer?.status !== undefined) return answer;
+          return { status: 200, id: ++downloadId, bytes: 10, filename: message.filename, ...answer };
         }
         if (message.type === 'text-file') {
           files[message.filename.split('/').pop()] = message.text;
           return { id: ++downloadId, filename: message.filename };
         }
-        if (message.type === 'check-file') return { complete: true, bytes: 10 };
+        if (message.type === 'check-file') return { complete: true, bytes: 10, filename: Object.values(state.run?.done_files || {}).find(f => f.id === message.id)?.filename };
         return { ok: true };
       },
     },
@@ -95,7 +100,7 @@ function harness({ run: savedRun = null, pauseOnDownload = false, feed = {}, sto
   vm.runInContext('const OriginalScheduler = ReadScheduler; ReadScheduler = class extends OriginalScheduler { constructor() { super({sleep: async () => {}}); } };', context);
   vm.runInContext(fs.readFileSync(new URL('../src/content.js', import.meta.url), 'utf8'), context);
   return {
-    state, options, ops, downloads, files, statuses, lines,
+    state, options, ops, downloads, requests, files, statuses, lines,
     button: label => created.find(el => el.textContent === label),
     // Sends a message as the popup does and returns the listener's immediate answer.
     message(message) { let answer; messageHandler(message, {}, value => { answer = structuredClone(value); }); return answer; },
@@ -405,4 +410,145 @@ test('clearing the selection goes back to exporting everything', async () => {
   assert.equal(app.state.selection, undefined);
   assert.equal(app.statuses.at(-1), 'Selection cleared. New exports include everything in the scope again.');
   assert.match(app.lines.at(-1), /^What to export: everything in the scope\./);
+});
+
+// Moodboards made before about May 2026 store Midjourney short links. Synthetic codes; no request leaves the test.
+const shortLinks = ['https://s.mj.run/AAAAAAAAAA1', 'https://s.mj.run/AAAAAAAAAA2'];
+const newerPicture = 'https://cdn.midjourney.com/u/00000000-0000-4000-8000-000000000001/aaaa.jpg';
+const shortFeed = (urls = [...shortLinks, newerPicture, 'https://example.invalid/p.png']) => ({ moodboards: [{ moodboard_id: 'old', title: 'Old', images: urls.map(url => ({ url, width: 1200, height: 1500 })) }] });
+const dead = { status: 404, item: true, error_detail: 'Short link could not be downloaded: Chrome reported SERVER_BAD_CONTENT at s.mj.run' };
+const asPng = { filename: message => message.filename.replace(/\.jpeg$/, '.png'), final_url: 'https://cdn.example.invalid/x/0_0.png' };
+const shortAnswers = (second = dead) => message => message.url === shortLinks[0] ? { filename: asPng.filename(message), final_url: asPng.final_url } : message.url === shortLinks[1] ? second : null;
+const otherHost = 'Source is neither the Midjourney image CDN nor a Midjourney short link; not downloaded';
+const byId = list => [...list].sort((a, b) => a.id.localeCompare(b.id));
+
+test('a short link picture is saved under the name Chrome gives it; a dead one fails alone and the export goes on', async () => {
+  const app = harness({ feed: shortFeed(), cdn: shortAnswers() });
+  await app.run('new', allJobs);
+  const { boards, meta } = app.output();
+  assert.deepEqual([...app.downloads].sort(), [...shortLinks, newerPicture].sort());
+  assert.deepEqual(app.requests.find(([url]) => url === shortLinks[0])[1], `${app.state.run.folder}/images/moodboard_old_0.jpeg`);
+  assert.deepEqual(boards[0].images, [
+    { source_url: shortLinks[0], file: 'images/moodboard_old_0.png', width: 1200, height: 1500, final_url: 'https://cdn.example.invalid/x/0_0.png' },
+    { source_url: shortLinks[1], file: null, width: 1200, height: 1500 },
+    { source_url: newerPicture, file: 'images/moodboard_old_2.jpg', width: 1200, height: 1500 },
+    { source_url: 'https://example.invalid/p.png', file: null, width: 1200, height: 1500 },
+  ]);
+  assert.equal(meta.status, 'completed_with_failures');
+  assert.deepEqual(byId(meta.failures), [{ kind: 'image', id: 'images/moodboard_old_1.jpeg', reason: dead.error_detail }, { kind: 'image', id: 'images/moodboard_old_3.jpeg', reason: otherHost }]);
+  assert.deepEqual([meta.counts.files, meta.counts.download_bytes], [2, 20]);
+  assert.deepEqual(Object.keys(app.state.run.done_files).sort(), ['images/moodboard_old_0.jpeg', 'images/moodboard_old_2.jpeg']);
+});
+
+test('a short link that keeps failing is retried with the usual backoff, then fails alone', async () => {
+  const busy = { status: 503, item: true, error_detail: 'Short link could not be downloaded: Chrome reported SERVER_FAILED at s.mj.run' };
+  const app = harness({ feed: shortFeed(), cdn: shortAnswers(busy) });
+  await app.run('new', allJobs);
+  assert.equal(app.downloads.filter(url => url === shortLinks[1]).length, 3);
+  const { boards, meta } = app.output();
+  assert.equal(meta.status, 'completed_with_failures');
+  assert.equal(boards[0].images[2].file, 'images/moodboard_old_2.jpg');
+  assert(meta.failures.some(f => f.id === 'images/moodboard_old_1.jpeg' && f.reason === busy.error_detail));
+});
+
+test('a download error that is not about the picture itself still stops the export', async () => {
+  // A local error, and a picture the worker reports saved under another name.
+  for (const [answer, reason] of [[{ status: 0, error_detail: 'Download interrupted: FILE_NO_SPACE' }, 'Download interrupted: FILE_NO_SPACE'], [{ filename: '/home/u/Downloads/x.png' }, 'Chrome saved images/moodboard_old_0.jpeg under another name or folder']]) {
+    const app = harness({ feed: shortFeed(), cdn: message => message.url === shortLinks[0] ? answer : null });
+    await app.run('new', allJobs);
+    const { meta } = app.output();
+    assert.equal(meta.status, 'stopped');
+    assert.deepEqual(meta.failures.at(-1), { kind: 'run', id: 'export', reason });
+  }
+});
+
+test('a short link that leads to something other than a picture fails alone at once, without a retry', async () => {
+  const page = { status: 0, item: true, error_detail: 'Short link led to text/html at www.example.invalid, not a JPEG, PNG, WebP, GIF or AVIF picture; not kept' };
+  const app = harness({ feed: shortFeed(), cdn: shortAnswers(page) });
+  await app.run('new', allJobs);
+  assert.equal(app.downloads.filter(url => url === shortLinks[1]).length, 1);
+  const { boards, meta } = app.output();
+  assert.equal(meta.status, 'completed_with_failures');
+  assert.deepEqual(boards[0].images.map(i => i.file), ['images/moodboard_old_0.png', null, 'images/moodboard_old_2.jpg', null]);
+  assert(meta.failures.some(f => f.id === 'images/moodboard_old_1.jpeg' && f.reason === page.error_detail));
+});
+
+test('resume downloads only the short links that failed and keeps the names and addresses already recorded', async () => {
+  const feed = shortFeed(shortLinks.concat(newerPicture));
+  const first = harness({ feed, cdn: shortAnswers() });
+  await first.run('new', allJobs);
+  const second = harness({ feed, stored: { run: first.state.run }, cdn: message => message.url === shortLinks[1] ? { filename: message.filename.replace(/\.jpeg$/, '.webp'), final_url: 'https://cdn.example.invalid/y.webp' } : null });
+  await second.run('export', allJobs);
+  assert.deepEqual(second.downloads, [shortLinks[1]]);
+  const { boards, meta } = second.output();
+  assert.deepEqual(boards[0].images.map(i => [i.file, i.final_url]), [['images/moodboard_old_0.png', 'https://cdn.example.invalid/x/0_0.png'], ['images/moodboard_old_1.webp', 'https://cdn.example.invalid/y.webp'], ['images/moodboard_old_2.jpg', undefined]]);
+  assert.equal(meta.status, 'complete');
+  assert.deepEqual(meta.failures, []);
+  assert.equal(meta.counts.files, 3);
+});
+
+test('a recorded download Chrome did not save in the export folder is not trusted, and a failed retry drops it from the counts', async () => {
+  const feed = shortFeed(shortLinks.concat(newerPicture));
+  const first = harness({ feed });
+  await first.run('new', allJobs);
+  const run = structuredClone(first.state.run);
+  run.done_files['images/moodboard_old_1.jpeg'].filename = '/home/u/Downloads/AAAAAAAAAA2.png';
+  const second = harness({ feed, stored: { run }, cdn: shortAnswers() });
+  await second.run('export', allJobs);
+  assert.deepEqual(second.downloads, [shortLinks[1]]);
+  const { boards, meta } = second.output();
+  assert.equal(boards[0].images[1].file, null);
+  assert.equal(meta.counts.files, 2);
+  assert.equal(meta.status, 'completed_with_failures');
+});
+
+test('a resume reuses a saved picture only for the address it came from, so pictures that moved are downloaded again', async () => {
+  const first = harness({ feed: shortFeed([shortLinks[0], newerPicture]), cdn: shortAnswers() });
+  await first.run('new', allJobs);
+  // The two pictures swapped places on the board.
+  const swapped = harness({ feed: shortFeed([newerPicture, shortLinks[0]]), stored: { run: first.state.run }, cdn: shortAnswers() });
+  await swapped.run('export', allJobs);
+  assert.deepEqual([...swapped.downloads].sort(), [shortLinks[0], newerPicture].sort());
+  const { boards, meta } = swapped.output();
+  assert.deepEqual(boards[0].images, [
+    { source_url: newerPicture, file: 'images/moodboard_old_0.jpg', width: 1200, height: 1500 },
+    { source_url: shortLinks[0], file: 'images/moodboard_old_1.png', width: 1200, height: 1500, final_url: asPng.final_url },
+  ]);
+  assert.deepEqual([meta.status, meta.counts.files], ['complete', 2]);
+  boards[0].images.forEach((image, i) => assert.equal(swapped.state.run.done_files[`images/moodboard_old_${i}.jpeg`].file, image.file));
+  // A picture on another host took the second place: what was saved there no longer counts.
+  const replaced = harness({ feed: shortFeed([shortLinks[0], 'https://example.invalid/p.png']), stored: { run: first.state.run } });
+  await replaced.run('export', allJobs);
+  assert.deepEqual(replaced.downloads, []);
+  const after = replaced.output();
+  assert.deepEqual(after.boards[0].images.map(i => [i.file, i.final_url]), [['images/moodboard_old_0.png', asPng.final_url], [null, undefined]]);
+  assert.deepEqual([after.meta.status, after.meta.counts.files], ['completed_with_failures', 1]);
+  assert.deepEqual(after.meta.failures, [{ kind: 'image', id: 'images/moodboard_old_1.jpeg', reason: otherHost }]);
+});
+
+test('a resume skips a generation picture saved through the .png fallback', async () => {
+  const feed = { jobs: { cursor: null, checkpoint: null, data: [apiJob(1)] }, moodboards: [] };
+  const png = jobImages(1)[0].replace(/\.jpeg$/, '.png');
+  const cdn = message => message.url.endsWith('/0_0.jpeg') ? { status: 404, error_detail: 'Download interrupted: SERVER_BAD_CONTENT' } : null;
+  const first = harness({ feed, cdn });
+  await first.run('new', allJobs);
+  assert.deepEqual([...first.downloads].sort(), [...jobImages(1), png].sort());
+  const second = harness({ feed, stored: { run: first.state.run }, cdn });
+  await second.run('export', allJobs);
+  assert.deepEqual(second.downloads, []);
+  const [job] = second.output().jobs;
+  assert.deepEqual([job.image_files, job.image_urls], [[`images/${jobId(1)}_0.png`, `images/${jobId(1)}_1.jpeg`], [png, jobImages(1)[1]]]);
+});
+
+test('a resume records the name Chrome saved a picture under where an older version recorded another', async () => {
+  const feed = shortFeed([newerPicture]);
+  const first = harness({ feed, cdn: message => ({ filename: message.filename.replace(/\.jpg$/, '.png') }) });
+  await first.run('new', allJobs);
+  const run = structuredClone(first.state.run);
+  run.done_files['images/moodboard_old_0.jpeg'].file = 'images/moodboard_old_0.jpg'; // as 0.4.0 recorded a picture Chrome renamed
+  const second = harness({ feed, stored: { run } });
+  await second.run('export', allJobs);
+  assert.deepEqual(second.downloads, []);
+  assert.equal(second.output().boards[0].images[0].file, 'images/moodboard_old_0.png');
+  assert.equal(second.state.run.done_files['images/moodboard_old_0.jpeg'].file, 'images/moodboard_old_0.png');
 });
