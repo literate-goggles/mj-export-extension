@@ -2,16 +2,16 @@
 
 ## Responsibilities
 
-- `src/page-bridge.js` runs in the page's main world. It learns the active own-feed identity, projects allowed response fields, authorizes image URLs observed in those records, and issues only fixed same-origin GET operations. It never reads cookies or request authentication headers.
+- `src/page-bridge.js` runs in the page's main world. It learns the active own-feed identity, projects allowed response fields, authorizes image URLs observed in those records (CDN URLs, and the Midjourney short links that older own boards store), and issues only fixed same-origin GET operations. It never reads cookies or request authentication headers.
 - `src/content.js` runs in the isolated extension world. It owns explicit Scan/Export/Pause/Resume commands, scope selection, pagination, persistence, the on-page panel, and export status. It validates the current identity on each run and reports incomplete parents.
 - `src/chooser.js` runs in the isolated world beside the controller and draws the "Choose what to export" window into the page: a full-viewport modal in a closed shadow root, so the page's CSS cannot reach it and its own CSS cannot reach the page. Prompts and names reach the DOM only as text. It reads `scan_data` and saves `selection` in `chrome.storage.local` itself; it makes no API requests. The controller holds the run lease from Choose's scan until the window closes, so no scan or export can start in any tab while a choice is open.
-- `src/service-worker.js` mediates cross-tab run leases and Chrome downloads. Metadata blobs come from the extension's offscreen document; image URLs use the permitted CDN.
+- `src/service-worker.js` mediates cross-tab run leases and Chrome downloads. Metadata blobs come from the extension's offscreen document; image URLs are the Midjourney CDN or, for older moodboards, Midjourney short links, which Chrome follows to wherever they redirect. The worker keeps a short link's file only when Chrome reports an HTTPS address, a JPEG, PNG, WebP, GIF or AVIF type and no danger verdict within 2 minutes. Otherwise it removes the file and only that picture fails, as it also does when Chrome reports a server or network error for a short link. For every picture it returns the name Chrome saved it under, whose suffix may differ from the one requested, and it stops the run when a picture lands anywhere but its requested name in the export folder.
 - `lib/` contains pure logic, shared with tests. `scripts/build.mjs` assembles these local modules into the classic content-script bundle. No remote bundler or runtime dependency is used.
 - `ui/` provides the popup and offscreen metadata-blob lifecycle.
 
 ## Data and resume
 
-Progress is local to the browser profile. Resume re-reads the selected own-feed scope to establish ownership; it does not blindly continue an old cursor after switching accounts. Completed downloads are checked against Chrome's download records and skipped. A changed scope needs New export; a new run leaves earlier downloaded folders intact.
+Progress is local to the browser profile. Resume re-reads the selected own-feed scope to establish ownership; it does not blindly continue an old cursor after switching accounts. Completed downloads are checked against Chrome's download records, under the name Chrome saved them, and skipped while the picture's address is unchanged; a picture that moved or was replaced on a board is downloaded again. A changed scope needs New export; a new run leaves earlier downloaded folders intact.
 
 Moodboard references and generations are separate datasets. `images` contains the board's current reference images; `generated_job_ids` links only selected feed jobs with an explicit matching personalization ID. Multiple codes from those references are retained in `codes`. Historical board snapshots and missing jobs cannot be reconstructed from those links.
 
@@ -29,7 +29,7 @@ The chooser's thumbnails are image loads made by the page, not by the extension:
 
 ## Trust and limits
 
-Page messages and private API shapes are not a stable or privileged public API. The bridge has a fixed read-operation allowlist, but this is not a security audit or a guarantee against a compromised page. Active-page challenge detection is heuristic. Download errors expose categories rather than precise HTTP statuses.
+Page messages and private API shapes are not a stable or privileged public API. The bridge has a fixed read-operation allowlist, but this is not a security audit or a guarantee against a compromised page. Active-page challenge detection is heuristic. Download errors expose categories rather than precise HTTP statuses. A short link may redirect to any host. The extension authorizes only its first address, and judges the result by what Chrome reports (address, type, danger verdict), since it cannot read the file.
 
 Large archives have not been load-tested. Metadata is held in memory and persisted as a run object, so very large histories may require a future chunked/IndexedDB architecture. Folder output avoids ZIP size limits but does not remove that metadata-memory limitation. MV3 interruptions, removed download-history entries, and browser shutdown can require an explicit resume.
 

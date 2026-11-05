@@ -18,6 +18,37 @@ The chooser was checked in headless Chromium on a local page with synthetic data
 
 Version 0.4.0 was not run against Midjourney: no live scan, choice or export was made. The thumbnail name the chooser tries first is unverified ([ENDPOINTS.md](ENDPOINTS.md#chooser-thumbnails)).
 
+## Offline verification — 2026-11-05, version 0.4.1
+
+Moodboard pictures stored as Midjourney short links (`https://s.mj.run/<code>`) are now downloaded. Local build, syntax and manifest checks and 76 synthetic tests passed; they make no network requests. They cover:
+
+- which addresses the page bridge, the content script and the service worker accept (the same set in all three);
+- a short link saved under the suffix Chrome gives its type, and recorded under that name, with `final_url` and no query;
+- a short link that leads to a page, an SVG, a non-HTTPS address or a download Chrome flags, or that does not finish within 2 minutes (before or after its response begins): removed, and reported for that picture alone;
+- a short link's type checked as soon as Chrome reports one, against every type Chrome reported for it, so that a server's own type (such as `application/octet-stream`) counts even after Chrome reports `image/jpeg` for the `.jpeg` it named; a type that is not a picture, an error page's included, ends the download before its file is complete and is retried like a server error;
+- a short link's download checked every 2 seconds and on any change Chrome reports, a danger verdict included, and waiting while Chrome scans it;
+- Chrome's errors failing a short link alone after the usual backoff, with its partial download erased, while local errors such as a full disk still stop the export; an error code Chrome gives when it cannot start a download is treated the same way;
+- a picture saved outside the export folder or under another name stopping the export, whatever words its folder or name contain;
+- unchanged error handling for CDN pictures, with no time limit;
+- a resume that skips finished pictures, a generation picture saved through the `.png` fallback included, retries failed ones, and records the name Chrome saved a picture under where 0.4.0 recorded another;
+- a resume that downloads again the pictures that moved on a board, and drops the record of one whose place now holds a picture on another host;
+- a failed retry that drops its stale record from the counts.
+
+The 349 viewer unit tests passed, apart from 33 browser tests that were skipped. They include a 0.4.1 export with short-link pictures through `--check`, and, in hosted mode, a short-link picture of a hidden generation withheld from everyone else, also when its final address names the generation after the first path segment.
+
+How `chrome.downloads` treats a link that redirects elsewhere was checked in Chrome for Testing 148.0.7778.96 on Linux, headless. The test extension had only the `downloads` permission, and a local server's links answered 302 to a second local host.
+
+- The download followed the redirect without host permissions.
+- Chrome replaced a requested `.jpeg` with `.png`, `.webp`, `.gif`, `.html` or `.txt` to match the type sent.
+- It kept `.jpeg` for JPEG, for `application/octet-stream`, and when the server named the file.
+- `mime` and `finalUrl` were known when `download()` resolved; `mime` was then the type the server sent, and, once Chrome had named the file, the type of the suffix it was saved under (`image/jpeg` for every file kept as `.jpeg`).
+- Cancelling right after that left no file; `removeFile`, which deletes a completed download's file, refused one still in progress.
+- For an HTTP error (403, 404, 410, 429 or 500) the item was still in progress, with the error page's type, when `download()` resolved, and Chrome reported the error code only afterwards, in the change that named the file.
+
+No Midjourney host was contacted.
+
+Version 0.4.1 was not run against Midjourney: where short links lead, and what their servers send, is unknown until a real export.
+
 There has been no full-history, multi-account, historical/deleted-board, video, or very-large-archive acceptance test. Live rate-limit enforcement and account-ban probability are unknown. A successful small export is neither completeness evidence for every account nor a promise of platform permission.
 
 Run `npm run check` and `npm test`. The standalone `scripts/verify-export.py` checks an existing local export without contacting any service.
