@@ -389,7 +389,7 @@ class ProbeAndHeaderTests(HostedTestCase):
             data = self.json_of(body)
             self.assertEqual(set(data), {'ok', 'mode', 'commit', 'features', 'catalog', 'cache'})
             self.assertEqual((data['ok'], data['mode'], data['cache']), (True, 'hosted', {'ok': True}))
-            self.assertEqual(data['features'], ['hide'])  # also with hiding off: this version applies hidden lists
+            self.assertEqual(data['features'], ['hide', 'hide_short_links'])  # also with hiding off: this version applies hidden lists
             self.assertEqual(set(data['catalog']), {'exports', 'ok', 'age_s', 'delete_enabled', 'zip_deletes_pending',
                                                     'soft_delete_days'})
             self.assertEqual((data['catalog']['exports'], data['catalog']['ok']), (1, catalog_ok))
@@ -1093,7 +1093,7 @@ class HideRouteTests(unittest.TestCase):
     def test_healthz_lists_its_features(self):
         status, _, body = self.hosted.request('GET', '/healthz', host='internal-probe')
         data = json.loads(body)
-        self.assertEqual((status, data['features'], data['catalog']['delete_enabled']), (200, ['hide'], True))
+        self.assertEqual((status, data['features'], data['catalog']['delete_enabled']), (200, ['hide', 'hide_short_links'], True))
         for who in ('alice', 'bob'):
             self.assertIs(json.loads(self.answer('/api/health', who)[2])['hide_enabled'], True)
 

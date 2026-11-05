@@ -52,9 +52,11 @@ PROFILES = 'profiles.jsonl'
 LIKES = 'likes.jsonl'
 JSONL_FILES = (JOBS, BOARDS, PROFILES, LIKES)
 # Writers this viewer was checked against: 0.3.0 and 0.3.1 share one writer (lib/normalize.js,
-# src/content.js), and 0.4.0 writes the same files plus the designer's selection (export_meta.selection,
-# board generated_left_out, parent_gaps left_out). Anything else, including 0.2.x, is read with best effort.
-SUPPORTED_VERSIONS = ('0.3.0', '0.3.1', '0.4.0')
+# src/content.js), 0.4.0 writes the same files plus the designer's selection (export_meta.selection,
+# board generated_left_out, parent_gaps left_out), and 0.4.1 also downloads moodboard pictures stored as
+# Midjourney short links (board images[].final_url; such a file's suffix is the type the server sent).
+# Anything else, including 0.2.x, is read with best effort.
+SUPPORTED_VERSIONS = ('0.3.0', '0.3.1', '0.4.0', '0.4.1')
 LEVEL_ORDER = {'error': 0, 'warning': 1, 'info': 2, 'ok': 3}
 MAX_CHECK_ITEMS = 500
 MAX_LIMIT = 500
@@ -80,7 +82,7 @@ KNOWN_FLAGS = {'ar', 'v', 'stylize', 'chaos', 'weird', 'sref', 'profile', 'niji'
 KNOWN_REFERENCE = {'code', 'id', 'type', 'user_id'}
 KNOWN_BOARD = {'id', 'code', 'codes', 'name', 'version', 'created_at', 'generated_job_ids', 'images',
                'generated_left_out'}
-KNOWN_BOARD_IMAGE = {'source_url', 'file', 'width', 'height'}
+KNOWN_BOARD_IMAGE = {'source_url', 'file', 'width', 'height', 'final_url'}
 KNOWN_PROFILE = {'id', 'codes', 'name', 'version', 'created_at', 'ratings_count', 'service', 'type'}
 KNOWN_LIKE = {'job_id', 'image_likes'}
 KNOWN_STATUS = ('reading', 'exporting', 'complete', 'completed_with_failures', 'paused', 'stopped')
@@ -2024,7 +2026,8 @@ class ExportIndex:
         amounts export_meta.json counted for them."""
         jobs, boards = closure.jobs, closure.moodboards
         withheld = frozenset((board.id, slot[0]) for board in self.boards.values() if board.id not in boards
-                             for slot in board.slots if _url_names(slot[3], jobs))
+                             for slot in board.slots
+                             if _url_names(slot[3], jobs) or _url_mentions(_final_url(board.raw, slot[0]), jobs))
 
         def hidden_owner(kind: str, owner_id: str, index: int) -> bool:
             if kind == 'job':
@@ -2172,6 +2175,32 @@ def _url_names(url: Any, ids) -> bool:
         return False
     segment = (path[1:] if path.startswith('/') else path).split('/', 1)[0]
     return bool(segment) and (segment in ids or urllib.parse.unquote(segment) in ids)
+
+
+_JOB_TOKEN = re.compile(r'[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}')
+
+
+def _url_mentions(url: Any, ids) -> bool:
+    """Whether an address names one of ids: as its first path segment (_url_names), or as a job id anywhere in its
+    path, in either case, as written or percent-decoded. For the final_url where a short link led (from 0.4.1),
+    which can be on any host and name its generation in a later segment or in a file name."""
+    if not isinstance(url, str):
+        return False
+    if _url_names(url, ids):
+        return True
+    try:
+        path = urllib.parse.urlsplit(url).path
+    except ValueError:
+        return False
+    return any(token in ids or token.lower() in ids
+               for text in (path, urllib.parse.unquote(path)) for token in _JOB_TOKEN.findall(text))
+
+
+def _final_url(row: Any, index: int) -> Any:
+    """images[index].final_url of a moodboard row (where a short link led, from 0.4.1), or None."""
+    images = row.get('images') if isinstance(row, dict) else None
+    image = images[index] if isinstance(images, list) and 0 <= index < len(images) else None
+    return image.get('final_url') if isinstance(image, dict) else None
 
 
 _NAMED_INDEX = re.compile(r'_\d{1,3}\.')

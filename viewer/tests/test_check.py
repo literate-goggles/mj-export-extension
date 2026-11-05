@@ -28,6 +28,19 @@ class CheckTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def test_a_0_4_1_export_with_short_link_pictures(self):
+        path = fx.write_zip(fx.short_link_export(), os.path.join(self.base, 'short.zip'))
+        status, out, err = run('--check', path, '--json')
+        self.assertEqual((status, err), (0, ''))
+        root = json.loads(out)['exports'][0]
+        self.assertEqual((root['extension_version'], root['version_support']), ('0.4.1', 'supported'))
+        self.assertEqual((root['counts']['images_expected'], root['counts']['images_present'], root['counts']['images_missing']), (35, 35, 0))
+        status, out, err = run('--check', path)
+        self.assertEqual(status, 0)
+        self.assertEqual([line.strip() for line in out.splitlines() if line.strip().startswith(('warning', 'error'))],
+                         ['warning: Export completed with failures: See the failure list.',
+                          'warning: 1 failure(s) reported by the exporter'])
+
     def test_valid_zip(self):
         path = fx.write_zip(fx.standard_export(), os.path.join(self.base, 'good.zip'))
         before = os.stat(path).st_mtime_ns

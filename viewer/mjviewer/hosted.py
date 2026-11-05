@@ -74,7 +74,7 @@ DELETE_STATUS = {'delete_disabled': 403, 'not_owner': 403, 'unknown_catalog_entr
                  'storage_error': 502, 'delete_unconfirmed': 502}
 # What this server can do that an older one could not; /healthz lists it, so a deployment can tell before it rolls
 # back to (or keeps running) an image that would show every hidden item to everyone.
-FEATURES = ('hide',)
+FEATURES = ('hide', 'hide_short_links')
 HIDE_STATUS = {'hide_disabled': 403, 'not_owner': 403, 'unknown_catalog_entry': 404, 'unknown_job': 404,
                'unknown_moodboard': 404, 'catalog_busy': 409, 'too_many_hidden': 409, 'storage_error': 502,
                'hide_unconfirmed': 502}

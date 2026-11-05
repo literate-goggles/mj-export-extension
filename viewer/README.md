@@ -180,9 +180,10 @@ Other things the viewer shows as recorded rather than guessing:
 
 ## Compatibility and odd data
 
-Exports from extension 0.3.0 and 0.3.1 (one writer) and 0.4.0 (the same files
-plus the designer's selection) are marked supported. Anything else, older
-versions included, is read with best effort and a warning.
+Exports from extension 0.3.0 and 0.3.1 (one writer), 0.4.0 (the same files
+plus the designer's selection) and 0.4.1 (moodboard pictures stored as short
+links are downloaded too, with `final_url`) are marked supported. Anything
+else, older versions included, is read with best effort and a warning.
 The viewer copes with:
 
 - a ZIP with or without a top folder, several export roots in one ZIP, and
@@ -354,18 +355,27 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
   upscale's picture stays visible in its grid. Prompts and flags of visible
   generations that use a hidden picture by its address (image prompts,
   `--sref`, `--cref`) keep that address, which names the hidden generation and
-  opens its picture at Midjourney. In a ZIP with several export roots, a
-  generation in another root that names a hidden moodboard only by its code
-  keeps showing that code. Fields this viewer does not know are shown as
-  written. Browsers may keep images they already showed for up to 10 minutes,
-  and a page that is open keeps what it showed until it is reloaded. The list
-  goes with the export's catalog entry: once the export is deleted (or
-  unpublished), publishing the same ZIP again, like publishing a new one,
-  starts with nothing hidden. To remove something for real, delete the export
-  and publish one without it.
-- **Versions.** A viewer older than this one ignores hidden lists and shows
-  everything to everyone. `/healthz` lists `hide` in `features`: check it
-  before rolling back, and while instances are upgraded.
+  opens its picture at Midjourney. A moodboard picture counts as a hidden
+  generation's picture only when its address names that generation: its
+  `source_url` when the generation's id is the first part of its path, as on
+  the image CDN, or, for a picture downloaded through a short link, the
+  `final_url` it led to when the id is anywhere in its path (any part or file
+  name, in either case, also percent-encoded); the same picture at any other
+  address stays visible.
+  In a ZIP with several export roots, a generation in another root that names
+  a hidden moodboard only by its code keeps showing that code. Fields this
+  viewer does not know are shown as written. Browsers may keep images they
+  already showed for up to 10 minutes, and a page that is open keeps what it
+  showed until it is reloaded. The list goes with the export's catalog entry:
+  once the export is deleted (or unpublished), publishing the same ZIP again,
+  like publishing a new one, starts with nothing hidden. To remove something
+  for real, delete the export and publish one without it.
+- **Versions.** A viewer without `hide` in the `features` of `/healthz`
+  ignores hidden lists and shows everything to everyone, and one without
+  `hide_short_links` shows a moodboard picture whose short link led to a
+  hidden generation. Check both before rolling back and while instances are
+  upgraded, and upgrade every instance before an export from extension 0.4.1
+  is published: an older one also marks that version untested.
 - **Opening a published export** downloads its ZIP in the background into the
   cache, checks its size and SHA-256 against the catalog, makes it read-only,
   and then reads it like a local ZIP. The start page shows the progress; with a
@@ -497,10 +507,12 @@ write the same way.
 ### Health and start probe
 
 - `GET /healthz` answers without sign-in and for any `Host`:
-  `{"ok": true, "mode": "hosted", "commit": "...", "features": ["hide"], "catalog": {"exports": 2, "ok": true, "age_s": 12.5, "delete_enabled": false, "zip_deletes_pending": 0, "soft_delete_days": null}, "cache": {"ok": true}}`.
+  `{"ok": true, "mode": "hosted", "commit": "...", "features": ["hide", "hide_short_links"], "catalog": {"exports": 2, "ok": true, "age_s": 12.5, "delete_enabled": false, "zip_deletes_pending": 0, "soft_delete_days": null}, "cache": {"ok": true}}`.
   It names no export, user, path or secret. `features` lists what this
   version does that older ones did not: `hide` means it applies hidden lists
-  (an instance without it would show every hidden item to everyone).
+  (an instance without it would show every hidden item to everyone), and
+  `hide_short_links` that it also withholds a moodboard picture whose short
+  link led to a hidden generation (an instance without it shows that picture).
   `catalog.ok` is false while the
   catalog cannot be read; `age_s` is the age of the copy in use;
   `delete_enabled` says whether `MJV_CATALOG_WRITE_URL` is set;

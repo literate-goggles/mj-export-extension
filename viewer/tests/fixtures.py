@@ -519,6 +519,30 @@ def shared_file_export() -> Export:
 
 # ------------------------------------------------------------------ writers
 
+SHORT_LINKS = ['https://s.mj.run/AAAAAAAAAA%d' % i for i in range(3)]  # synthetic codes; nothing is requested
+SHORT_LINK_FAILURE = 'Short link could not be downloaded: Chrome reported SERVER_BAD_CONTENT at s.mj.run'
+
+
+def short_link_export() -> Export:
+    """standard_export() as extension 0.4.1 writes it, plus board-s, a moodboard made before about May 2026 whose
+    pictures are Midjourney short links: the first was saved as .png, the type the server sent, with the address it
+    led to; the second could not be downloaded (a failure); the third kept its planned .jpeg name although its bytes
+    are PNG, as when a server names the file itself."""
+    export = standard_export()
+    export.meta['extension_version'] = '0.4.1'
+    export.meta['status'] = 'completed_with_failures'
+    export.boards.append({'id': 'board-s', 'code': None, 'codes': [], 'name': 'Short links', 'version': None,
+                          'created_at': '2025-04-01 10:00:00.000000', 'generated_job_ids': [], 'images': [
+                              {'source_url': SHORT_LINKS[0], 'file': 'images/moodboard_board-s_0.png', 'width': 1200,
+                               'height': 1500, 'final_url': 'https://cdn.example.invalid/u/short-0/aaaa.png'},
+                              {'source_url': SHORT_LINKS[1], 'file': None, 'width': 1200, 'height': 1500},
+                              {'source_url': SHORT_LINKS[2], 'file': 'images/moodboard_board-s_2.jpeg', 'width': 1200,
+                               'height': 1500, 'final_url': 'https://cdn.example.invalid/u/short-2/bbbb.png'}]})
+    export.files['images/moodboard_board-s_2.jpeg'] = png_bytes(4, 4)
+    export.meta['failures'] = [{'kind': 'image', 'id': 'images/moodboard_board-s_1.jpeg', 'reason': SHORT_LINK_FAILURE}]
+    return export.sync_counts()
+
+
 def write_folder(export: Export, base: str, root: str = ROOT) -> str:
     """Write the export under base/root; returns that folder."""
     folder = os.path.join(base, *root.split('/')) if root else base

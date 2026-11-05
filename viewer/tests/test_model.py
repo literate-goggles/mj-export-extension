@@ -753,7 +753,7 @@ class RobustnessTests(unittest.TestCase):
         self.assertEqual(index.summary['version_support'], 'unknown')
         self.assertEqual(checks(index)['extension_version'], 'warning')
         self.assertEqual([c['detail'] for c in index.checks if c['id'] == 'extension_version'],
-                         ['This viewer was checked against exports from versions 0.3.0, 0.3.1 and 0.4.0; '
+                         ['This viewer was checked against exports from versions 0.3.0, 0.3.1, 0.4.0 and 0.4.1; '
                           '9.9.0 was read with best effort.'])
         self.assertEqual(index.summary['counts']['jobs'], 9)
         del export.meta['extension_version']
@@ -782,11 +782,29 @@ class RobustnessTests(unittest.TestCase):
 
     def test_supported_versions(self):
         for version, support in (('0.3.0', 'supported'), ('0.3.1', 'supported'), ('0.3.2', 'unknown'),
-                                 ('0.4.0', 'supported'), ('0.4.1', 'unknown'), ('0.2.0', 'unknown'), ('1.0.0', 'unknown')):
+                                 ('0.4.0', 'supported'), ('0.4.1', 'supported'), ('0.4.2', 'unknown'), ('0.2.0', 'unknown'),
+                                 ('1.0.0', 'unknown')):
             export = fx.standard_export()
             export.meta['extension_version'] = version
             index = build(export, tempfile.mkdtemp(dir=self.tmp))
             self.assertEqual(index.summary['version_support'], support, version)
+
+    def test_short_link_pictures_written_by_0_4_1(self):
+        index = build(fx.short_link_export(), self.tmp)
+        self.assertEqual(index.summary['version_support'], 'supported')
+        refs = index.moodboard_detail('board-s')['references']
+        self.assertEqual([(r['status'], r['file'], r['source_url']) for r in refs],
+                         [('present', 'images/moodboard_board-s_0.png', fx.SHORT_LINKS[0]),
+                          ('not_exported', None, fx.SHORT_LINKS[1]),
+                          ('present', 'images/moodboard_board-s_2.jpeg', fx.SHORT_LINKS[2])])
+        self.assertEqual(refs[1]['reason'], 'no file was recorded for this reference image')
+        found = checks(index)
+        self.assertNotIn('unknown_fields', found)  # final_url is a known field
+        self.assertNotIn('files_unreadable', found)  # PNG bytes under .jpeg are served as PNG
+        self.assertEqual((found['counts'], found['failures'], found['status']), ('ok', 'warning', 'warning'))
+        failures = [c for c in index.checks if c['id'] == 'failures'][0]['items']
+        self.assertEqual(failures, [{'kind': 'image', 'id': 'images/moodboard_board-s_1.jpeg', 'reason': fx.SHORT_LINK_FAILURE}])
+        self.assertEqual(index.file(refs[2]['url'].rsplit('/', 1)[1]).kind, 'png')
 
     def test_in_progress_status_is_incomplete(self):
         # 'reading' and 'exporting' are in-memory run states; a finished run never writes them.

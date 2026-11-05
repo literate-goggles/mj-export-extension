@@ -231,6 +231,52 @@ class VisibleIndexTests(HidingTestCase):
         self.assertEqual(self.full.card('job-grid-a')['child_count'], self.visible.card('job-grid-a')['child_count'])
         self.assertEqual(self.full.job_detail('job-zq-solo')['lineage']['descendant_count'], 2)
 
+    def test_a_short_link_picture_that_led_to_a_hidden_generation_is_not_available(self):
+        export = fx.hiding_export()
+        export.meta['extension_version'] = '0.4.1'
+        rel = 'images/moodboard_board-1_3.png'
+        export.boards[0]['images'].append({'source_url': fx.SHORT_LINKS[0], 'file': rel, 'width': 4, 'height': 4,
+                                           'final_url': 'https://cdn.example.invalid/job-zq-solo/0_1.png'})
+        export.sync_counts()
+        source, (full,) = open_roots(fx.write_folder(export, os.path.join(self._tmp.name, 'short-hidden')))
+        self.sources.append(source)
+        _, (visible,) = hide([full])
+        self.assertEqual(full.moodboard_detail('board-1')['references'][3]['status'], 'present')
+        ref = visible.moodboard_detail('board-1')['references'][3]
+        self.assertEqual((ref['status'], ref['url'], ref['file'], ref['source_url']), ('unavailable', None, None, None))
+        self.assertIsNone(visible.moodboard_detail('board-1')['raw']['images'][3])
+        self.assertIn(rel, visible.hidden.files)
+        self.assertIsNone(visible.file(full.files[rel].file_id))
+        # Where a short link led decides only for the picture it names: the others on the board stay.
+        self.assertEqual(visible.moodboard_detail('board-1')['references'][0]['status'], 'present')
+
+    def test_a_short_link_picture_whose_address_names_a_hidden_generation_further_on_is_not_available(self):
+        # Where a short link led can be on any host, and name its generation after the first path segment.
+        export = fx.hiding_export()
+        export.meta['extension_version'] = '0.4.1'
+        # Synthetic job ids: the first is hidden, the second is not.
+        hidden_id, shown_id = '1b2c3d4e-0000-4000-8000-000000000abc', '1b2c3d4e-0000-4000-8000-000000000def'
+        export.jobs += [fx.make_job(hidden_id, '2026-03-08T10:00:00+00:00', 'zqled lighthouse'),
+                        fx.make_job(shown_id, '2026-03-09T10:00:00+00:00', 'shown lighthouse')]
+        finals = ['https://cdn.example.invalid/attachments/111/222/someone_a_prompt_%s.png' % hidden_id,
+                  'https://cdn.example.invalid/a/%s/0_1.png' % hidden_id.upper(),
+                  'https://cdn.example.invalid/a/b/%s/0_1.png' % hidden_id.replace('-', '%2D'),
+                  'https://cdn.example.invalid/attachments/111/222/someone_a_prompt_%s.png' % shown_id]
+        for n, final in enumerate(finals, 3):
+            export.boards[0]['images'].append({'source_url': 'https://s.mj.run/AAAAAAAAAB%d' % n, 'width': 4,
+                                               'height': 4, 'file': 'images/moodboard_board-1_%d.png' % n,
+                                               'final_url': final})
+        export.sync_counts()
+        source, (full,) = open_roots(fx.write_folder(export, os.path.join(self._tmp.name, 'short-hidden-further')))
+        self.sources.append(source)
+        _, (visible,) = hide([full], jobs=fx.HIDE['jobs'] + [hidden_id])
+
+        def statuses(index):
+            return [ref['status'] for ref in index.moodboard_detail('board-1')['references'][3:]]
+        self.assertEqual(statuses(full), ['present'] * 4)
+        # The hidden job's id anywhere in the path, in either case or percent-encoded; another job's id is not it.
+        self.assertEqual(statuses(visible), ['unavailable'] * 3 + ['present'])
+
     def test_a_moodboard_picture_of_a_hidden_generation_is_not_available(self):
         rel = 'images/moodboard_board-1_2.png'
         file_id = self.full.files[rel].file_id
