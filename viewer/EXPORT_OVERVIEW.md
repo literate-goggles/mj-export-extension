@@ -1,6 +1,6 @@
 # What an MJ Export export contains
 
-This page describes the files the MJ Export extension writes, the Midjourney web endpoints they come from, and how their parts relate. It is derived only from this repository's code and docs at extension version 0.4.0, and citations are `path:line` from the repository root at that version. Version 0.4.0 adds a way for the designer to choose what to export, described in the section [The designer's selection](#the-designers-selection) and in every row, paragraph or sentence elsewhere that begins "With a selection". Without a selection, 0.4.0 writes the 0.3.1 format plus `"selection": null`. Raw endpoint observations are in [docs/ENDPOINTS.md](../docs/ENDPOINTS.md) and are not repeated here. The statuses verified, inferred and unsupported are defined in [section 4](#4-verified-inferred-unsupported).
+This page describes the files the MJ Export extension writes, the Midjourney web endpoints they come from, and how their parts relate. It is derived only from this repository's code and docs at extension version 0.4.1, and citations are `path:line` from the repository root at that version. Version 0.4.0 adds a way for the designer to choose what to export, described in the section [The designer's selection](#the-designers-selection) and in every row, paragraph or sentence elsewhere that begins "With a selection". Without a selection, 0.4.0 writes the 0.3.1 format plus `"selection": null`. Version 0.4.1 also downloads moodboard pictures stored as Midjourney short links and adds `final_url` to them, records every picture by the name Chrome saved it under, and stops a run when Chrome saves a picture anywhere else (see [Image downloads](#image-downloads)). Apart from `extension_version` and any picture Chrome saved under another suffix, an export with no short links and no board images on other hosts is written as 0.4.0 wrote it. Raw endpoint observations are in [docs/ENDPOINTS.md](../docs/ENDPOINTS.md) and are not repeated here. The statuses verified, inferred and unsupported are defined in [section 4](#4-verified-inferred-unsupported).
 
 Versions 0.3.0 and 0.3.1 write the same format: 0.3.1 (commit `83b3540`) changed no writer code, only the UI defaults (All jobs, images on, Small test off) and when saved settings are restored. No 0.2.0 code is in Git; that version is known only from `docs/TESTING.md:3-11`.
 
@@ -39,9 +39,11 @@ Not everything kept is written. `batch_size` only sizes the image list and decid
 ### Image downloads
 
 - The API does not list job image URLs. The exporter builds `image_urls` as `https://cdn.midjourney.com/<job_id>/0_<i>.jpeg` for i from 0 to `min(batch_size, 4) - 1`, with one slot when `batch_size` is not a positive integer (`lib/normalize.js:9-10`). Board images use each URL exactly as returned (`src/content.js:138`).
-- Files are saved with `chrome.downloads`, byte for byte, overwriting the same path (`src/service-worker.js:8-16`; `README.md:76`). Only `https://cdn.midjourney.com/` URLs that the bridge allowlisted from own records are fetched: job URLs built from own job ids (`.jpeg`, `.png`, `.webp`), and board URLs as returned (`src/page-bridge.js:14,25,71`; `src/content.js:77,81`; `src/service-worker.js:10`). A board image on another host is not fetched: it gets a failure of kind `image`, and its `file` stays null.
-- Chrome reports error categories, not HTTP statuses. The worker maps FORBIDDEN and UNAUTHORIZED to 403 and SERVER_FAILED and NETWORK to 503, which are retried as above; BAD_CONTENT to 404; and anything else to a stop (`src/service-worker.js:30`).
-- A 404 on a URL ending in `/0_<i>.jpeg`, the job URL shape, is retried once with `.png`. Any other 404 stops the run, so board URLs as observed have no fallback, and `.webp` is allowlisted but never requested (`src/content.js:83-88`; `src/page-bridge.js:14`).
+- Files are saved with `chrome.downloads`, byte for byte, overwriting the same path (`src/service-worker.js:36-64`; `README.md:76`). Only URLs that the bridge allowlisted from own records are fetched: job URLs built from own job ids on `https://cdn.midjourney.com/` (`.jpeg`, `.png`, `.webp`), and board URLs as returned when they are on that CDN or are Midjourney short links, `https://s.mj.run/` plus 1 to 64 letters, digits, `-` or `_` (`src/page-bridge.js:14,25,71`; `src/content.js:77,81`; `src/service-worker.js:38`; `lib/transport.js:34-38`). A board image on another host is not fetched: it gets a failure of kind `image`, and its `file` stays null.
+- Chrome follows a short link to wherever it redirects, with no host permission, and sends each host the cookies it holds for it. The worker keeps the file only when Chrome reports an HTTPS final address, a JPEG, PNG, WebP, GIF or AVIF type and no danger verdict, within 2 minutes of the request. Otherwise it removes the file, and the picture gets a failure of kind `image` while the run goes on (`src/service-worker.js:8-64`). The row records the final address, without query or fragment, as `final_url` (`src/content.js:90,139`).
+- Chrome reports error categories, not HTTP statuses. The worker maps the error code Chrome reports, never other text such as the folder name: FORBIDDEN and UNAUTHORIZED to 403 and SERVER_FAILED and NETWORK to 503, which are retried as above; BAD_CONTENT to 404; and anything else to a stop (`src/service-worker.js:79-88`). For a short link, the 404, the third 403 or 503, and the other SERVER_ errors (as well as FILE_VIRUS_INFECTED, FILE_BLOCKED, FILE_SECURITY_CHECK_FAILED and FILE_TOO_LARGE) fail that picture alone, and the run goes on (`lib/transport.js:17`); local and user errors still stop it. Whatever the error, the worker first erases a short link's interrupted download, which also deletes the partial file Chrome keeps to resume it; a CDN download is left as Chrome left it (`src/service-worker.js:29-34,47`). A short link's type is checked as soon as Chrome reports one, against every type Chrome reported for it: once Chrome has named the file it reports the type of the suffix it saved under (`image/jpeg` for a `.jpeg` it kept), so the server's own type counts from the first check and from the earlier value of each change Chrome reports, even one reported before Chrome answered with the download's id (`src/service-worker.js:17-24,41,46,55,60`; `docs/TESTING.md:44`). A type that is not a picture ends the download before its file is complete, since Chrome may open a completed file of a type the user chose to always open. An HTML error page shows first as its type: in a local Chrome test, each HTTP error tried was still in progress, with the error page's type, when `chrome.downloads.download` resolved, and Chrome reported the error code only in the change that named the file (`docs/TESTING.md:46`). So this refusal is answered as 503 and retried as above, and after the third attempt it fails that picture alone, with a reason that names the type and the host rather than an error code (`src/service-worker.js:13-14,83`). An error code Chrome gives when it cannot start a download at all is mapped like an interruption (`src/service-worker.js:63`).
+- A 404 on a URL ending in `/0_<i>.jpeg`, the job URL shape, is retried once with `.png`. Any other 404 on a CDN URL stops the run, so CDN board URLs have no fallback, and `.webp` is allowlisted but never requested (`src/content.js:83-88`; `src/page-bridge.js:14`).
+- Chrome may save a picture under the suffix of the type its server sent. The worker requires the saved file to be the requested name in the export folder, apart from the suffix, and the rows record the saved name. A picture saved anywhere else stops the run at once, without a retry or the `.png` fallback, and its file stays where Chrome put it (`lib/transport.js:39-45`; `src/service-worker.js:50`; `src/content.js:76,88,90`).
 - At most two downloads run at once, and they skip the 1 s spacing (`lib/transport.js:22-29`; `src/content.js:80`).
 
 ### Endpoints not used
@@ -67,7 +69,7 @@ mj_export_<username>_<YYYYMMDD>[_<epoch ms>]/
 
 ### export_meta.json
 
-Evidence: `src/content.js:13,17,77,95,110,115,126,129,141,143`; `lib/normalize.js:47`.
+Evidence: `src/content.js:13,17,77,90,95,110,115,126,129,141,143`; `lib/normalize.js:47`.
 
 | Field | Content |
 |---|---|
@@ -75,13 +77,13 @@ Evidence: `src/content.js:13,17,77,95,110,115,126,129,141,143`; `lib/normalize.j
 | `export_time` | ISO UTC with milliseconds, taken at this write: the end or stop of the latest attempt, not its start. |
 | `username` | `username_v2`. The account id itself is not recorded here. |
 | `scope` | `{mode, max, since, images, testSubset}` of the latest attempt; `mode` is `all`, `since` or `max`. `max` is always present (20 by default) but applies only in Max mode, and `since` is a `YYYY-MM-DD` date or `''`. |
-| `status` | `complete` (the latest attempt had no failures), `completed_with_failures` (only video jobs and board images on other hosts cause it), `paused` or `stopped`. The in-memory states `reading` and `exporting` are never written. |
-| `counts` | `jobs`, `moodboards`, `profiles`: rows written. `likes`: jobs with likes. `files`, `download_bytes`: every image download record of the run, across attempts, and Chrome's sizes for them. `completed_jobs`: jobs that finished the job loop (video jobs never do). |
-| `failures` | `[{kind, id, reason}]` from the latest attempt only. `image`: the id is the requested `images/...jpeg` path. `job`: a video job. `run`: id `export`, with the error that stopped or paused the run. |
+| `status` | `complete` (the latest attempt had no failures), `completed_with_failures` (only video jobs, board images on other hosts and short-link pictures that failed cause it), `paused` or `stopped`. The in-memory states `reading` and `exporting` are never written. |
+| `counts` | `jobs`, `moodboards`, `profiles`: rows written. `likes`: jobs with likes. `files`, `download_bytes`: every image download record of the run, across attempts, and Chrome's sizes for them; a picture that failed on its own in its latest attempt has no record (`src/content.js:77,90`). `completed_jobs`: jobs that finished the job loop (video jobs never do). |
+| `failures` | `[{kind, id, reason}]` from the latest attempt only. `image`: the id is the planned `images/...` path (for a board picture always `images/moodboard_<board id>_<i>.jpeg`), and the reason says why the picture was not downloaded or not kept. `job`: a video job. `run`: id `export`, with the error that stopped or paused the run. |
 | `parent_gaps` | `[{job_id, parent_id, reason}]` for every job whose `parent_id` is not an exported `job_id`, recomputed at each write, with one fixed reason. With a selection, a parent that was in scope but not exported because of it also has `left_out: true`, and its reason reads "The designer left the parent out of this export" (`lib/normalize.js:47`; `lib/selection.js:164`). |
 | `feed_exhausted` | True when the last page read had no cursor. |
 | `limitations` | Three fixed sentences. With a selection, a fourth: "Items the designer left out are not in this export." (`src/content.js:95`) |
-| `selection` | Absent from 0.3.x exports. With a selection, what the designer chose (see [The designer's selection](#the-designers-selection)); without one, 0.4.0 writes null (`src/content.js:95,115,124`). |
+| `selection` | Absent from 0.3.x exports. With a selection, what the designer chose (see [The designer's selection](#the-designers-selection)); without one, 0.4.0 and 0.4.1 write null (`src/content.js:95,115,124`). |
 
 ### jobs.jsonl
 
@@ -99,7 +101,7 @@ Keys are written in this order (`lib/normalize.js:10`; `lib/parser.js:17-30`):
 | `parent_id` | The API `parent_id`, or null. |
 | `parent_index` | The API `parent_index` when it is an integer, else `parent_grid` when that is, else null. |
 | `kind` | See section 3. |
-| `image_files` | Relative paths of the saved images; `[]` when images were off or none were saved. |
+| `image_files` | Relative paths of the saved images, under the names Chrome saved them; `[]` when images were off or none were saved. |
 | `image_urls` | The built CDN URLs, each replaced by the URL actually downloaded (`src/content.js:132`). |
 | `width`, `height` | The job's API dimensions: metadata, not measured. |
 | `job_type`, `event_type` | As returned, or null. |
@@ -110,7 +112,7 @@ Keys are written in this order (`lib/normalize.js:10`; `lib/parser.js:17-30`):
 
 ### moodboards.jsonl
 
-Evidence: `lib/normalize.js:12-34`; `src/content.js:137-140`; `docs/ENDPOINTS.md:29`.
+Evidence: `lib/normalize.js:12-34`; `src/content.js:90,137-140`; `src/service-worker.js:51-52`; `docs/ENDPOINTS.md:29`.
 
 | Field | Content |
 |---|---|
@@ -121,7 +123,7 @@ Evidence: `lib/normalize.js:12-34`; `src/content.js:137-140`; `docs/ENDPOINTS.md
 | `created_at` | `created`, or null. Observed as `YYYY-MM-DD HH:MM:SS.ffffff` with no time zone. |
 | `generated_job_ids` | The exported jobs that have a reference whose `id` equals the board id, in feed order. |
 | `generated_left_out` | With a selection, how many of the board's generations in scope were not exported because of it (left out, or made after choosing), 0 included; absent without one (`lib/selection.js:157-160`). |
-| `images` | The board's current reference images in API order, as `{source_url, file, width, height}`. `file` is set only after a successful download. |
+| `images` | The board's current reference images in API order, as `{source_url, file, width, height}`, plus, from 0.4.1, `final_url` on a picture downloaded through a short link: the HTTPS address it led to, without query or fragment. `file` is set only after a successful download, to the name Chrome saved the picture under. |
 
 ### profiles.jsonl
 
@@ -132,16 +134,16 @@ Evidence: `lib/normalize.js:12-34`; `src/content.js:137-140`; `docs/ENDPOINTS.md
 ### likes.jsonl and images/
 
 - `likes.jsonl` holds `{job_id, image_likes}` for each selected job whose `image_likes` is non-empty. The same arrays stay on the job rows (`src/content.js:94`).
-- A job image is `images/<job_id>_<i>.jpeg`, or `.png` after the PNG fallback, where `<i>` is the 0-based image slot (`src/content.js:79,84,131`).
-- A board image is `images/moodboard_<board id>_<i>.<ext>`, where `<i>` is its position in the board's `images`, and `<ext>` is the URL path's suffix when that is `png`, `jpg`, `jpeg` or `webp` (lower-cased), else `jpeg` whatever the bytes are (`src/content.js:79,138`).
-- The suffix therefore comes from the URL, not from the bytes or the MIME type, although `docs/ENDPOINTS.md:43` says the MIME type decides. Check magic bytes, as `scripts/verify-export.py:15-40,71` does.
+- A job image is `images/<job_id>_<i>.jpeg`, or `.png` after the PNG fallback, where `<i>` is the 0-based image slot; Chrome may instead give it the suffix of the type its server sent (`src/content.js:79,84,90,131`).
+- A board image is `images/moodboard_<board id>_<i>.<ext>`, where `<i>` is its position in the board's `images`, and `<ext>` is the URL path's suffix when that is `png`, `jpg`, `jpeg` or `webp` (lower-cased), else `jpeg` (a short link has none), unless Chrome saved it under the suffix of the type its server sent (`src/content.js:79,90,138`).
+- The suffix therefore comes from the URL or from the type the server sent, never from the bytes: a server that names the file itself can leave PNG bytes under `.jpeg`. Check magic bytes, as `scripts/verify-export.py:17-49,96-98` does; it lists such files under `suffix_mismatches`.
 - Match files to slots by the `_<i>` in the name. A partial run can leave `image_files` shorter than `image_urls`, with the saved slots kept in order (`src/content.js:132-133`).
 
 ### Resumed, partial and interrupted runs
 
-- **Export / resume** continues the saved run in the same folder. It refuses another account, and any scope change except Include images. It then re-reads the identity, the feed from the first page, the boards and the profiles; keeps earlier job `image_files`; skips downloads that Chrome still reports complete; overwrites unfinished files; clears `failures`; and rewrites every metadata file when it ends (`src/content.js:75-76,106-126,141`; `README.md:87`).
+- **Export / resume** continues the saved run in the same folder. It refuses another account, and any scope change except Include images. It then re-reads the identity, the feed from the first page, the boards and the profiles; keeps earlier job `image_files`; skips a download that Chrome still reports complete in the export folder, under the name Chrome saved it, when its slot still has the URL it was downloaded from (for a job image saved through the `.png` fallback, the `.jpeg` URL it replaced) and records that name; downloads again, into its slot, a picture that moved or was replaced on its board, and drops the record of a slot that now holds an image on another host; retries pictures that failed; overwrites unfinished files; clears `failures`; and rewrites every metadata file when it ends (`src/content.js:75-77,90,106-126,141`; `README.md:87`).
 - **New export** starts over in a new `_<epoch ms>` folder and leaves earlier folders alone (`src/content.js:115`; `README.md:34`).
-- **Paused or stopped** runs still write metadata, with a `run` failure (`Run paused`, or the error that stopped the run). Jobs can have fewer `image_files` than `image_urls`, and `completed_jobs` can be below `jobs`. Board `file` values stay null until that attempt reaches the boards, even for files an earlier attempt saved, so those files look unreferenced (`src/content.js:123,137-143`; `tests/content.test.js:156-161`).
+- **Paused or stopped** runs still write metadata, with a `run` failure (`Run paused`, or the error that stopped the run). Jobs can have fewer `image_files` than `image_urls`, and `completed_jobs` can be below `jobs`. Board `file` values stay null (and `final_url` absent) until that attempt reaches the boards, even for files an earlier attempt saved, so those files look unreferenced (`src/content.js:123,137-143`; `tests/content.test.js:161-166`).
 - **Stopped while reading**: the rows and `feed_exhausted` are the previous attempt's. A new run writes empty files and no `feed_exhausted` (`src/content.js:115-126`).
 - **Metadata only** (`images: false`): `image_files` is `[]`, `file` is null, and `image_urls` are unchecked guesses. A metadata-only resume after an image run keeps the job `image_files`, resets board `file` to null and keeps `counts.files` (`src/content.js:122-123,137`).
 - **No `export_meta.json`**: the first attempt is still running, or it was killed (a closed tab, a browser crash) before it ended. A killed resume leaves the previous attempt's metadata beside newer images (`src/content.js:92-98`; `docs/ARCHITECTURE.md:34`).
@@ -163,7 +165,7 @@ Version 0.4.0 lets the designer choose what to export: whole moodboards in or ou
 | `jobs` | `{available, exported, left_out, not_reviewed}`: the jobs in the scope (mode, maximum, since date) at export time, the jobs exported, the jobs the designer unchecked, and the jobs in scope that the saved choice does not cover. |
 | `left_out_moodboard_ids` | Only the left-out boards that at least one exported job references by a personalization reference id, so that readers can label those references. Other left-out boards are only counted. |
 
-Evidence: `lib/selection.js:128-142`; `scripts/verify-export.py:49-56`.
+Evidence: `lib/selection.js:128-142`; `scripts/verify-export.py:62-69`.
 
 `exported + left_out + not_reviewed` can be less than `available`: with Small test, for example, fewer boards can be exported than were chosen (`lib/selection.js:146,160`). Do not expect the numbers to add up. `counts` still describe what was exported, and job rows keep their shape and the API data as returned, so an exported job's `personalization_codes` and `full_command` can still name a left-out board. With a selection, every board row also has `generated_left_out`, and `parent_gaps` marks the parents the designer left out (see the tables above; `lib/selection.js:157-160,164`).
 
@@ -214,8 +216,10 @@ A parent that `parent_gaps` marks `left_out` is shown as left out by the designe
 | The feed is newest first. | inferred | observed in a sample export; only Max mode and the order of `generated_job_ids` and `codes` depend on it |
 | Job images are at `https://cdn.midjourney.com/<job_id>/0_<i>.jpeg`. | verified | `docs/ENDPOINTS.md:41`; `docs/TESTING.md:5` |
 | The `.png` fallback for job images works. | inferred | the code path has never run live (`src/content.js:83-86`) |
-| Board references are CDN PNG URLs. | verified for the boards seen | `docs/ENDPOINTS.md:68`; other hosts become failures (`src/content.js:77`) |
-| The MIME type decides the local file suffix. | unsupported | the code takes the URL's suffix (`src/content.js:79`), contrary to `docs/ENDPOINTS.md:43` |
+| Board references are CDN URLs; boards made before about May 2026 have Midjourney short links instead. | verified for the boards seen | `docs/ENDPOINTS.md:43,68`; other hosts become failures (`src/content.js:77`) |
+| Chrome gives a downloaded picture the suffix of the type its server sent, and the rows record that name. | verified offline | Chromium source and a local Chrome test (`docs/TESTING.md:39-46`); `tests/service-worker.test.js:68,195`; `tests/content.test.js:425` |
+| A short link's picture is kept only when Chrome reports an HTTPS address, a picture type and no danger verdict within 2 minutes; otherwise only that picture fails. | verified (synthetic) | `src/service-worker.js:8-64,79-88`; `tests/service-worker.test.js:89,146,166,174,200,222,239`; `tests/content.test.js:425,443` |
+| Where short links lead, and what type their servers send. | unsupported | never requested (`docs/ENDPOINTS.md:43`; `docs/TESTING.md:50`) |
 | A variation links to its grid by `parent_id`, with an integer `parent_grid`. | verified | `docs/ENDPOINTS.md:68`; `lib/normalize.js:8` |
 | `parent_index` is the 0-based image slot in the parent. | inferred | field names and one observation |
 | The kinds `upscale`, `zoom`, `pan` and `remix`. | inferred | keyword rules, never observed (`lib/normalize.js:6`) |
@@ -228,20 +232,21 @@ A parent that `parent_gaps` marks `left_out` is shown as left out by the designe
 | What reference `type` means, and why `user` entries have no `id`. | unsupported | undocumented; observed in a sample export only |
 | The shape of the elements of `image_likes`. | unsupported | never observed non-empty (`docs/ENDPOINTS.md:56`) |
 | `complete` means the latest attempt had no failures; `reading` and `exporting` are never written. | verified | `src/content.js:141,143` |
-| Pausing during board downloads cannot report `complete`. | verified | `tests/content.test.js:156-161` |
+| Pausing during board downloads cannot report `complete`. | verified | `tests/content.test.js:161-166` |
 | A resume keeps completed image files. | verified (0.2.0, live) | `docs/TESTING.md:7`; `src/content.js:75-76` |
+| A resume reuses a saved picture only while its slot keeps the URL it was downloaded from; a picture that moved or was replaced on its board is downloaded again. | verified (synthetic) | `src/content.js:76-77`; `tests/content.test.js:505,529` |
 | Image dimensions match the API's. | verified for the live sample | `docs/TESTING.md:5`; rows carry API values, not measurements (`src/content.js:95`) |
 | The account is the one whose feed the site requested. | inferred | `/api/profile` only echoes that id (`src/page-bridge.js:19,42`) |
 | `username` can be an id-like value rather than a handle. | inferred | observed in a sample export |
 | Exports from 0.3.0 and 0.3.1 have the same format. | verified | 0.3.1 (`83b3540`) changes no writer code |
-| Without a selection, 0.4.0 writes the 0.3.1 format plus `"selection": null`. | verified | `tests/selection.test.js:47`; `tests/content.test.js:279` |
-| With a selection, left-out and not-reviewed jobs and boards leave no row, link, code, like or download. | verified | `tests/selection.test.js:61,115`; `tests/content.test.js:163` |
-| The selection block's counts, and `left_out_moodboard_ids` only for boards that exported jobs reference. | verified | `tests/selection.test.js:83,98`; `scripts/verify-export.py:49-56` |
+| Without a selection, 0.4.0 writes the 0.3.1 format plus `"selection": null`. | verified | `tests/selection.test.js:47`; `tests/content.test.js:284` |
+| With a selection, left-out and not-reviewed jobs and boards leave no row, link, code, like or download. | verified | `tests/selection.test.js:61,115`; `tests/content.test.js:168` |
+| The selection block's counts, and `left_out_moodboard_ids` only for boards that exported jobs reference. | verified | `tests/selection.test.js:83,98`; `scripts/verify-export.py:62-69` |
 | A parent not exported because of the choice is a parent gap with `left_out: true`. | verified | `tests/selection.test.js:106` |
-| A resume never exports what the latest choice of its account leaves out. | verified | `tests/selection.test.js:260`; `tests/content.test.js:215,249` |
+| A resume never exports what the latest choice of its account leaves out. | verified | `tests/selection.test.js:260`; `tests/content.test.js:220,254` |
 | Choosing, and exporting with a choice, on the live site. | unsupported | not run against Midjourney (`docs/TESTING.md:19`) |
 | The 0.2.0 format. | unsupported | no 0.2.0 code in Git (`docs/TESTING.md:3-11`) |
-| Full-history, multi-account or very large exports, and live rate limits. | unsupported | untested (`docs/TESTING.md:21`; `docs/ARCHITECTURE.md:34`) |
+| Full-history, multi-account or very large exports, and live rate limits. | unsupported | untested (`docs/TESTING.md:52`; `docs/ARCHITECTURE.md:34`) |
 
 ## 5. Known gaps
 
@@ -249,6 +254,7 @@ What the exporter cannot export:
 
 - Videos, which become a `job` failure, so such an export is never `complete`; and deleted, trashed, hidden or legacy jobs (`src/content.js:129`; `README.md:11,107`).
 - Earlier versions of a board, deleted boards, a board's use beyond the exported jobs, and each board image's `created` time, which is fetched and dropped (`README.md:12-13`; `lib/normalize.js:30-32`).
+- A moodboard picture whose short link no longer works, leads to something other than an HTTPS JPEG, PNG, WebP, GIF or AVIF picture, is flagged by Chrome or takes over 2 minutes; it keeps its `source_url`, its `file` stays null, and the failure names the host when Chrome reported one (`src/service-worker.js:16,21-25,57,83-85`; `src/content.js:90`).
 - Personalization weights and individual ratings; `counts.profileCounts`, fetched but never written; the `*Btrees*` counts, never fetched; and any global profile other than V6, V7, Niji V6 and Niji V7, since only those four count keys are read (`README.md:14`; `src/page-bridge.js:29`; `lib/normalize.js:39`; `docs/ENDPOINTS.md:35`).
 - Likes of other creators' work (`README.md:106`).
 - With a selection, what the designer left out. Only its numbers, and the ids of left-out boards that exported jobs use, are recorded (`export_meta.selection`; `lib/selection.js:128-142`).
