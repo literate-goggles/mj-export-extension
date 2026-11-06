@@ -334,7 +334,16 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
   same views, plus a **Hidden** section on the export's overview that lists
   what is hidden (who hid it and when; a moodboard with how many generations
   went with it), the hidden items' own pages, reached from there or by their
-  links, with a "Hidden from everyone else" banner, and **Show again…**. The
+  links, with a "Hidden from everyone else" banner, and **Show again…**.
+  With `MJV_MEMBERS_HIDE_MOODBOARDS=1`, anyone signed in also sees **Hide…** on
+  the page of every moodboard, in every export. They do not become its
+  managers: the moodboard is then gone for them too, so its page keeps only a
+  banner whose **Show again…** they can use until they leave it; after that,
+  the export's owner and the administrators see it in the **Hidden** section,
+  with who hid it, and can show it again. Their dialog gives no counts, and
+  they can hide moodboards only while the export hides fewer than 900 items,
+  which keeps the last 100 for its owner and the administrators. Generations
+  stay theirs to hide. The
   list belongs to the export's entry in `catalog.json` (see
   [Catalog](#catalog)), so it holds on every instance: the instance that
   changed it applies it before it answers, the others when they next read
@@ -402,6 +411,7 @@ python3 -m mjviewer --hosted   # every setting comes from the environment
 | `MJV_CATALOG_WRITE_URL` | none | Turns deleting and hiding on. The same container as `MJV_CATALOG_URL` (the same scheme, host and path) with a query string of its own that may also write and delete: a SAS whose `sp` contains `w` and `d` and nothing but `r`, `w`, `d` and `l`, such as `sp=rwdl`. https only. It is used only to rewrite `catalog.json` and to delete the ZIPs of deleted exports; everything is still read with `MJV_CATALOG_URL`. Treat it like a password. Without it the viewer never writes to the container and nobody can delete, hide or show again (lists hidden before still apply to everyone). |
 | `MJV_SOFT_DELETE_DAYS` | none | How many days the container keeps a deleted file recoverable (its soft-delete setting), a whole number from 1 to 365. The delete dialog states it. The viewer cannot check it, so set it to what the container really keeps; without it the dialog says that the storage's own settings decide whether a recoverable copy is kept. |
 | `MJV_ADMIN_EMAILS` | none | Administrators: email addresses, separated by commas and/or spaces, who may delete any export, also one without an owner, and hide its generations and moodboards or show them again. Each must be an address at `MJV_ALLOWED_DOMAIN`; they are compared in lower case. They can do so only while deleting is turned on. |
+| `MJV_MEMBERS_HIDE_MOODBOARDS` | 0 | `1`: anyone signed in may hide a moodboard of any export (with its generations), and show again a moodboard they hid (the UI offers that until they leave its page). Only while deleting is turned on. They do not become the export's managers, so they never see what is hidden; its owner and the administrators see who hid it. `0` or unset: only the export's owner and the administrators may hide. |
 | `PORT` | 8000 | Port to listen on; hosted mode binds all interfaces. |
 | `MJV_CACHE_DIR` | `/home/mjv-cache`, else `~/.cache/mj-export-viewer` | Downloaded ZIPs and thumbnails. The first default is used when that folder exists and accepts writes, or when `/home` accepts writes to create it (a shared, persistent mount on some platforms); otherwise the second (under `$XDG_CACHE_HOME` when that is set) is used and the log says so. Whichever folder is used is checked for writes at start and every minute; `/healthz` reports the result as `cache.ok`. |
 | `MJV_CACHE_MAX_GB` | 50 | The cache never grows past this size (in GiB). Before a download, the least recently used ZIPs that no instance used in the last 10 minutes are deleted to make room; when that is not enough, opening fails with "the cache is full" until some of them have not been used for 10 minutes. |

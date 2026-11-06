@@ -52,3 +52,17 @@ Version 0.4.1 was not run against Midjourney: where short links lead, and what t
 There has been no full-history, multi-account, historical/deleted-board, video, or very-large-archive acceptance test. Live rate-limit enforcement and account-ban probability are unknown. A successful small export is neither completeness evidence for every account nor a promise of platform permission.
 
 Run `npm run check` and `npm test`. The standalone `scripts/verify-export.py` checks an existing local export without contacting any service.
+
+## Offline verification — 2026-11-06, hosted viewer: anyone hides moodboards
+
+With `MJV_MEMBERS_HIDE_MOODBOARDS=1`, anyone signed in can hide a moodboard of any published export. The 357 viewer tests passed, the 34 browser tests included (`MJV_E2E=1`, Chromium for Playwright). They cover:
+
+- the setting: `1` or `0`, and no effect while writes are off;
+- someone who manages nothing hiding a moodboard of another person's export, or of an export without an owner: the moodboard and its generations then answer Not found to them as to everyone else, while the export's managers see it, and who hid it;
+- such a person learning nothing about what others hid: hiding a moodboard that is hidden already, their own included, answers like an id the export does not have, and showing again one that someone else hid changes and writes nothing, as for one that is not hidden;
+- who hid it, and whether they manage the export, decided on `catalog.json` as storage holds it, so an instance's older copy never tells anyone what others hid; a moodboard listed twice is theirs to show again only when every item names them;
+- the limit for anyone (900 listed items, saying nothing about them), which keeps the last 100 for the export's managers;
+- generations, which still only the export's owner and the administrators can hide or show again;
+- in Chromium: **Hide…** on a moodboard's page, the dialog's words, the banner that then replaces the page, **Show again…** from it, and the moodboard gone from the person's moodboards once they leave.
+
+An independent review of the change found that a hide answered from an instance's older copy of the catalog could tell someone that a moodboard was hidden already, that the hidden-list limit told them how much was hidden, and that leaving the page while a hide was saved lost the only way back without a word. All three are fixed above; leaving the page now leaves a notice.
