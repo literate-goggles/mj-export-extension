@@ -64,6 +64,7 @@ from .sources import CHUNK_SIZE, SourceError
 CATALOG_NAME = 'catalog.json'
 MAX_CATALOG_BYTES = 16 * 1024 * 1024
 MAX_HIDDEN_ITEMS = 1000  # jobs and moodboards one entry's hidden list may name, together
+MAX_ANYONE_HIDDEN = MAX_HIDDEN_ITEMS - 100  # where hiding by anyone stops: the rest is kept for the export's managers
 MAX_HIDDEN_ID = 200
 MAX_WRITE_BYTES = 12 * 1024 * 1024  # this server never grows catalog.json past this (it reads up to 16 MiB)
 HIDDEN_LISTS = ('jobs', 'moodboards')
@@ -102,6 +103,7 @@ CATALOG_UNAVAILABLE = "The viewer can't reach its list of exports right now. Try
 UNCHANGED = object()  # what a change to catalog.json returns when there is nothing to change: nothing is written
 TOO_MANY_HIDDEN = ('this export already hides %d generations and moodboards, the most it can; show some again first'
                    % MAX_HIDDEN_ITEMS)
+HIDE_LIMIT = 'no more moodboards can be hidden in this export, except by its owner or an administrator'
 UNREADABLE_CHANGE = 'this change would make the export unreadable for the viewer (%s); nothing was changed'
 # How each change written to catalog.json words its errors (Published._rewrite); a delete's are the ones it always had.
 ACTION_WORDS = {
@@ -1701,16 +1703,24 @@ class Published:
             self._follow_hidden()
 
     def change_hidden(self, catalog_id: str, user: str, admin: bool, kind: str, item_id: str, show: bool,
-                      roots: Optional[list], wait_s: float) -> dict:
+                      roots: Optional[list], wait_s: float, member: bool = False) -> dict:
         """Hide one job or moodboard ('job' or 'moodboard') of a published export from everyone but its managers,
-        or (show) show it again, for its owner or an administrator. roots are the full indexes of every root of the
-        ZIP, which count what the list hides; None writes the list without counts (a show again of an export that
-        cannot be opened). The entry is rewritten through _rewrite like a deletion; a request that changes nothing
-        writes nothing. Then this instance serves the new catalog and applies the list before it answers (waiting
-        up to wait_s). Returns {changed, counts}. CatalogError codes: hide_disabled, unknown_catalog_entry,
-        not_owner, too_many_hidden, catalog_busy, storage_error, hide_unconfirmed."""
+        or (show) show it again, for its owner or an administrator. member: a moodboard, which anyone signed in
+        may hide (MJV_MEMBERS_HIDE_MOODBOARDS). Then the owner is not checked, and on catalog.json as storage holds
+        it a user who is neither owner nor administrator acts as anyone: hiding a moodboard listed already (theirs
+        included) answers unknown_moodboard, like an id the export does not have; hiding stops at
+        MAX_ANYONE_HIDDEN items (hide_limit, which counts nothing); showing again changes only a moodboard every
+        item of which names them as hidden_by (else nothing changes, as for one not hidden at all). roots are the
+        full indexes of every root of the ZIP, which count what the list hides; None writes the list without counts
+        (a show again of an export that cannot be opened). The entry is rewritten through _rewrite like a deletion;
+        a request that changes nothing writes nothing. Then this instance serves the new catalog and applies the
+        list before it answers (waiting up to wait_s). Returns {changed, counts}. CatalogError codes:
+        hide_disabled, unknown_catalog_entry, not_owner, unknown_moodboard, too_many_hidden, hide_limit,
+        catalog_busy, storage_error, hide_unconfirmed."""
         if not self.store.writable:
             raise CatalogError('hide_disabled', 'hiding is not turned on for this viewer')
+        if member and kind != 'moodboard':
+            raise CatalogError('not_owner', ACTION_WORDS['hide']['not_owner'])
         name = 'moodboards' if kind == 'moodboard' else 'jobs'
         now = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(self._wall()))
 
@@ -1718,17 +1728,24 @@ class Published:
             return isinstance(item, dict) and item.get('id') == item_id
 
         def change(data: dict, raw_entry: dict, entry: dict):
+            anyone = member and not admin and entry['owner'] != user  # who they are, as storage holds it
             record = raw_entry.get('hidden')
             record = record if isinstance(record, dict) else {}  # the raw record, edited in place: unknown keys stay
             items = record.get(name) or []
             if show:
-                if not any(this(item) for item in items):
+                listed = [item for item in items if this(item)]
+                if not listed or (anyone and any(str(item.get('hidden_by') or '').lower() != user for item in listed)):
                     return UNCHANGED
                 items = [item for item in items if not this(item)]
             else:
                 if any(this(item) for item in items):
+                    if anyone:  # hidden already: to someone who cannot see it, like an id the export does not have
+                        raise CatalogError('unknown_moodboard', 'no moodboard with this id in the export')
                     return UNCHANGED
-                if sum(len(record.get(key) or []) for key in HIDDEN_LISTS) >= MAX_HIDDEN_ITEMS:
+                total = sum(len(record.get(key) or []) for key in HIDDEN_LISTS)
+                if anyone and total >= MAX_ANYONE_HIDDEN:
+                    raise CatalogError('hide_limit', HIDE_LIMIT)
+                if total >= MAX_HIDDEN_ITEMS:
                     raise CatalogError('too_many_hidden', TOO_MANY_HIDDEN)
                 items = items + [{'id': item_id, 'hidden_at': now, 'hidden_by': user}]
             record[name] = items
@@ -1765,7 +1782,8 @@ class Published:
             return any(this(item) and item.get('hidden_at') == now and item.get('hidden_by') == user for item in items)
 
         with self._writes:  # not held while the list is applied below
-            result, body, tag, entry, since = self._rewrite(catalog_id, user, admin, 'hide', change, landed)
+            result, body, tag, entry, since = self._rewrite(catalog_id, user, admin, 'hide', change, landed,
+                                                            member=member)
             if result is not UNCHANGED:
                 what = 'generation' if kind == 'job' else 'moodboard'
                 self._log('%s in %s by %s; hidden now: %s' % (
@@ -1854,7 +1872,8 @@ class Published:
 
     def _rewrite(self, catalog_id: str, user: str, admin: bool, action: str,
                  change: Callable[[dict, dict, dict], object],
-                 landed: Callable[[dict, object], bool]) -> Tuple[object, Optional[bytes], Optional[str], dict, int]:
+                 landed: Callable[[dict, object], bool],
+                 member: bool = False) -> Tuple[object, Optional[bytes], Optional[str], dict, int]:
         """The one way this server writes catalog.json (deleting, hiding and showing again): read it fresh with its
         ETag (never the copy in use), find the entry, check the owner or an administrator on that copy, let change
         edit the raw JSON of that copy in place (every field this server does not know survives), check that every
@@ -1864,7 +1883,9 @@ class Published:
         that got no answer, or a 5xx, may have been stored all the same: catalog.json is read again and
         landed(data, result) tells. Returns (result, body written, its ETag, the entry as read, the catalog's
         generation from before that read, for adopt). action ('delete' or 'hide') words the errors; a delete's are the
-        ones it always had. Called holding _writes, which the caller keeps until it has served what was written."""
+        ones it always had. member (hiding a moodboard as anyone signed in may): the owner is not checked, and change
+        decides what such a user may do. Called holding _writes, which the caller keeps until it has served what was
+        written."""
         words = ACTION_WORDS[action]
         match = EXPORT_ID_RE.fullmatch(catalog_id or '')
         if not match or match.group(2):
@@ -1877,7 +1898,7 @@ class Published:
                 raise CatalogError('unknown_catalog_entry', NOT_LISTED)
             position, entry = found
             owner = entry['owner']
-            if not admin and (owner is None or owner != user):
+            if not admin and not member and (owner is None or owner != user):
                 raise CatalogError('not_owner', words['not_owner'] if owner else words['no_owner'])
             result = change(data, data['exports'][position], entry)
             if result is UNCHANGED:

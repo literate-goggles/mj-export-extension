@@ -107,6 +107,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.cache_max_bytes, 50 * 1024 ** 3)
         self.assertEqual(config.commit, 'unknown')
         self.assertIsNone(config.soft_delete_days)  # the dialog then leaves it to the storage's own settings
+        self.assertIs(config.members_hide_moodboards, False)
         self.assertTrue(config.google_token_url.startswith('https://oauth2.googleapis.com/'))
         # Secrets never show in repr(), and so never in a traceback's message or a log line.
         text = repr(config) + str(config)
@@ -142,6 +143,7 @@ class ConfigTests(unittest.TestCase):
             'MJV_SESSION_DAYS': ['0', '999', 'x'],
             'MJV_CATALOG_TTL_S': ['-1', 'soon'],
             'MJV_SOFT_DELETE_DAYS': ['0', '366', '-7', '7.5', '1e1', 'week'],
+            'MJV_MEMBERS_HIDE_MOODBOARDS': ['yes', 'true', 'on', '2', '01'],
             'MJV_GOOGLE_TOKEN_URL': ['https://oauth2.example.com/token', 'http://10.0.0.1/token'],
         }
         for name, values in cases.items():
@@ -208,6 +210,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(found, ['MJV_ADMIN_EMAILS: entry %d is not an email address at example.com' % n
                                  for n in (2, 3, 4, 5)])
         self.assertFalse(any('mallory' in p or 'not-an-address' in p for p in found))
+
+    def test_anyone_hiding_moodboards_is_a_switch(self):
+        self.assertEqual([load_config(env(MJV_MEMBERS_HIDE_MOODBOARDS=value)).members_hide_moodboards
+                          for value in (None, '', '0', ' 0 ', '1', ' 1 ')], [False, False, False, False, True, True])
 
     def test_numbers_commit_and_test_endpoints(self):
         config = load_config(env(PORT='8080', MJV_CACHE_MAX_GB='0.5', MJV_SESSION_DAYS='7', MJV_CATALOG_TTL_S='0',
@@ -1314,6 +1320,138 @@ class HideRouteTests(unittest.TestCase):
         self.assertEqual((status, answer['catalog']['hidden']), (200, {'jobs': 5, 'moodboards': 1, 'images': 18}))
         self.assertEqual(json.loads(self.answer(base + '/hidden', 'alice')[2])['counts'],
                          {'jobs': 5, 'moodboards': 1, 'images': 18})
+
+
+class MemberHideTests(unittest.TestCase):
+    """With MJV_MEMBERS_HIDE_MOODBOARDS=1, anyone signed in may hide a moodboard of any export and show again a
+    moodboard they hid, and manages nothing. The ZIPs of HideRouteTests: alice@example.com owns the first, the second
+    has no owner; carol@example.com is an administrator; bob@example.com and dave@example.com are anyone."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory(prefix='mjv-members-')
+        cls.blob = FakeBlob(os.path.join(cls._tmp.name, 'blob'))
+        cls.google = FakeGoogle()
+        cls.single = cls.blob.put_export(fx.hiding_zip_bytes(), name='mj_export_hiding.zip', owner='alice@example.com')
+        cls.orphan = cls.blob.put_export(fx.hiding_zip_bytes(root='mj_export_orphan'), name='mj_export_orphan.zip')
+        cls.write_catalog()
+        cls.hosted = Hosted(cls._tmp.name, cls.blob, cls.google, env={
+            'MJV_CATALOG_WRITE_URL': cls.blob.write_url, 'MJV_ADMIN_EMAILS': 'carol@example.com',
+            'MJV_MEMBERS_HIDE_MOODBOARDS': '1'})
+        cls.sessions = {name: cls.hosted.session('%s@example.com' % name) for name in ('alice', 'bob', 'carol', 'dave')}
+        for entry in (cls.single, cls.orphan):
+            cls.hosted.post('/api/catalog/%s/open' % entry['id'], cls.sessions['alice'])
+            deadline = time.time() + 30
+            while json.loads(cls.hosted.get('/api/catalog/%s' % entry['id'], cls.sessions['alice'])[2])['state'] != 'ready':
+                assert time.time() < deadline, 'not ready'
+                time.sleep(0.05)
+
+    @classmethod
+    def write_catalog(cls):
+        record = {'moodboards': [{'id': 'board-zq', 'hidden_at': '2026-11-03T10:20:00Z', 'hidden_by': 'carol@example.com'}]}
+        cls.blob.write_catalog([dict(entry, hidden=record) for entry in (cls.single, cls.orphan)])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.hosted.stop()
+        cls.blob.stop()
+        cls.google.stop()
+        cls._tmp.cleanup()
+
+    def setUp(self):
+        self.write_catalog()
+
+    def answer(self, path, who):
+        return self.hosted.get(path, self.sessions[who])
+
+    def change(self, who, entry, kind, item_id, show=False):
+        status, _, raw = self.hosted.post('/api/catalog/%s/%s' % (entry['id'], 'unhide' if show else 'hide'),
+                                          self.sessions[who], body=json.dumps({'kind': kind, 'id': item_id}).encode())
+        return status, json.loads(raw)
+
+    def board(self, who, board_id='board-1', entry=None):
+        return self.answer('/api/exports/%s/moodboards/%s' % ((entry or self.single)['id'], board_id), who)[0]
+
+    def puts(self):
+        return self.blob.count('catalog.json', method='PUT')
+
+    def test_anyone_may_hide_moodboards_and_manages_nothing(self):
+        for who, rights in (('alice', (True, True, True, True)), ('carol', (True, True, True, True)),
+                            ('bob', (False, False, True, False))):
+            items = json.loads(self.answer('/api/exports', who)[2])['catalog']['items']
+            item = next(i for i in items if i['id'] == self.single['id'])
+            self.assertEqual((item['can_hide'], item['can_delete'], item['can_hide_moodboards'], 'hidden' in item),
+                             rights, who)
+        health = json.loads(self.answer('/api/health', 'bob')[2])
+        self.assertEqual((health['hide_enabled'], health['members_hide_moodboards']), (True, True))
+        # bob browses as everyone else does: no Hidden listing, nothing only managers get, hidden items unknown.
+        status, _, raw = self.answer('/api/exports/%s/hidden' % self.single['id'], 'bob')
+        self.assertEqual((status, json.loads(raw)['error']['code']), (403, 'not_owner'))
+        status, _, raw = self.answer('/api/exports/%s/moodboards/board-1' % self.single['id'], 'bob')
+        self.assertEqual(status, 200)
+        self.assertFalse({'hidden', 'hide_preview'} & json_keys(json.loads(raw)))
+        self.assertEqual(self.board('bob', 'board-zq'), 404)
+        # Writes off: the switch alone lets nobody hide anything.
+        other = Hosted(self._tmp.name, self.blob, self.google, env={
+            'MJV_MEMBERS_HIDE_MOODBOARDS': '1', 'MJV_CACHE_DIR': os.path.join(self._tmp.name, 'off')})
+        self.addCleanup(other.stop)
+        bob = other.session('bob@example.com')
+        self.assertIs(json.loads(other.get('/api/health', bob)[2])['members_hide_moodboards'], False)
+        items = json.loads(other.get('/api/exports', bob)[2])['catalog']['items']
+        self.assertEqual({i['can_hide_moodboards'] for i in items}, {False})
+
+    def test_a_member_hides_a_moodboard_from_everyone_and_shows_again_only_their_own(self):
+        status, answer = self.change('bob', self.single, 'moodboard', 'board-1')
+        self.assertEqual((status, answer['changed']), (200, True))
+        self.assertEqual((answer['catalog']['can_hide'], 'hidden' in answer['catalog']), (False, False))
+        stored = next(e for e in self.blob.read_json('catalog.json')['exports'] if e['id'] == self.single['id'])
+        self.assertEqual([(item['id'], item['hidden_by']) for item in stored['hidden']['moodboards']],
+                         [('board-zq', 'carol@example.com'), ('board-1', 'bob@example.com')])
+        self.assertIn('hid a moodboard in %s by bob@example.com' % self.single['id'], self.hosted.log.getvalue())
+        # Gone for him too, and for anyone else; its managers see it, and who hid it.
+        self.assertEqual([self.board(who) for who in ('bob', 'dave', 'alice', 'carol')], [404, 404, 200, 200])
+        note = json.loads(self.answer('/api/exports/%s/moodboards/board-1' % self.single['id'], 'alice')[2])['hidden']
+        self.assertEqual(note['hidden_by'], 'bob@example.com')
+        listing = json.loads(self.answer('/api/exports/%s/hidden' % self.single['id'], 'alice')[2])
+        self.assertEqual([(row['id'], row['hidden_by']) for row in listing['moodboards']],
+                         [('board-1', 'bob@example.com'), ('board-zq', 'carol@example.com')])
+        # Nobody else may show it again, and he may not show again what someone else hid: nothing is written, as
+        # for a moodboard that is not hidden at all.
+        writes = self.puts()
+        for who, board_id in (('dave', 'board-1'), ('bob', 'board-zq')):
+            with self.subTest(who=who, board=board_id):
+                status, answer = self.change(who, self.single, 'moodboard', board_id, show=True)
+                self.assertEqual((status, answer['changed'], 'hidden' in answer['catalog']), (200, False, False))
+        self.assertEqual([self.board(who) for who in ('bob', 'dave')], [404, 404])
+        self.assertEqual(self.board('bob', 'board-zq'), 404)
+        # Hiding what is hidden already, his own included, answers like a moodboard the export does not have.
+        invented = self.change('bob', self.single, 'moodboard', 'board-invented')
+        self.assertEqual(invented, (404, {'error': {'code': 'unknown_moodboard',
+                                                    'message': 'no moodboard with this id in the export'}}))
+        for board_id in ('board-zq', 'board-1'):
+            self.assertEqual(self.change('bob', self.single, 'moodboard', board_id), invented, board_id)
+        self.assertEqual(self.puts(), writes)
+        # He shows his own again: everyone sees it again.
+        status, answer = self.change('bob', self.single, 'moodboard', 'board-1', show=True)
+        self.assertEqual((status, answer['changed']), (200, True))
+        self.assertEqual([self.board(who) for who in ('bob', 'dave')], [200, 200])
+        self.assertIn('showed a moodboard again in %s by bob@example.com' % self.single['id'], self.hosted.log.getvalue())
+
+    def test_members_may_not_hide_or_show_generations(self):
+        writes = self.puts()
+        for show, job_id in ((False, 'job-grid-a'), (True, 'job-zq-exp')):
+            with self.subTest(show=show):
+                self.assertEqual(self.change('bob', self.single, 'job', job_id, show), (403, {'error': {
+                    'code': 'not_owner',
+                    'message': 'only the owner of this export or an administrator can hide or show its generations'}}))
+        self.assertEqual(self.puts(), writes)
+        self.assertEqual(self.answer('/api/exports/%s/jobs/job-grid-a' % self.single['id'], 'dave')[0], 200)
+
+    def test_members_may_hide_moodboards_of_an_export_without_an_owner(self):
+        status, answer = self.change('dave', self.orphan, 'moodboard', 'board-1')
+        self.assertEqual((status, answer['changed']), (200, True))
+        self.assertEqual(self.board('bob', entry=self.orphan), 404)
+        self.assertEqual(self.board('carol', entry=self.orphan), 200)
 
 
 class CacheCheckTests(unittest.TestCase):

@@ -1865,6 +1865,71 @@ class HideFlowTests(FlowTestCase):
         self.assertEqual(self.change(hosted, session, mine, 'job', 'job-in-no-root', show=True)[1]['changed'], True)
         self.assertIsNone(self.record())
 
+    def test_a_member_hides_a_moodboard_and_shows_again_only_what_storage_says_they_hid(self):
+        mine = dict(self.publish(), hidden=hidden_record(boards=['board-zq']))  # hidden by alice
+        self.blob.write_catalog([mine])
+        hosted, session = self.start(MJV_MEMBERS_HIDE_MOODBOARDS='1')
+        self.ready(hosted, session, mine)
+        bob = self.bob(hosted)
+        # The owner is never checked for a member's moodboard, on catalog.json as storage holds it either.
+        status, answer = self.change(hosted, bob, mine, 'moodboard', 'board-1')
+        self.assertEqual((status, answer['changed']), (200, True))
+        self.assertEqual([(item['id'], item['hidden_by']) for item in self.record()['moodboards']],
+                         [('board-zq', 'alice@example.com'), ('board-1', 'bob@example.com')])
+        self.assertEqual(self.code(hosted, bob, '/api/exports/%s/moodboards/board-1' % mine['id']),
+                         (404, 'unknown_moodboard'))
+        # Showing again: only a moodboard the stored list says he hid, whatever the copy in use says.
+        writes = self.puts()
+        self.assertEqual(self.change(hosted, bob, mine, 'moodboard', 'board-zq', show=True)[1]['changed'], False)
+        self.blob.write_catalog([dict(mine, hidden=hidden_record(boards=['board-zq', 'board-1']))])  # now alice's
+        self.assertEqual(self.change(hosted, bob, mine, 'moodboard', 'board-1', show=True)[1]['changed'], False)
+        self.assertEqual(self.puts(), writes)
+        stored = self.record()
+        stored['moodboards'][1]['hidden_by'] = 'BOB@example.com'  # compared as an address: in lower case
+        self.blob.write_catalog([dict(mine, hidden=stored)])
+        self.assertEqual(self.change(hosted, bob, mine, 'moodboard', 'board-1', show=True)[1]['changed'], True)
+        self.assertEqual([item['id'] for item in self.record()['moodboards']], ['board-zq'])
+        self.assertEqual(self.code(hosted, bob, '/api/exports/%s/moodboards/board-1' % mine['id']), (200, None))
+        # A generation is never a member's to hide, also when asked of the catalog directly.
+        with self.assertRaises(CatalogError) as caught:
+            hosted.app.published.change_hidden(mine['id'], 'bob@example.com', False, 'job', 'job-grid-a', False, None,
+                                               1.0, member=True)
+        self.assertEqual(caught.exception.code, 'not_owner')
+        self.assertEqual(self.puts(), writes + 1)
+
+    def test_a_member_learns_nothing_from_a_stale_copy_and_leaves_room_for_managers(self):
+        mine = self.publish()
+        self.blob.write_catalog([mine])
+        hosted, session = self.start(MJV_MEMBERS_HIDE_MOODBOARDS='1', MJV_CATALOG_TTL_S='3600')
+        self.ready(hosted, session, mine)
+        bob = self.bob(hosted)
+        invented = self.change(hosted, bob, mine, 'moodboard', 'board-invented')
+        self.assertEqual(invented, (404, {'error': {'code': 'unknown_moodboard',
+                                                    'message': 'no moodboard with this id in the export'}}))
+        # alice hid board-zq through another instance, and this one has not read catalog.json since: what storage
+        # holds decides, and answers like an id the export does not have.
+        self.blob.write_catalog([dict(mine, hidden=hidden_record(boards=['board-zq']))])
+        writes = self.puts()
+        self.assertEqual(self.change(hosted, bob, mine, 'moodboard', 'board-zq'), invented)
+        self.assertEqual(self.puts(), writes)
+        # A moodboard listed twice is his to show again only when every item names him.
+        record = hidden_record(boards=['board-1'])
+        record['moodboards'] = [dict(record['moodboards'][0], hidden_by='bob@example.com'), record['moodboards'][0]]
+        self.blob.write_catalog([dict(mine, hidden=record)])
+        self.assertEqual(self.change(hosted, bob, mine, 'moodboard', 'board-1', show=True)[1]['changed'], False)
+        self.assertEqual(self.puts(), writes)
+        # Anyone stops at 900 items, saying nothing about them; the last 100 are kept for the export's managers.
+        # (board-2: this instance still serves the copy it read above, in which board-1 is hidden.)
+        self.blob.write_catalog([dict(mine, hidden=hidden_record(jobs=['job-x%03d' % n for n in range(900)]))])
+        status, answer = self.change(hosted, bob, mine, 'moodboard', 'board-2')
+        self.assertEqual((status, answer['error']), (409, {
+            'code': 'hide_limit',
+            'message': 'no more moodboards can be hidden in this export, except by its owner or an administrator'}))
+        self.assertEqual(self.puts(), writes)
+        status, answer = self.change(hosted, session, mine, 'moodboard', 'board-2')  # alice, its owner
+        self.assertEqual((status, answer['changed']), (200, True))
+        self.assertEqual(len(self.record()['jobs']) + len(self.record()['moodboards']), 901)
+
     def test_null_lists_are_written_like_empty_ones(self):
         mine = dict(self.publish(), hidden={'jobs': None, 'moodboards': None, 'counts': None})
         self.blob.write_catalog([mine])

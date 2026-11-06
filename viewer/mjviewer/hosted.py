@@ -24,6 +24,11 @@ python3 -m mjviewer --hosted takes its whole configuration from the environment
   choke point (HostedHandler._export_or_404), which serves everyone but the
   export's managers an index built without what is hidden; the list applies
   whether or not this instance can write.
+* With MJV_MEMBERS_HIDE_MOODBOARDS=1 as well, anyone signed in can hide a
+  moodboard of any export, with its generations, and show again a moodboard
+  they hid themselves. That does not make them its managers: they see what
+  everyone else sees, so what they hid is gone for them too, and their hides
+  answer them as if what anyone else hid were not in the export.
 
 The OAuth client secret, the signing secret and the storage query strings are
 held as Secret values: they never appear in a log line, a page or a response.
@@ -76,10 +81,11 @@ DELETE_STATUS = {'delete_disabled': 403, 'not_owner': 403, 'unknown_catalog_entr
 # back to (or keeps running) an image that would show every hidden item to everyone.
 FEATURES = ('hide', 'hide_short_links')
 HIDE_STATUS = {'hide_disabled': 403, 'not_owner': 403, 'unknown_catalog_entry': 404, 'unknown_job': 404,
-               'unknown_moodboard': 404, 'catalog_busy': 409, 'too_many_hidden': 409, 'storage_error': 502,
-               'hide_unconfirmed': 502}
+               'unknown_moodboard': 404, 'catalog_busy': 409, 'too_many_hidden': 409, 'hide_limit': 409,
+               'storage_error': 502, 'hide_unconfirmed': 502}
 HIDE_EXAMPLE = '{"kind": "job", "id": "<job id>"}'
 HIDE_DISABLED = 'hiding is not turned on for this viewer'
+JOBS_NOT_OWNER = 'only the owner of this export or an administrator can hide or show its generations'
 SEE_HIDDEN = ('only the owner of this export or an administrator can see what is hidden in it',
               'this export has no owner recorded, so only an administrator can see what is hidden in it')
 NOT_READY = 'this export is not open yet; open it from the start page'
@@ -140,6 +146,7 @@ class HostedConfig:
     catalog_write_url: Optional[Secret] = None  # None: deleting is turned off
     admin_emails: frozenset = frozenset()
     soft_delete_days: Optional[int] = None  # how long the storage keeps a deleted file recoverable, when stated
+    members_hide_moodboards: bool = False  # MJV_MEMBERS_HIDE_MOODBOARDS=1: anyone signed in may hide a moodboard
 
     @property
     def redirect_uri(self) -> str:
@@ -321,6 +328,9 @@ def load_config(env: Mapping[str, str], cache_base: str = '/home') -> HostedConf
     days = _number(env, 'MJV_SESSION_DAYS', 30, 0.01, 366, problems)
     ttl = _number(env, 'MJV_CATALOG_TTL_S', 60, 0, 86400, problems)
     soft_days = _number(env, 'MJV_SOFT_DELETE_DAYS', None, 1, 365, problems, integer=True)
+    members = (env.get('MJV_MEMBERS_HIDE_MOODBOARDS') or '').strip()
+    if members not in ('', '0', '1'):
+        problems.append('MJV_MEMBERS_HIDE_MOODBOARDS must be 1 (on) or 0 (off)')
     commit = (env.get('MJV_COMMIT') or '').strip()
     commit = commit if _COMMIT_RE.fullmatch(commit) else 'unknown'
     google = {}
@@ -340,7 +350,7 @@ def load_config(env: Mapping[str, str], cache_base: str = '/home') -> HostedConf
                         cache_dir=cache_dir, cache_warning=warning, port=port,
                         cache_max_bytes=int(max_gb * 1024 ** 3), session_days=days, catalog_ttl_s=ttl,
                         commit=commit, catalog_write_url=Secret(write) if write else None, admin_emails=admins,
-                        soft_delete_days=soft_days, **google)
+                        soft_delete_days=soft_days, members_hide_moodboards=members == '1', **google)
 
 
 # ----------------------------------------------------------------- signing
@@ -802,7 +812,8 @@ class HostedHandler(Handler):
                                     'mode': 'hosted', 'user': self.user, 'delete_enabled': self.app.delete_enabled,
                                     'can_delete_any': self.app.delete_enabled and self._admin(),
                                     'soft_delete_days': self.config.soft_delete_days,
-                                    'hide_enabled': self.app.hide_enabled})
+                                    'hide_enabled': self.app.hide_enabled,
+                                    'members_hide_moodboards': self.app.members_hide_moodboards})
         if parts == ['exports']:
             if method != 'GET':
                 return self._method_not_allowed()
@@ -862,8 +873,9 @@ class HostedHandler(Handler):
 
     def _hide(self, catalog_id: str, show: bool) -> None:
         """POST /api/catalog/<id>/hide (or /unhide, show) with {"kind": "job" | "moodboard", "id": "..."}: for the
-        export's owner or an administrator. Hiding needs the export open here (it counts what the list hides);
-        showing again does not, so a broken export never keeps an item hidden."""
+        export's owner or an administrator; with MJV_MEMBERS_HIDE_MOODBOARDS=1, a moodboard for anyone signed in
+        too, who may show again only a moodboard they hid. Hiding needs the export open here (it counts what the
+        list hides); showing again does not, so a broken export never keeps an item hidden."""
         if not self.app.hide_enabled:
             return self._error(403, 'hide_disabled', HIDE_DISABLED)
         body = self._body_object(HIDE_EXAMPLE, required=True)
@@ -876,21 +888,27 @@ class HostedHandler(Handler):
         entry = self.app.published.entry(catalog_id) if match and not match.group(2) else None
         if entry is None:
             return self._hide_refused(catalog_id, show, 'unknown_catalog_entry', NOT_LISTED)
-        if not self._manages(entry['owner']):  # checked again on catalog.json as storage holds it
+        manages = self._manages(entry['owner'])
+        anyone = kind == 'moodboard' and self.app.members_hide_moodboards  # who acts as anyone: decided in storage
+        if not manages and not anyone:  # checked again on catalog.json as storage holds it
             words = ACTION_WORDS['hide']
-            return self._hide_refused(catalog_id, show, 'not_owner',
-                                      words['not_owner'] if entry['owner'] else words['no_owner'])
+            return self._hide_refused(catalog_id, show, 'not_owner', JOBS_NOT_OWNER if self.app.members_hide_moodboards
+                                      else words['not_owner'] if entry['owner'] else words['no_owner'])
         roots, item = self.app.published.full_indexes(catalog_id, RESOLVE_WAIT_S)
         if roots is None and not show:
             if item is None:
                 return self._hide_refused(catalog_id, show, 'unknown_catalog_entry', NOT_LISTED)
             return self._json(409, {'error': {'code': 'export_not_ready', 'message': NOT_READY},
                                     'catalog': self._for_user(item)})
-        if not show and not any(item_id in (index.jobs if kind == 'job' else index.boards) for index in roots):
+        unknown = not show and not any(item_id in (index.jobs if kind == 'job' else index.boards) for index in roots)
+        if not manages and not show and not unknown:  # hidden already: to someone who cannot see it, like an unknown id
+            record = (self.app.published.catalog.peek(entry['id']) or entry)['hidden']
+            unknown = bool(record) and item_id in record['moodboards']
+        if unknown:
             return self._hide_refused(catalog_id, show, 'unknown_%s' % kind, 'no %s with this id in the export' % kind)
         try:
             result = self.app.published.change_hidden(catalog_id, self.user, self._admin(), kind, item_id, show,
-                                                      roots, RESOLVE_WAIT_S)
+                                                      roots, RESOLVE_WAIT_S, member=anyone)
         except CatalogError as exc:
             code = exc.code if exc.code in HIDE_STATUS else 'storage_error'
             return self._hide_refused(catalog_id, show, code, self.app.store.scrub(exc.message))
@@ -941,11 +959,13 @@ class HostedHandler(Handler):
         return self.app.hide_enabled and (self._admin() or (owner is not None and owner == self.user))
 
     def _for_user(self, item: dict) -> dict:
-        """A catalog item, plus whether the signed-in user may delete it and hide in it. Its managers also get
-        what it hides (counts, null while not counted) while it hides something; everyone else never learns
-        whether it does, and sees a failure to apply its list as a plain failure to prepare it."""
+        """A catalog item, plus whether the signed-in user may delete it, hide in it, and hide its moodboards (its
+        managers, or anyone while MJV_MEMBERS_HIDE_MOODBOARDS is on). Its managers also get what it hides (counts,
+        null while not counted) while it hides something; everyone else never learns whether it does, and sees a
+        failure to apply its list as a plain failure to prepare it."""
         manages = self._manages(item.get('owner'))
-        out = dict(item, can_delete=manages, can_hide=manages)
+        out = dict(item, can_delete=manages, can_hide=manages,
+                   can_hide_moodboards=manages or self.app.members_hide_moodboards)
         if manages:
             hidden = self.app.published.hidden_counts(item['id'])
             if hidden is not None:
@@ -1077,6 +1097,12 @@ class HostedApp(ViewerApp):
         """The same switch: owners and administrators can hide generations and moodboards and show them again.
         Without it nobody can, but hidden lists still apply to everyone."""
         return self.store.writable
+
+    @property
+    def members_hide_moodboards(self) -> bool:
+        """Hiding is on and MJV_MEMBERS_HIDE_MOODBOARDS=1: anyone signed in can hide a moodboard of any export, and
+        show again a moodboard they hid."""
+        return self.hide_enabled and self.config.members_hide_moodboards
 
     def check_cache(self) -> bool:
         """Whether downloads and thumbnails can be written (/healthz reports it)."""
