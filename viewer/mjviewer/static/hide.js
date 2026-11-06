@@ -5,7 +5,11 @@
 // detail of an item carries hide_preview (a visible item) or hidden (a hidden
 // one) for its managers only. This module asks first, in plain words, and draws
 // what managers see: the Hide… button, the banner on a hidden item's page and
-// the Hidden section of the overview. Local mode shows none of it.
+// the Hidden section of the overview. When the viewer lets anyone hide
+// moodboards, a catalog item has can_hide_moodboards for everyone: then anyone
+// else gets Hide… on a moodboard's page too, and a banner to show it again
+// while they stay there (they no longer see it, so they have no other way).
+// Local mode shows none of it.
 
 import {h, icon, fill, nextId} from './dom.js';
 import {hrefs} from './router.js';
@@ -18,6 +22,8 @@ import {confirmAction} from './confirm.js';
 
 const PROMPT_CHARS = 120;
 const STAYS_STORED = "It stays in the stored export, and the owner or an administrator can show it again from the export's overview.";
+const STAYS_STORED_MEMBER = 'It stays in the stored export. If you hide it by mistake, show it again from this page before '
+  + "you leave it; after that, only the export's owner or an administrator can.";
 const BROWSER_CACHE = 'Browsers that already showed its pictures may keep them for up to 10 minutes.';
 const MANAGERS_ONLY = "Only the export's owner and the viewer's administrators can see";
 const NOT_RECORDED = 'Who hid it and when were not recorded.';
@@ -32,6 +38,14 @@ export function canHide(exportId) {
 }
 
 /**
+ * True when the signed-in user may hide this published export's moodboards: its managers, or anyone when the viewer
+ * lets anyone.
+ */
+export function canHideMoodboards(exportId) {
+  return hosted && obj(catalogItemOf(exportId)).can_hide_moodboards === true;
+}
+
+/**
  * How the server answered an item's detail: 'visible' (a manager's view of an item everyone sees, with
  * hide_preview), 'hidden' (a manager's view of a hidden item, with hidden), or null (everyone else, local mode).
  */
@@ -43,19 +57,23 @@ export function managerView(data) {
   return null;
 }
 
-/** The Hide… button of a generation's or a moodboard's page. */
-export function hideButton(kind, onclick) {
-  const label = `Hide this ${kind === 'job' ? 'generation' : 'moodboard'} from everyone else`;
+/**
+ * The Hide… button of a generation's or a moodboard's page; member: for someone who does not manage the export, who
+ * will not see it either.
+ */
+export function hideButton(kind, onclick, {member = false} = {}) {
+  const label = `Hide this ${kind === 'job' ? 'generation' : 'moodboard'} from everyone${member ? '' : ' else'}`;
   return h('button', {type: 'button', class: 'btn btn--ghost hide-btn', 'aria-label': label, title: label, onclick},
     icon('eye-off', {size: 15}), 'Hide…');
 }
 
 /**
  * Run a hide or show-again dialog (open() resolves true once the change is made); then, while the view that
- * opened it is still there, announce said and run then() (draw the view anew). A failure after the dialog was
- * gone is said on the page. action: 'hide' or 'show'.
+ * opened it is still there, announce said and run then() (draw the view anew), else run away() when given (the
+ * view was left before the change was made). A failure after the dialog was gone is said on the page. action:
+ * 'hide' or 'show'.
  */
-export async function runChange(ctx, open, action, said, then) {
+export async function runChange(ctx, open, action, said, then, away = null) {
   let done;
   try {
     done = await open();
@@ -63,7 +81,11 @@ export async function runChange(ctx, open, action, said, then) {
     pageNotice(hideFailure(err, action));
     return;
   }
-  if (!done || !ctx.isActive()) return;
+  if (!done) return;
+  if (!ctx.isActive()) {
+    if (away) away();
+    return;
+  }
   announce(said);
   then();
 }
@@ -82,6 +104,7 @@ export function hideFailure(err, action) {
       unknown_job: 'This generation is not in this export.',
       unknown_moodboard: 'This moodboard is not in this export.',
       too_many_hidden: 'This export already hides 1,000 generations and moodboards, the most it can. Show some again first.',
+      hide_limit: 'No more moodboards can be hidden in this export, except by its owner or an administrator.',
       export_not_ready: 'The export is still opening on the server. Try again in a moment.',
     },
     otherwise: show ? 'Could not show this again. Reload the page and try again.'
@@ -131,10 +154,11 @@ function madeFromSentence(n, from) {
 
 /**
  * Ask before hiding a visible generation (kind 'job') or moodboard, with the numbers of its detail's hide_preview,
- * and hide it on confirm. Resolves true when it was hidden, false when cancelled; rejects only when hiding failed
+ * and hide it on confirm. member: a moodboard, for someone who does not manage the export (no hide_preview), who
+ * will not see it either. Resolves true when it was hidden, false when cancelled; rejects only when hiding failed
  * after the dialog was gone (say so on the page).
  */
-export function confirmHide({exportId, kind, id, data}) {
+export function confirmHide({exportId, kind, id, data, member = false}) {
   const d = obj(data);
   const preview = obj(d.hide_preview);
   const job = kind === 'job';
@@ -150,13 +174,16 @@ export function confirmHide({exportId, kind, id, data}) {
       : n > 0 ? `, its reference images or ${n === 1 ? 'the 1 generation' : `the ${fmtInt(n)} generations`} made with it`
         : ' or its reference images';
     factRows = [['Moodboard', boardName(d.moodboard)], ['Reference images', fmtInt(arr(d.references).length)]];
-    lead = `In this viewer, nobody else will see the moodboard${made}.`;
+    lead = member
+      ? `In this viewer, nobody will see the moodboard${made} any more, you included. `
+        + "The export's owner and the viewer's administrators still will."
+      : `In this viewer, nobody else will see the moodboard${made}.`;
   }
   const count = job ? madeFromSentence(preview.made_from_it, 'it') : madeFromSentence(preview.made_from_them, 'those');
   return confirmAction({
     title: job ? 'Hide this generation?' : 'Hide this moodboard?',
-    body: [facts(factRows), h('p', null, lead), count ? h('p', null, count) : null, h('p', null, STAYS_STORED),
-      h('p', null, BROWSER_CACHE)],
+    body: [facts(factRows), h('p', null, lead), count ? h('p', null, count) : null,
+      h('p', null, member ? STAYS_STORED_MEMBER : STAYS_STORED), h('p', null, BROWSER_CACHE)],
     confirmLabel: job ? 'Hide generation' : 'Hide moodboard',
     busyLabel: 'Hiding…',
     tone: 'primary',
@@ -223,6 +250,25 @@ export function confirmShow({exportId, kind, id, name, notHere = false, generati
     action: () => setHidden(exportId, kind, id, false),
     returnFocus,
   });
+}
+
+/**
+ * What a moodboard's page keeps once someone who does not manage the export hid it: they no longer see it, so only
+ * this banner can show it again, and only until they leave the page. Returns {el, heading}; the heading takes focus.
+ */
+export function memberHiddenBanner({onShow}) {
+  const headingId = nextId('hidden-banner');
+  const heading = h('h2', {class: 'hidden-banner__title', id: headingId, tabindex: '-1'}, 'You hid this moodboard');
+  const el = h('section', {class: 'callout callout--info hidden-banner', 'aria-labelledby': headingId},
+    icon('eye-off', {size: 18}),
+    h('div', {class: 'callout__body'},
+      heading,
+      h('p', {class: 'hidden-banner__text'}, "Nobody sees it or the generations made with it any more, except the "
+        + "export's owner and the viewer's administrators. If you hid it by mistake, show it again now: once you "
+        + 'leave this page, only they can.'),
+      h('div', {class: 'hidden-banner__actions'},
+        h('button', {type: 'button', class: 'btn btn--sm', onclick: onShow}, icon('eye', {size: 14}), 'Show again…'))));
+  return {el, heading};
 }
 
 // --- Who hid it -----------------------------------------------------------------------

@@ -9,11 +9,13 @@ import {getJSON, paths, isAbort, ApiError} from './api.js';
 import {arr, str, obj, isNum, fmtInt, linkInfo, plural, recordedDate, isNaiveDate} from './format.js';
 import {
   pageHead, section, linkChip, badge, timeEl, copyButton, idValue, imageEl, placeholder, jobCard, gridItem, rawBlock,
-  callout, emptyState, errorState, loadingState, safeFileUrl,
+  callout, emptyState, errorState, loadingState, safeFileUrl, pageNotice,
 } from './ui.js';
 import {openLightbox} from './lightbox.js';
 import {closeConfirm} from './confirm.js';
-import {managerView, hideButton, hiddenBanner, confirmHide, confirmShow, runChange} from './hide.js';
+import {
+  managerView, canHideMoodboards, hideButton, hiddenBanner, memberHiddenBanner, confirmHide, confirmShow, runChange,
+} from './hide.js';
 
 const LINK_ORDER = ['exporter', 'derived', 'inferred_code'];
 // generated_left_out is one number for both causes: generations left out, and generations made after choosing.
@@ -154,6 +156,29 @@ export function renderMoodboard(root, route, ctx) {
       'Hidden from everyone else', () => load({quiet: true, focus: 'banner'}));
   }
 
+  // Someone who does not manage the export but may hide its moodboards (anyone, when the viewer lets anyone): after
+  // a hide the board is gone for them too, so the page keeps only a banner whose Show again… they lose once they
+  // leave; after a show again it is drawn as everyone sees it.
+  function hideAsMember(data) {
+    const name = str(obj(data.moodboard).name) || 'Untitled moodboard';
+    runChange(ctx, () => confirmHide({exportId, kind: 'moodboard', id: boardId, data, member: true}), 'hide',
+      'Hidden from everyone', () => hiddenByYou(name),
+      () => pageNotice(`You hid the moodboard ${name} after leaving its page, so only the export's owner or an `
+        + 'administrator can show it again now.'));
+  }
+
+  function hiddenByYou(name) {
+    setActions([]);
+    banner = memberHiddenBanner({onShow: () => showAsMember(name)});
+    fill(body, banner.el);
+    banner.heading.focus();
+  }
+
+  function showAsMember(name) {
+    runChange(ctx, () => confirmShow({exportId, kind: 'moodboard', id: boardId, name}), 'show',
+      'Shown to everyone again', () => load({quiet: true, focus: 'heading'}));
+  }
+
   function show(data) {
     const note = obj(data.hidden);
     runChange(ctx, () => confirmShow({exportId, kind: 'moodboard', id: boardId,
@@ -182,13 +207,16 @@ export function renderMoodboard(root, route, ctx) {
     const oldSub = textBox.querySelector('.page-sub');
     if (oldSub) oldSub.replaceWith(subItems);
     else textBox.append(subItems);
-    // Hosted mode, the export's managers only: Hide… on a board everyone sees, the banner on a hidden one. The
-    // gallery is what everyone sees, so a hidden board has nothing to show there.
+    // Hosted mode: the export's managers get Hide… on a board everyone sees and the banner on a hidden one; anyone
+    // else gets Hide… too when the viewer lets anyone hide moodboards. The gallery is what everyone sees, so a
+    // hidden board has nothing to show there.
     const managed = managerView(data);
+    const asMember = !managed && canHideMoodboards(exportId);
     setActions([
       managed === 'hidden' ? null
         : h('a', {class: 'btn', href: hrefs.gallery(exportId, {moodboard: board.id || boardId})}, icon('grid', {size: 15}), 'Show in gallery'),
-      managed === 'visible' ? hideButton('moodboard', () => hide(data)) : null,
+      managed === 'visible' ? hideButton('moodboard', () => hide(data))
+        : asMember ? hideButton('moodboard', () => hideAsMember(data), {member: true}) : null,
     ].filter(Boolean));
     banner = managed === 'hidden' ? hiddenBanner({kind: 'moodboard', data, onShow: () => show(data)}) : null;
 

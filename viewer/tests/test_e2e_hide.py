@@ -634,6 +634,62 @@ class HideBrowserTests(_BrowserCase):
                 self.open_job(page, 'job-zq-solo')
                 self.assert_not_found(page)
 
+    def test_anyone_hides_a_moodboard_and_can_show_it_again_only_from_its_page(self):
+        """With MJV_MEMBERS_HIDE_MOODBOARDS=1, bob (who does not manage alice's export) hides one of its moodboards:
+        it is gone for him too, so its page keeps only a banner to show it again; once he leaves, its managers can."""
+        members = Hosted(self._tmp.name, self.blob, self.google, env={
+            'MJV_CATALOG_WRITE_URL': self.blob.write_url, 'MJV_ADMIN_EMAILS': CAROL, 'MJV_MEMBERS_HIDE_MOODBOARDS': '1',
+            'MJV_CACHE_DIR': os.path.join(self._tmp.name, 'cache-members')})
+        self.addCleanup(members.stop)
+        bob = self.sign_in(BOB, hosted=members)
+        self.assertEqual(self.card(bob, self.mine).locator('.xcard__hidden, .xcard__delete').count(), 0)
+        self.open_job(bob, 'job-grid-a')
+        self.assertEqual(bob.locator('.hide-btn, .hidden-banner').count(), 0)  # a generation is not his to hide
+        self.open_board(bob, 'board-zq')
+        button = bob.locator('.page-head__actions .hide-btn')
+        self.assertEqual(button.get_attribute('aria-label'), 'Hide this moodboard from everyone')
+        button.click()
+        self.dialog(bob).wait_for(timeout=15000)
+        text = self.dialog(bob).inner_text()
+        for part in ('Hide this moodboard?', 'Zqboard',
+                     'In this viewer, nobody will see the moodboard, its reference images or the generations made with '
+                     "it any more, you included. The export's owner and the viewer's administrators still will.",
+                     'It stays in the stored export. If you hide it by mistake, show it again from this page before you '
+                     "leave it; after that, only the export's owner or an administrator can.", CACHE):
+            self.assertIn(part, text)
+        self.dialog(bob).locator('button', has_text='Hide moodboard').click()
+        banner = bob.locator('.hidden-banner')
+        banner.wait_for(timeout=30000)
+        self.wait_focus(bob, '.hidden-banner__title')
+        self.wait_announced(bob, 'Hidden from everyone')
+        self.assertEqual(banner.locator('.hidden-banner__title').inner_text(), 'You hid this moodboard')
+        self.assertIn('once you leave this page, only they can.', banner.inner_text())
+        self.assertEqual(bob.locator('.page-head__actions, .section--gen, .section--ref').count(), 0)
+        self.assertEqual([(item['id'], item['hidden_by']) for item in self.record()['moodboards']], [('board-zq', BOB)])
+        # Show again, from the banner: the page is drawn as everyone sees it.
+        banner.locator('button', has_text='Show again…').click()
+        self.dialog(bob).wait_for(timeout=15000)
+        self.assertIn('Show this moodboard again?', self.dialog(bob).inner_text())
+        self.dialog(bob).locator('button', has_text='Show again').click()
+        bob.wait_for_selector('.legend', timeout=30000)
+        self.wait_announced(bob, 'Shown to everyone again')
+        self.assertIsNone(self.record())
+        self.assertEqual(bob.locator('.page-head__actions .hide-btn').count(), 1)
+        # Hidden again and left: gone from his moodboards too, and its managers see who hid it.
+        bob.locator('.page-head__actions .hide-btn').click()
+        self.dialog(bob).wait_for(timeout=15000)
+        self.dialog(bob).locator('button', has_text='Hide moodboard').click()
+        bob.locator('.hidden-banner').wait_for(timeout=30000)
+        self.go(bob, '#/x/%s/moodboards' % self.x)
+        bob.wait_for_selector('article.bcard', timeout=30000)
+        self.assertEqual(bob.locator('article.bcard .bcard__title').all_inner_texts(),
+                         ['Synthetic board one', 'Synthetic board two'])
+        self.open_board(bob, 'board-zq')
+        self.assert_not_found(bob, 'Moodboard')
+        carol = self.sign_in(CAROL, hosted=members)
+        self.open_board(carol, 'board-zq')
+        self.assertIn('Hidden by %s' % BOB, carol.locator('.hidden-banner').inner_text())
+
     def test_a_zip_with_two_roots_is_managed_from_either_root(self):
         """A hidden list belongs to the published ZIP: a hide from one root's page names the catalog entry, and the
         Hidden section of each root's overview lists all of it, with the root that has each item."""
